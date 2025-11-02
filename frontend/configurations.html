@@ -1,0 +1,83 @@
+<div id="configurations-section" class="content-section">
+  <div id="configsListView">
+    <h3>Configurations</h3>
+    <div class="row">
+      <button id="btnRefreshConfigs">Refresh</button>
+      <button id="btnDeleteConfig" style="display:none;">Delete Selected</button>
+    </div>
+    <div id="configsList" style="margin-top: 16px;">
+      <p>Loading configurations...</p>
+    </div>
+  </div>
+  
+  <div id="configEditView" style="display:none;">
+    <h3>Edit Configuration</h3>
+    <div class="row">
+      <label>Configuration Name</label>
+      <input id="editConfigName" value="" size="40" type="text" />
+    </div>
+
+    <hr />
+
+    <h3>Authentication</h3>
+    <div class="row">
+      <label>API Base</label>
+      <input id="editApiBase" value="" size="40" type="text" />
+    </div>
+    <div class="row">
+      <label>Fabric Host</label>
+      <div style="display: flex; flex-direction: column; gap: 8px; width: 600px;">
+        <input id="editFabricHost" value="" style="width: 100%; box-sizing: border-box;" type="text" placeholder="Enter hosts separated by spaces" />
+        <div id="editFabricHostChips" style="display: flex; flex-wrap: wrap; gap: 6px; min-height: 24px;"></div>
+        <span id="editFabricHostStatus" class="status"></span>
+      </div>
+    </div>
+    <div class="row">
+      <label>NHI Credential</label>
+      <select id="editNhiCredentialSelect" style="width: 287px;">
+        <option value="">Select NHI credential...</option>
+      </select>
+    </div>
+    <div class="row">
+      <label>Expert Mode</label>
+      <input id="editExpertMode" type="checkbox" />
+    </div>
+
+    <hr />
+
+    <h3>FabricStudio Base Configuration</h3>
+    <div class="row">
+      <label>New Hostname Base</label>
+      <input id="editNewHostname" placeholder="e.g. fabric.local" size="40" type="text" />
+    </div>
+    <div class="row">
+      <label>Guest user password</label>
+      <input id="editChgPass" placeholder="" size="40" type="text" />
+    </div>
+
+    <hr />
+
+    <h3>Create Workspace</h3>
+    <div style="padding: 8px 12px; background-color: #e8f4f8; border-left: 3px solid #0066cc; margin-bottom: 12px; border-radius: 4px; font-size: 13px;">
+      <strong>Note:</strong> Templates are loaded from the cache. Make sure to click "Confirm" in FabricStudio Preparation to cache templates first.
+    </div>
+    <div id="editTplFormList"></div>
+    <div class="row">
+      <button id="btnAddEditRow">Add Row</button>
+    </div>
+    <h3>Run Workspace</h3>
+    <div class="row">
+      <label>Select Workspace</Select> Workspace</label>
+      <select id="editInstallSelect"></select>
+    </div>
+
+    <hr />
+
+    <div class="row">
+      <label></label>
+      <button id="btnSaveEditConfig">Save</button>
+      <button id="btnCancelEditConfig">Cancel</button>
+    </div>
+  </div>
+</div>
+

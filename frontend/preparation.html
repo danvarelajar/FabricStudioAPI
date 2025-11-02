@@ -1,0 +1,109 @@
+<div id="preparation-section" class="content-section">
+  <h3>Authentication</h3>
+  <div class="row">
+    <label>API Base</label>
+    <input id="apiBase" value="" size="40" type="text" />
+  </div>
+  <div class="row">
+    <label>Fabric Host</label>
+    <div style="display: flex; flex-direction: column; gap: 8px; width: 600px;">
+      <div style="display: flex; gap: 16px; align-items: flex-start;">
+        <div style="display: flex; flex-direction: column; gap: 8px; flex: 1;">
+          <label style="font-size: 12px; font-weight: 600; color: #424245; margin-bottom: 4px;">Host List</label>
+          <input id="fabricHost" value="" style="width: 100%; box-sizing: border-box;" type="text" placeholder="Enter hosts separated by spaces" />
+          <div id="fabricHostChips" style="display: flex; flex-wrap: wrap; gap: 6px; min-height: 24px;"></div>
+          <span id="fabricHostStatus" class="status"></span>
+        </div>
+        <div style="display: flex; flex-direction: column; gap: 8px; flex: 1;">
+          <label style="font-size: 12px; font-weight: 600; color: #424245; margin-bottom: 4px;">From NHI Credential</label>
+          <input id="fabricHostFromNhi" value="" style="width: 100%; box-sizing: border-box;" type="text" placeholder="Hosts from loaded credential" disabled />
+          <div id="fabricHostFromNhiChips" style="display: flex; flex-wrap: wrap; gap: 6px; min-height: 24px;"></div>
+          <span id="fabricHostFromNhiStatus" class="status"></span>
+        </div>
+      </div>
+      <div style="display: flex; gap: 12px; align-items: center; margin-top: 4px;">
+        <label style="font-size: 12px; font-weight: 600; color: #424245; margin: 0;">Use hosts from:</label>
+        <label style="display: flex; align-items: center; gap: 6px; font-size: 13px; font-weight: normal; margin: 0; cursor: pointer;">
+          <input type="radio" name="hostSource" value="manual" id="hostSourceManual" checked />
+          <span>Host List</span>
+        </label>
+        <label style="display: flex; align-items: center; gap: 6px; font-size: 13px; font-weight: normal; margin: 0; cursor: pointer;">
+          <input type="radio" name="hostSource" value="nhi" id="hostSourceNhi" disabled />
+          <span>NHI Credential</span>
+        </label>
+      </div>
+    </div>
+  </div>
+  <div class="row">
+    <label>NHI Credential</label>
+    <select id="nhiCredentialSelect" style="width: 287px;">
+      <option value="">Select NHI credential...</option>
+    </select>
+  </div>
+  <div class="row">
+    <label>Encryption Password</label>
+    <input id="nhiDecryptPassword" type="password" size="40" placeholder="Enter password to decrypt credential" />
+    <button id="btnLoadNhiCredential" style="margin-left: 4px;">Load</button>
+    <span id="nhiLoadStatus" style="font-size: 12px; color: #86868b; margin-left: 8px;"></span>
+  </div>
+  <div class="row">
+    <label></label>
+    <button id="btnConfirmHosts" disabled>Confirm</button>
+    <span id="tokenStatus" class="status"></span>
+  </div>
+  <div class="row" id="hostsListRow" style="display: none;">
+    <label>Hosts</label>
+    <ul id="fabricHostList"></ul>
+  </div>
+  <div class="row">
+    <label>Expert Mode</label>
+    <input id="expertMode" type="checkbox" />
+  </div>
+
+  <hr />
+
+  <h3>FabricStudio Base Configuration</h3>
+  <div class="row">
+    <label>New Hostname Base</label>
+    <input id="newHostname" placeholder="e.g. fabric.local" size="40" type="text" />
+  </div>
+  <div class="row">
+    <label>Guest user password</label>
+    <input id="chgPass" placeholder="" size="40" type="text" />
+  </div>
+
+  <h3>Install Workspace</h3>
+  <div id="tplFormList"></div>
+  <div class="row">
+    <button id="btnAddRow" disabled>Add Row</button>
+  </div>
+  <h3>Run Workspace</h3>
+  <div class="row">
+    <label>Select Template</label>
+    <select id="installSelect"></select>
+    <button id="btnInstallSelected" disabled>Run</button>
+    <button id="btnSaveConfig">Save</button>
+    <button id="btnCancelConfig">Cancel</button>
+  </div>
+  <div id="runProgressContainer" style="display:none; margin: 10px 0;">
+    <div class="row" style="margin-bottom: 4px;">
+      <label style="width: auto; margin-right: 8px;">Overall Progress:</label>
+      <div class="progress" style="width: 400px; height: 20px; margin: 0;">
+        <span id="runProgressBar" class="ind determinate"></span>
+      </div>
+      <span id="runProgressText" style="margin-left: 8px; font-weight: 600;">0%</span>
+      <span id="runProgressTimer" style="margin-left: 12px; font-size: 12px; color: #424245; font-weight: 500;">00:00</span>
+    </div>
+    <div class="row" style="margin-top: 4px;">
+      <span id="runProgressStatus" style="font-size: 12px; color: #424245; margin-left: 148px;">Initializing...</span>
+    </div>
+  </div>
+  <div id="runningTasksContainer" class="row" style="display:none;">
+    <label>Running Tasks</label>
+    <ul id="tplList"></ul>
+  </div>
+
+  <div id="actionStatus" class="notice" role="status" style="display:none;"></div>
+  <pre id="out" style="display:none;"></pre>
+</div>
+

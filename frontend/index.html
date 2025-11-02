@@ -1,0 +1,33 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>FabricStudio UI</title>
+    <link rel="stylesheet" href="styles.css">
+  </head>
+  <body>
+    <div class="app-container">
+      <aside class="sidebar">
+        <h2 class="sidebar-title">FabricStudio UI</h2>
+        <nav class="sidebar-nav">
+          <button type="button" class="menu-item active" data-section="preparation">FabricStudio Preparation</button>
+          <button type="button" class="menu-item" data-section="event-schedule">Event Schedule</button>
+          <button type="button" class="menu-item" data-section="configurations">Configurations</button>
+          <button type="button" class="menu-item" data-section="nhi-management">NHI Management</button>
+        </nav>
+      </aside>
+      
+      <main class="main-content">
+        <div id="configNameDisplay" style="display: none; padding: 12px 16px; background: #da291c; color: white; font-weight: 600; font-size: 16px; margin-bottom: 16px; border-radius: 0; width: 100%; box-sizing: border-box;">
+          <span>Configuration: </span><span id="configNameValue"></span>
+        </div>
+        <div id="content-container">
+          <!-- Content will be loaded here dynamically -->
+        </div>
+      </main>
+    </div>
+
+    <script src="app.js"></script>
+  </body>
+</html>

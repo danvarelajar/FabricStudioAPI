@@ -1,0 +1,43 @@
+<div id="event-schedule-section" class="content-section">
+  <h3>Event Schedule</h3>
+  <div style="border: 1px solid #d2d2d7; padding: 16px; border-radius: 4px; background: #fafafa; margin-bottom: 20px;">
+    <h4 style="margin-top: 0; margin-bottom: 12px; font-size: 14px; font-weight: 600;">Create New Event</h4>
+    <div class="row">
+      <label style="width: 120px;">Event Name</label>
+      <input id="eventName" type="text" size="40" placeholder="Enter event name" />
+    </div>
+    <div class="row">
+      <label style="width: 120px;">Date</label>
+      <input id="eventDate" type="date" />
+    </div>
+    <div class="row">
+      <label style="width: 120px;">Time</label>
+      <input id="eventTime" type="time" />
+    </div>
+    <div class="row">
+      <label style="width: 120px;">Configuration</label>
+      <select id="eventConfigSelect" style="width: 300px;">
+        <option value="">Select a configuration...</option>
+      </select>
+    </div>
+    <div class="row">
+      <label style="width: 120px;">Auto Run</label>
+      <input id="eventAutoRun" type="checkbox" />
+      <span style="font-size: 12px; color: #86868b; margin-left: 8px;">Automatically execute configuration at event time</span>
+    </div>
+    <div class="row">
+      <label style="width: 120px;"></label>
+      <button id="btnCreateEvent" disabled>Create Event</button>
+      <button id="btnUpdateEvent" disabled style="display: none;">Update Event</button>
+      <button id="btnCancelEvent" style="display: none;">Cancel</button>
+    </div>
+  </div>
+  <div class="row">
+    <button id="btnRefreshEvents">Refresh</button>
+    <button id="btnDeleteEvent" style="display:none;">Delete Selected</button>
+  </div>
+  <div id="eventsList" style="margin-top: 16px;">
+    <p>Loading events...</p>
+  </div>
+</div>
+
