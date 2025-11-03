@@ -4702,7 +4702,6 @@ async function handleRunButton() {
       const new_password = el('chgPass').value.trim();
       if (new_password) {
         updateRunProgress(17, 'Changing guest user password...');
-        logMsg('Changing guest user password...');
         const username = 'guest';
         await executeOnAllHosts('Change password', async (fabric_host) => {
           const res = await api('/user/password', {
