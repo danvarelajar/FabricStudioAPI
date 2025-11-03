@@ -89,12 +89,22 @@ colima logs
 ### Docker credential helper error
 If you see: `docker-credential-osxkeychain: executable file not found`
 
-**Quick fix:**
+**This is automatically fixed by `docker-start.sh`**, but if you need to fix it manually:
+
 ```bash
-./fix-docker-creds.sh
+# Option 1: Use jq (if installed)
+jq 'del(.credsStore)' ~/.docker/config.json > ~/.docker/config.json.tmp && \
+mv ~/.docker/config.json.tmp ~/.docker/config.json
+
+# Option 2: Create new config
+cat > ~/.docker/config.json <<EOF
+{
+  "auths": {}
+}
+EOF
 ```
 
-This will automatically configure Docker to not use the credential helper (which isn't needed for Colima).
+This configures Docker to not use the credential helper (which isn't needed for Colima).
 
 ### Colima won't start
 ```bash

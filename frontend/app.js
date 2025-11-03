@@ -616,7 +616,11 @@ async function loadSelectedNhiCredential() {
   
   try {
     if (statusSpan) statusSpan.textContent = 'Loading...';
-    const res = await api(`/nhi/get/${nhiId}?encryption_password=${encodeURIComponent(password)}`);
+    const res = await api(`/nhi/get/${nhiId}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ encryption_password: password })
+    });
     
     if (!res.ok) {
       let errorText = 'Unknown error';
@@ -831,12 +835,56 @@ function logMsg(msg) {
 function showStatus(msg, opts = {}) {
   const box = el('actionStatus');
   if (!box) return;
-  box.textContent = msg;
+  // Replace newlines with <br> tags for HTML display
+  box.innerHTML = msg.replace(/\n/g, '<br>');
   box.style.display = '';
+  // Add error styling if it's an error message
+  if (opts.error || msg.toLowerCase().includes('error') || msg.toLowerCase().includes('failed')) {
+    box.style.color = '#d32f2f';
+    box.style.backgroundColor = '#ffebee';
+    box.style.border = '1px solid #d32f2f';
+  } else {
+    box.style.color = '';
+    box.style.backgroundColor = '';
+    box.style.border = '';
+  }
   logMsg(msg);
   if (opts.hideAfterMs) {
     const ms = opts.hideAfterMs;
-    setTimeout(() => { if (box.textContent === msg) box.style.display = 'none'; }, ms);
+    setTimeout(() => { if (box.innerHTML === msg.replace(/\n/g, '<br>')) box.style.display = 'none'; }, ms);
+  }
+}
+
+// NHI-specific status display function
+function showNhiStatus(msg, opts = {}) {
+  const box = el('nhiStatus');
+  if (!box) {
+    console.warn('nhiStatus element not found');
+    return;
+  }
+  // Replace newlines with <br> tags for HTML display
+  box.innerHTML = msg.replace(/\n/g, '<br>');
+  box.style.display = '';
+  // Add error styling if it's an error message
+  if (opts.error || msg.toLowerCase().includes('error') || msg.toLowerCase().includes('failed')) {
+    box.style.color = '#d32f2f';
+    box.style.backgroundColor = '#ffebee';
+    box.style.border = '1px solid #d32f2f';
+    box.style.padding = '12px';
+    box.style.margin = '12px 0';
+    box.style.borderRadius = '4px';
+  } else {
+    box.style.color = '#1976d2';
+    box.style.backgroundColor = '#e3f2fd';
+    box.style.border = '1px solid #1976d2';
+    box.style.padding = '12px';
+    box.style.margin = '12px 0';
+    box.style.borderRadius = '4px';
+  }
+  console.log('NHI Status:', msg);
+  if (opts.hideAfterMs) {
+    const ms = opts.hideAfterMs;
+    setTimeout(() => { if (box.innerHTML === msg.replace(/\n/g, '<br>')) box.style.display = 'none'; }, ms);
   }
 }
 
@@ -1055,7 +1103,11 @@ async function acquireTokens() {
       const selectedId = nhiSelect ? (nhiSelect.value || '') : '';
       const encPwd = pwdInput ? (pwdInput.value || '').trim() : '';
       if (selectedId && encPwd) {
-        const res = await api(`/nhi/get/${selectedId}?encryption_password=${encodeURIComponent(encPwd)}`);
+        const res = await api(`/nhi/get/${selectedId}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ encryption_password: encPwd })
+        });
         if (res.ok) {
           const data = await res.json();
           decryptedClientId = data.client_id || '';
@@ -5348,7 +5400,11 @@ async function restoreConfiguration(config) {
           const pwdInput = el('nhiDecryptPassword');
           const pwd = pwdInput ? (pwdInput.value || '').trim() : '';
           if (pwd) {
-            const res = await api(`/nhi/get/${config.nhiCredentialId}?encryption_password=${encodeURIComponent(pwd)}`);
+            const res = await api(`/nhi/get/${config.nhiCredentialId}`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ encryption_password: pwd })
+            });
             if (res.ok) {
               const nhiData = await res.json();
               decryptedClientId = nhiData.client_id || '';
@@ -6633,7 +6689,11 @@ async function editNhi(nhiId) {
       return;
     }
     
-    const getRes = await api(`/nhi/get/${nhiId}?encryption_password=${encodeURIComponent(encryptionPassword)}`);
+    const getRes = await api(`/nhi/get/${nhiId}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ encryption_password: encryptionPassword })
+    });
     if (!getRes.ok) {
       const errorText = await getRes.text().catch(() => 'Unknown error');
       showStatus(`Failed to retrieve NHI credential: ${errorText}`);
@@ -6877,8 +6937,28 @@ function setupNhiButtons() {
     }
     
     const data = await res.json();
-    showStatus(data.message || 'NHI credential saved successfully');
-    logMsg(`NHI credential saved: ${name}`);
+    
+    // Check for token retrieval errors
+    if (data.token_errors && Array.isArray(data.token_errors) && data.token_errors.length > 0) {
+      // Display error messages for failed token retrievals
+      const errorMsg = data.token_errors.filter(e => e && e.trim()).join('\n');
+      if (errorMsg) {
+        const fullMessage = `NHI credential saved, but token retrieval failed:\n${errorMsg}`;
+        // Use NHI-specific status element
+        showNhiStatus(fullMessage, { error: true });
+        showStatus(fullMessage, { error: true });
+        logMsg(`NHI credential saved: ${name}, but token errors: ${errorMsg}`);
+        console.error('Token retrieval errors:', data.token_errors);
+      } else {
+        showNhiStatus(data.message || 'NHI credential saved successfully');
+        showStatus(data.message || 'NHI credential saved successfully');
+        logMsg(`NHI credential saved: ${name}`);
+      }
+    } else {
+      showNhiStatus(data.message || 'NHI credential saved successfully');
+      showStatus(data.message || 'NHI credential saved successfully');
+      logMsg(`NHI credential saved: ${name}`);
+    }
     
     // Clear form
     cancelNhiEdit();
@@ -6951,8 +7031,28 @@ function setupNhiButtons() {
     }
     
     const data = await res.json();
-    showStatus(data.message || 'NHI credential updated successfully');
-    logMsg(`NHI credential updated: ${name} (ID: ${editingNhiId})`);
+    
+    // Check for token retrieval errors
+    if (data.token_errors && Array.isArray(data.token_errors) && data.token_errors.length > 0) {
+      // Display error messages for failed token retrievals
+      const errorMsg = data.token_errors.filter(e => e && e.trim()).join('\n');
+      if (errorMsg) {
+        const fullMessage = `NHI credential updated, but token retrieval failed:\n${errorMsg}`;
+        // Use NHI-specific status element
+        showNhiStatus(fullMessage, { error: true });
+        showStatus(fullMessage, { error: true });
+        logMsg(`NHI credential updated: ${name} (ID: ${editingNhiId}), but token errors: ${errorMsg}`);
+        console.error('Token retrieval errors:', data.token_errors);
+      } else {
+        showNhiStatus(data.message || 'NHI credential updated successfully');
+        showStatus(data.message || 'NHI credential updated successfully');
+        logMsg(`NHI credential updated: ${name} (ID: ${editingNhiId})`);
+      }
+    } else {
+      showNhiStatus(data.message || 'NHI credential updated successfully');
+      showStatus(data.message || 'NHI credential updated successfully');
+      logMsg(`NHI credential updated: ${name} (ID: ${editingNhiId})`);
+    }
     
     // Clear form and exit edit mode
     cancelNhiEdit();

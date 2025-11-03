@@ -72,11 +72,19 @@ else
     if [ -f "$HOME/.docker/config.json" ] && grep -q "credsStore.*osxkeychain" "$HOME/.docker/config.json" 2>/dev/null; then
         echo ""
         echo "⚠️  Docker credential helper issue detected. Fixing..."
-        if [ -f "./fix-docker-creds.sh" ]; then
-            ./fix-docker-creds.sh
+        DOCKER_CONFIG_DIR="$HOME/.docker"
+        if command -v jq &> /dev/null; then
+            jq 'del(.credsStore)' "$DOCKER_CONFIG_DIR/config.json" > "$DOCKER_CONFIG_DIR/config.json.tmp" && \
+            mv "$DOCKER_CONFIG_DIR/config.json.tmp" "$DOCKER_CONFIG_DIR/config.json"
+            echo "✅ Removed credential helper from Docker config"
         else
-            echo "   Please run: ./fix-docker-creds.sh"
-            exit 1
+            # Create config without credential helper
+            cat > "$DOCKER_CONFIG_DIR/config.json" <<EOF
+{
+  "auths": {}
+}
+EOF
+            echo "✅ Created Docker config without credential helper"
         fi
     fi
 fi

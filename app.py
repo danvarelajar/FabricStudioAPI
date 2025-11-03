@@ -1790,6 +1790,10 @@ class NhiDetailItem(BaseModel):
     updated_at: str
 
 
+class GetNhiReq(BaseModel):
+    encryption_password: str
+
+
 @app.post("/nhi/save")
 def save_nhi(req: SaveNhiReq):
     """Save or update an NHI credential"""
@@ -1861,11 +1865,12 @@ def save_nhi(req: SaveNhiReq):
         
         # Now store tokens for all hosts
         tokens_stored = 0
+        token_errors = []
         if nhi_id and hosts_to_process:
             for fabric_host in hosts_to_process:
                 try:
                     token_data = get_access_token(req.client_id.strip(), req.client_secret.strip(), fabric_host)
-                    if token_data and token_data.get("access_token"):
+                    if token_data and isinstance(token_data, dict) and token_data.get("access_token"):
                         # Encrypt the token using the same encryption password
                         token_encrypted = encrypt_client_secret(token_data.get("access_token"), req.encryption_password)
                         
@@ -1883,9 +1888,22 @@ def save_nhi(req: SaveNhiReq):
                                 VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
                             ''', (nhi_id, fabric_host, token_encrypted, token_expires_at))
                             tokens_stored += 1
+                        else:
+                            # No expiration time in response
+                            error_msg = f"Failed to retrieve token for host {fabric_host}: No expiration time in response"
+                            token_errors.append(error_msg)
+                            logger.warning(error_msg)
+                    else:
+                        # Token retrieval failed - get_access_token returned None or invalid response
+                        # Check logs for more details, but provide user-friendly message
+                        error_msg = f"Host {fabric_host}: Connection timeout or invalid credentials (check hostname and credentials)"
+                        token_errors.append(error_msg)
+                        logger.warning(f"Failed to retrieve token for host {fabric_host}: get_access_token returned None")
                 except Exception as e:
-                    # Log error but continue with other hosts
-                    print(f"Warning: Could not get token for host {fabric_host}: {e}")
+                    # Collect error for this host
+                    error_msg = f"Failed to retrieve token for host {fabric_host}: {str(e)}"
+                    token_errors.append(error_msg)
+                    logger.error(error_msg, exc_info=True)
         
         conn.commit()
         
@@ -1895,7 +1913,13 @@ def save_nhi(req: SaveNhiReq):
         elif hosts_to_process:
             message += " (No tokens stored - check hosts and credentials)"
         
-        return {"status": "ok", "message": message, "id": nhi_id}
+        # Include errors in response if any occurred
+        response = {"status": "ok", "message": message, "id": nhi_id}
+        if token_errors:
+            response["token_errors"] = token_errors
+            response["warning"] = f"{len(token_errors)} host(s) failed to retrieve tokens"
+        
+        return response
     except sqlite3.IntegrityError as e:
         conn.rollback()
         if "UNIQUE constraint" in str(e):
@@ -1978,10 +2002,11 @@ def list_nhi():
         conn.close()
 
 
-@app.get("/nhi/get/{nhi_id}")
-def get_nhi(nhi_id: int, encryption_password: str):
+@app.post("/nhi/get/{nhi_id}")
+def get_nhi(nhi_id: int, req: GetNhiReq):
     """Retrieve an NHI credential by ID and decrypt the secret"""
-    if not encryption_password:
+    encryption_password = req.encryption_password
+    if not encryption_password or not encryption_password.strip():
         raise HTTPException(400, "Encryption password is required")
     
     conn = sqlite3.connect(DB_PATH)
