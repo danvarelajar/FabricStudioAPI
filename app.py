@@ -44,8 +44,8 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = FastAPI()
 
-# Database setup
-DB_PATH = "fabricstudio_ui.db"
+# Database setup - use environment variable or default to current directory
+DB_PATH = os.environ.get("DB_PATH", "fabricstudio_ui.db")
 
 def init_db():
     """Initialize the SQLite database with configurations and event_schedules tables"""
@@ -514,7 +514,14 @@ def tasks_status(fabric_host: str, access_token: str):
 
 
 def _init_db():
-    conn = sqlite3.connect('cache.db')
+    cache_db_path = os.environ.get("CACHE_DB_PATH", "cache.db")
+    # In Docker, store cache.db in data directory (same location as main DB)
+    if DB_PATH and "/app/data" in DB_PATH:
+        cache_db_path = os.path.join(os.path.dirname(DB_PATH), "cache.db")
+    elif DB_PATH and DB_PATH != "fabricstudio_ui.db":
+        # If DB_PATH is customized, put cache.db in same directory
+        cache_db_path = os.path.join(os.path.dirname(DB_PATH), "cache.db")
+    conn = sqlite3.connect(cache_db_path)
     cur = conn.cursor()
     cur.execute(
         """

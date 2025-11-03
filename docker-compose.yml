@@ -1,0 +1,37 @@
+services:
+  fabricstudio-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: fabricstudio-api
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      # CRITICAL: Set this to a strong, random secret in production
+      # Generate with: openssl rand -base64 32
+      - FS_SERVER_SECRET=${FS_SERVER_SECRET:-CHANGE_ME_IN_PRODUCTION}
+      # Optional: Set logging level
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+    volumes:
+      # Persist database across container restarts
+      - ./data:/app/data
+      # Persist logs
+      - ./logs:/app/logs
+    networks:
+      - fabricstudio-network
+    # Security: Run as non-root user (set in Dockerfile)
+    # Limit resources
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 2G
+        reservations:
+          cpus: '0.5'
+          memory: 512M
+
+networks:
+  fabricstudio-network:
+    driver: bridge
+
