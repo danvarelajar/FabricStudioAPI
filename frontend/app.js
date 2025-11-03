@@ -10,6 +10,82 @@ let storedNhiTokens = new Map(); // Store tokens from NHI credential by host: {t
 let currentNhiId = null; // Track which NHI credential is currently loaded
 
 const el = (id) => document.getElementById(id);
+// Password modal prompt used for NHI password (hidden while typing)
+async function promptForNhiPassword(titleText) {
+  return new Promise((resolve) => {
+    const overlay = document.createElement('div');
+    overlay.style.position = 'fixed';
+    overlay.style.top = '0';
+    overlay.style.left = '0';
+    overlay.style.right = '0';
+    overlay.style.bottom = '0';
+    overlay.style.background = 'rgba(0,0,0,0.4)';
+    overlay.style.display = 'flex';
+    overlay.style.alignItems = 'center';
+    overlay.style.justifyContent = 'center';
+    overlay.style.zIndex = '9999';
+
+    const dialog = document.createElement('div');
+    dialog.style.background = 'white';
+    dialog.style.border = '1px solid #d2d2d7';
+    dialog.style.boxShadow = '0 4px 12px rgba(0,0,0,0.2)';
+    dialog.style.width = '420px';
+    dialog.style.maxWidth = '90%';
+    dialog.style.padding = '16px';
+    dialog.style.borderRadius = '0';
+
+    const title = document.createElement('div');
+    title.textContent = titleText || 'Enter NHI credential password';
+    title.style.fontWeight = '600';
+    title.style.marginBottom = '10px';
+    dialog.appendChild(title);
+
+    const label = document.createElement('label');
+    label.textContent = 'NHI Password';
+    label.style.display = 'block';
+    label.style.marginBottom = '6px';
+    dialog.appendChild(label);
+
+    const input = document.createElement('input');
+    input.type = 'password';
+    input.autocomplete = 'current-password';
+    input.style.width = '100%';
+    input.style.boxSizing = 'border-box';
+    input.style.margin = '0 0 12px 0';
+    input.style.padding = '6px 10px';
+    input.style.border = '1px solid #d2d2d7';
+    input.style.minHeight = '32px';
+    dialog.appendChild(input);
+
+    const actions = document.createElement('div');
+    actions.style.display = 'flex';
+    actions.style.justifyContent = 'flex-end';
+    actions.style.gap = '8px';
+
+    const cancelBtn = document.createElement('button');
+    cancelBtn.type = 'button';
+    cancelBtn.textContent = 'Cancel';
+    cancelBtn.onclick = () => { document.body.removeChild(overlay); resolve(null); };
+
+    const okBtn = document.createElement('button');
+    okBtn.type = 'button';
+    okBtn.textContent = 'OK';
+    okBtn.onclick = () => { const val = input.value; document.body.removeChild(overlay); resolve(val); };
+
+    actions.appendChild(cancelBtn);
+    actions.appendChild(okBtn);
+    dialog.appendChild(actions);
+    overlay.appendChild(dialog);
+    document.body.appendChild(overlay);
+
+    // Focus and submit on Enter/Escape
+    input.focus();
+    input.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') okBtn.click();
+      if (e.key === 'Escape') cancelBtn.click();
+    });
+  });
+}
 function isValidIp(v) {
   // IPv4 dotted-quad, each octet 0-255
   if (!/^\d{1,3}(?:\.\d{1,3}){3}$/.test(v)) return false;
@@ -793,7 +869,13 @@ async function api(path, options = {}) {
     if (options.params && typeof options.params === 'object') {
       Object.entries(options.params).forEach(([k, v]) => url.searchParams.set(k, v));
     }
-    return fetch(url.toString(), options);
+    // Add cache-busting and disable browser cache
+    if ((options.method || 'GET').toUpperCase() === 'GET') {
+      url.searchParams.set('_ts', Date.now());
+    }
+    const headers = new Headers(options.headers || {});
+    headers.set('Cache-Control', 'no-cache');
+    return fetch(url.toString(), { ...options, headers, cache: 'no-store' });
   }
   
   try {
@@ -802,7 +884,13 @@ async function api(path, options = {}) {
     if (options.params && typeof options.params === 'object') {
       Object.entries(options.params).forEach(([k, v]) => url.searchParams.set(k, v));
     }
-    return fetch(url.toString(), options);
+    // Add cache-busting and disable browser cache
+    if ((options.method || 'GET').toUpperCase() === 'GET') {
+      url.searchParams.set('_ts', Date.now());
+    }
+    const headers = new Headers(options.headers || {});
+    headers.set('Cache-Control', 'no-cache');
+    return fetch(url.toString(), { ...options, headers, cache: 'no-store' });
   } catch (error) {
     // If base URL is invalid, try using current origin as fallback
     const baseUrl = window.location.origin;
@@ -810,9 +898,154 @@ async function api(path, options = {}) {
     if (options.params && typeof options.params === 'object') {
       Object.entries(options.params).forEach(([k, v]) => url.searchParams.set(k, v));
     }
-    return fetch(url.toString(), options);
+    if ((options.method || 'GET').toUpperCase() === 'GET') {
+      url.searchParams.set('_ts', Date.now());
+    }
+    const headers = new Headers(options.headers || {});
+    headers.set('Cache-Control', 'no-cache');
+    return fetch(url.toString(), { ...options, headers, cache: 'no-store' });
   }
 }
+
+// API helper that surfaces errors to UI and throws on failure
+async function apiJson(path, options = {}) {
+  const res = await api(path, options);
+  if (!res.ok) {
+    const errText = await res.text().catch(() => `HTTP ${res.status}`);
+    showStatus(`Error: ${errText}`);
+    throw new Error(errText);
+  }
+  try {
+    return await res.json();
+  } catch (e) {
+    showStatus('Error: Invalid JSON response');
+    throw e;
+  }
+}
+
+// Minimal logging mode: disable console.log unless explicitly enabled
+(() => {
+  const DEBUG_LOGS = false; // set true when debugging
+  if (!DEBUG_LOGS && typeof console !== 'undefined' && typeof console.log === 'function') {
+    try { console.log = function(){}; } catch(_) {}
+  }
+})();
+
+// Reset Preparation UI/state so it can be reused for a new run
+function resetPreparationForNewRun() {
+  try {
+    // Reset Authentication section (keep API Base)
+    const apiBase = el('apiBase');
+    // intentionally keep apiBase as-is
+    const nhiSelect = el('nhiCredentialSelect');
+    if (nhiSelect) nhiSelect.value = '';
+    const nhiPwd = el('nhiDecryptPassword');
+    if (nhiPwd) nhiPwd.value = '';
+    const nhiStatus = el('nhiLoadStatus');
+    if (nhiStatus) nhiStatus.textContent = '';
+    const tokenStatus = el('tokenStatus');
+    if (tokenStatus) tokenStatus.textContent = '';
+    const hostSourceManual = el('hostSourceManual');
+    if (hostSourceManual) hostSourceManual.checked = true;
+    const hostSourceNhi = el('hostSourceNhi');
+    if (hostSourceNhi) hostSourceNhi.checked = false;
+
+    // Clear any decrypted/stored credentials and tokens
+    if (typeof decryptedClientId !== 'undefined') decryptedClientId = '';
+    if (typeof decryptedClientSecret !== 'undefined') decryptedClientSecret = '';
+    if (typeof currentNhiId !== 'undefined') currentNhiId = null;
+    if (typeof storedNhiTokens?.clear === 'function') storedNhiTokens.clear();
+    if (typeof accessTokens?.clear === 'function') accessTokens.clear();
+
+    // Clear templates array/state
+    if (Array.isArray(templates)) templates.length = 0;
+
+    // Clear rows
+    const tplFormList = el('tplFormList');
+    if (tplFormList) tplFormList.innerHTML = '';
+
+    // Clear install dropdown and disable Run button
+    const installSelect = el('installSelect');
+    if (installSelect) {
+      installSelect.innerHTML = '';
+      installSelect.disabled = true;
+    }
+    const runBtn = el('btnInstallSelected');
+    if (runBtn) runBtn.disabled = true;
+
+    // Clear host inputs and chips/status
+    const fabricHost = el('fabricHost');
+    if (fabricHost) fabricHost.value = '';
+    const fabricHostChips = el('fabricHostChips');
+    if (fabricHostChips) fabricHostChips.innerHTML = '';
+    const fabricHostStatus = el('fabricHostStatus');
+    if (fabricHostStatus) fabricHostStatus.textContent = '';
+
+    // Clear NHI derived hosts and status
+    const fabricHostFromNhi = el('fabricHostFromNhi');
+    if (fabricHostFromNhi) fabricHostFromNhi.value = '';
+    const fabricHostFromNhiChips = el('fabricHostFromNhiChips');
+    if (fabricHostFromNhiChips) fabricHostFromNhiChips.innerHTML = '';
+    const fabricHostFromNhiStatus = el('fabricHostFromNhiStatus');
+    if (fabricHostFromNhiStatus) fabricHostFromNhiStatus.textContent = '';
+
+    // Reset confirmed hosts map
+    if (Array.isArray(confirmedHosts)) confirmedHosts.length = 0;
+
+    // Hide progress UI
+    const runProgressContainer = el('runProgressContainer');
+    if (runProgressContainer) runProgressContainer.style.display = 'none';
+    const runProgressBar = el('runProgressBar');
+    if (runProgressBar) runProgressBar.style.width = '0%';
+    const runProgressText = el('runProgressText');
+    if (runProgressText) runProgressText.textContent = '0%';
+    const runProgressStatus = el('runProgressStatus');
+    if (runProgressStatus) runProgressStatus.textContent = 'Initializing...';
+    const runProgressTimer = el('runProgressTimer');
+    if (runProgressTimer) runProgressTimer.textContent = '00:00';
+
+    // Clear running tasks list
+    const runningTasksContainer = el('runningTasksContainer');
+    if (runningTasksContainer) runningTasksContainer.style.display = 'none';
+    const tplList = el('tplList');
+    if (tplList) tplList.innerHTML = '';
+
+    // Re-enable inputs/buttons as initial state
+    const addRowBtn = el('btnAddRow');
+    if (addRowBtn) addRowBtn.disabled = false;
+    const confirmBtn = el('btnConfirmHosts');
+    if (confirmBtn) confirmBtn.disabled = false;
+
+    // Clear status/notice area
+    const actionStatus = el('actionStatus');
+    if (actionStatus) actionStatus.style.display = 'none';
+  } catch (e) {
+    // Non-fatal; log only
+    console.warn('resetPreparationForNewRun error:', e);
+  }
+}
+
+// Wire Reset button in Preparation UI
+document.addEventListener('DOMContentLoaded', () => {
+  const resetBtn = el('btnResetPreparation');
+  if (resetBtn) {
+    resetBtn.onclick = (e) => {
+      e.preventDefault();
+      resetPreparationForNewRun();
+      if (typeof showStatus === 'function') showStatus('Preparation reset');
+    };
+  }
+});
+
+// Delegate reset click in case the button is injected after DOMContentLoaded
+document.addEventListener('click', (e) => {
+  const target = e.target;
+  if (target && target.id === 'btnResetPreparation') {
+    e.preventDefault();
+    resetPreparationForNewRun();
+    if (typeof showStatus === 'function') showStatus('Preparation reset');
+  }
+});
 
 // Token acquisition function (now called from Install Workspace)
 async function acquireTokens() {
@@ -820,17 +1053,52 @@ async function acquireTokens() {
     showStatus('Please confirm hosts first');
     return false;
   }
+  // Ensure decrypted credentials using the Encryption Password field in Preparation
+  try {
+    if ((!decryptedClientId || !decryptedClientSecret)) {
+      const nhiSelect = el('nhiCredentialSelect');
+      const pwdInput = el('nhiDecryptPassword');
+      const selectedId = nhiSelect ? (nhiSelect.value || '') : '';
+      const encPwd = pwdInput ? (pwdInput.value || '').trim() : '';
+      if (selectedId && encPwd) {
+        const res = await api(`/nhi/get/${selectedId}?encryption_password=${encodeURIComponent(encPwd)}`);
+        if (res.ok) {
+          const data = await res.json();
+          decryptedClientId = data.client_id || '';
+          decryptedClientSecret = data.client_secret || '';
+          currentNhiId = parseInt(selectedId);
+          // preload tokens per host if any
+          storedNhiTokens.clear();
+          if (data.tokens_by_host) {
+            for (const [host, tokenInfo] of Object.entries(data.tokens_by_host)) {
+              storedNhiTokens.set(host, { token: tokenInfo.token, expires_at: tokenInfo.expires_at });
+            }
+          }
+          showStatus('NHI credential decrypted using Encryption Password');
+        } else {
+          const errText = await res.text().catch(() => 'Invalid Encryption Password');
+          showStatus(`Failed to decrypt NHI credential: ${errText}`);
+          return false;
+        }
+      }
+    }
+  } catch (e) {
+    console.error('Error ensuring decrypted credentials:', e);
+    showStatus('Error decrypting NHI credential with Encryption Password');
+    return false;
+  }
   // Use decrypted credentials from NHI Management
   const clientId = decryptedClientId;
   const clientSecret = decryptedClientSecret;
   if (!clientId || !clientSecret) {
-    showStatus('Please select and load an NHI credential first');
+    showStatus('Enter Encryption Password and load NHI credential to acquire tokens');
     return false;
   }
   
   // Try to reuse stored tokens from NHI credential if available
   let reusedTokens = 0;
   let fetchedTokens = 0;
+  const failures = [];
   const tokenLifetimes = []; // Store token lifetimes for display
   
   // First, try to reuse stored tokens from NHI credential per host
@@ -893,7 +1161,9 @@ async function acquireTokens() {
         }),
       });
       if (!res.ok) {
-        logMsg(`Failed to get token for ${host}`);
+        const errText = await res.text().catch(() => 'Unknown error');
+        logMsg(`Failed to get token for ${host}: ${res.status} ${errText}`);
+        failures.push({ host, status: res.status, error: errText });
         continue;
       }
       const data = await res.json();
@@ -966,6 +1236,13 @@ async function acquireTokens() {
     el('tokenStatus').textContent = statusText;
     return true;
   }
+  // No tokens acquired – show detailed reasons
+  if (failures.length > 0) {
+    const details = failures.map(f => `${f.host}: ${f.status} ${f.error}`).join(' | ');
+    showStatus(`Token acquisition failed for all hosts: ${details}`);
+  } else {
+    showStatus('Token acquisition failed for all hosts (no details).');
+  }
   return false;
 }
 
@@ -1017,16 +1294,9 @@ async function cacheAllTemplates() {
           }
           
           try {
-            const templatesRes = await api('/repo/templates/list', { 
+            const templatesData = await apiJson('/repo/templates/list', { 
               params: mergeAuth(host, { fabric_host: host, repo_name: repoName }) 
             });
-            
-            if (!templatesRes.ok) {
-              console.warn(`Failed to get templates for repo ${repoName} on ${host}:`, await templatesRes.text().catch(() => 'Unknown error'));
-              continue;
-            }
-            
-            const templatesData = await templatesRes.json();
             const templates = templatesData.templates || [];
             console.log(`Found ${templates.length} templates in repo ${repoName} on ${host}`);
             
@@ -1656,25 +1926,6 @@ function addTplRow(prefill) {
     const host = getFabricHostPrimary();
     if (!host || !repo_name) return;
     
-    // Check cache first to avoid API calls if no token is available
-    const cachedTemplates = window.cachedTemplates || [];
-    if (cachedTemplates.length > 0) {
-      const templatesForRepo = cachedTemplates.filter(t => t.repo_name === repo_name);
-      const uniqueNames = Array.from(new Set(templatesForRepo.map(t => t.template_name).filter(Boolean))).sort();
-      if (uniqueNames.length > 0) {
-        const templateOptions = uniqueNames.map(name => {
-          const o = document.createElement('option');
-          o.value = name;
-          o.textContent = name;
-          return o;
-        });
-        templateFiltered.populateOptions(templateOptions);
-        templateFiltered.enable();
-        console.log(`Loaded ${uniqueNames.length} templates from cache for repo ${repo_name}`);
-        return; // Don't call API if we have cache
-      }
-    }
-    
     // Fallback to API only if we have a token
     const token = accessTokens.get(host);
     if (!token) {
@@ -1683,9 +1934,8 @@ function addTplRow(prefill) {
     }
     
     try {
-      const resTpl = await api('/repo/templates/list', { params: mergeAuth(host, { fabric_host: host, repo_name }) });
-      if (resTpl.ok) {
-        const data = await resTpl.json();
+      try {
+        const data = await apiJson('/repo/templates/list', { params: mergeAuth(host, { fabric_host: host, repo_name }) });
         const uniqueNames = Array.from(new Set((data.templates || []).map(x => x.name).filter(Boolean)));
         const templateOptions = uniqueNames.map(name => {
           const o = document.createElement('option');
@@ -1695,7 +1945,7 @@ function addTplRow(prefill) {
         });
         templateFiltered.populateOptions(templateOptions);
         templateFiltered.enable();
-      }
+      } catch (error) { /* surfaced via apiJson/showStatus */ }
     } catch (error) {
       console.warn('Error loading templates from API:', error);
     }
@@ -1727,43 +1977,7 @@ function addTplRow(prefill) {
     
     console.log('Template change: Loading versions for', { repo_name, template_name });
     
-    // Check cache first
-    const cachedTemplates = window.cachedTemplates || [];
-    if (cachedTemplates.length > 0) {
-      const versions = cachedTemplates
-        .filter(t => t.repo_name === repo_name && t.template_name === template_name && t.version)
-        .map(t => t.version)
-        .filter(Boolean)
-        .sort((a, b) => a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' }));
-      
-      if (versions.length > 0) {
-        v.innerHTML = '';
-        const optVerPh = document.createElement('option');
-        optVerPh.value = '';
-        optVerPh.textContent = 'Select version';
-        v.appendChild(optVerPh);
-        
-        versions.forEach(ver => {
-          const o = document.createElement('option');
-          o.value = ver;
-          o.textContent = ver;
-          v.appendChild(o);
-        });
-        v.disabled = false;
-        
-        // Prefill version if provided
-        if (prefill && prefill.version && versions.includes(prefill.version)) {
-          v.value = prefill.version;
-        } else if (v.options.length > 1) {
-          v.value = v.options[1].value;
-        }
-        
-        console.log(`Loaded ${versions.length} versions from cache for ${repo_name}/${template_name}`);
-        return; // Don't call API if we have cache
-      }
-    }
-    
-    // Fallback to API if no cache
+    // LIVE API only (no cache)
     try {
       const resVer = await api('/repo/versions', { params: mergeAuth(host, { fabric_host: host, repo_name, template_name }) });
       if (resVer.ok) {
@@ -3333,6 +3547,7 @@ function addEditTplRow(prefill) {
   
   // Repo dropdown - populate from cached templates
   const r = document.createElement('select');
+  r.disabled = false; // ensure repo is selectable
   const optRepoPh = document.createElement('option');
   optRepoPh.value = '';
   optRepoPh.textContent = 'Select repo';
@@ -3351,6 +3566,8 @@ function addEditTplRow(prefill) {
   // Template filtered dropdown
   const templateFiltered = createFilteredDropdown('Select template', '250px');
   const t = templateFiltered.select;
+  // allow template selection once repo is chosen
+  templateFiltered.enable();
   
   // Version dropdown
   const v = document.createElement('select');
@@ -4338,24 +4555,12 @@ async function handleRunButton() {
           
           try {
             // 1) get template id
-            let res = await api('/repo/template', { params: mergeAuth(host, {
+            const { template_id } = await apiJson('/repo/template', { params: mergeAuth(host, {
               fabric_host: host,
               template_name: t.template_name,
               repo_name: t.repo_name,
               version: t.version,
             })});
-            if (!res.ok) {
-              const errorText = await res.text().catch(() => `HTTP ${res.status}`);
-              const errorMsg = `Failed to get template '${t.template_name}' v${t.version} from repo '${t.repo_name}' on ${host}: ${errorText}`;
-              logMsg(errorMsg);
-              showStatus(errorMsg);
-              console.error(`Template fetch failed on ${host}:`, errorText);
-              t.status = 'err';
-              t.createProgress = 0;
-              renderTemplates();
-              return {host, success: false, error: errorText || 'Template not found'};
-            }
-            const { template_id } = await res.json();
             logMsg(`Template located on ${host}`);
 
             // 2) create fabric
@@ -4871,14 +5076,45 @@ async function restoreConfiguration(config) {
       console.log('Restored expertMode:', config.expertMode);
     }
     
-    // Restore NHI credential selection if available
+    // Restore NHI credential selection if available, and auto-load with password prompt
     if (config.nhiCredentialId) {
       const nhiSelect = el('nhiCredentialSelect');
       if (nhiSelect) {
-        nhiSelect.value = config.nhiCredentialId;
-        // Reload credentials list to ensure it's up to date
+        // Ensure list is fresh, then set value
         await loadNhiCredentialsForAuth();
-        nhiSelect.value = config.nhiCredentialId; // Set again after reload
+        nhiSelect.value = String(config.nhiCredentialId);
+        // Take Encryption Password from input to load the credential
+        try {
+          const pwdInput = el('nhiDecryptPassword');
+          const pwd = pwdInput ? (pwdInput.value || '').trim() : '';
+          if (pwd) {
+            const res = await api(`/nhi/get/${config.nhiCredentialId}?encryption_password=${encodeURIComponent(pwd)}`);
+            if (res.ok) {
+              const nhiData = await res.json();
+              decryptedClientId = nhiData.client_id || '';
+              decryptedClientSecret = nhiData.client_secret || '';
+              currentNhiId = parseInt(config.nhiCredentialId);
+              storedNhiTokens.clear();
+              if (nhiData.tokens_by_host) {
+                for (const [host, tokenInfo] of Object.entries(nhiData.tokens_by_host)) {
+                  storedNhiTokens.set(host, { token: tokenInfo.token, expires_at: tokenInfo.expires_at });
+                }
+              }
+              // Enable confirm button now that credentials are loaded
+              const confirmBtn = el('btnConfirmHosts');
+              if (confirmBtn) confirmBtn.disabled = false;
+              showStatus('NHI credential loaded for configuration');
+            } else {
+              const errText = await res.text().catch(() => 'Failed to load NHI credential');
+              showStatus(`Failed to load NHI credential: ${errText}`);
+            }
+          } else {
+            showStatus('Enter Encryption Password to load NHI credential for this configuration');
+          }
+        } catch (e) {
+          console.error('Error auto-loading NHI credential:', e);
+          showStatus('Error loading NHI credential for configuration');
+        }
       }
     }
     const newHostnameInput = el('newHostname');
@@ -4975,24 +5211,19 @@ async function restoreConfiguration(config) {
     // Load cached templates first to use for restoration if API is not available
     let cachedTemplates = [];
     try {
-      const cacheRes = await api('/cache/templates');
-      if (cacheRes.ok) {
-        const cacheData = await cacheRes.json();
-        cachedTemplates = cacheData.templates || [];
-        // Store globally so event handlers can use it to avoid API calls
-        window.cachedTemplates = cachedTemplates;
-        console.log('Loaded', cachedTemplates.length, 'cached templates for restoration');
-        
-        // Log sample of cached templates for debugging
-        if (cachedTemplates.length > 0) {
-          console.log('Sample cached templates (first 5):', cachedTemplates.slice(0, 5).map(t => ({
-            repo_name: t.repo_name,
-            template_name: t.template_name,
-            version: t.version
-          })));
-        }
-      } else {
-        console.warn('Failed to load cached templates: HTTP', cacheRes.status);
+      const cacheData = await apiJson('/cache/templates');
+      cachedTemplates = cacheData.templates || [];
+      // Store globally so event handlers can use it to avoid API calls
+      window.cachedTemplates = cachedTemplates;
+      console.log('Loaded', cachedTemplates.length, 'cached templates for restoration');
+      
+      // Log sample of cached templates for debugging
+      if (cachedTemplates.length > 0) {
+        console.log('Sample cached templates (first 5):', cachedTemplates.slice(0, 5).map(t => ({
+          repo_name: t.repo_name,
+          template_name: t.template_name,
+          version: t.version
+        })));
       }
     } catch (error) {
       console.warn('Could not load cached templates:', error);
@@ -5647,6 +5878,16 @@ function setupEventButtons() {
   }
   
   try {
+    // If auto-run is enabled, ask for NHI credential password (hidden input)
+    let nhiPassword = null;
+    if (autoRun) {
+      nhiPassword = await promptForNhiPassword('Create Event');
+      if (nhiPassword === null) {
+        showStatus('Event creation cancelled');
+        return;
+      }
+    }
+
     const res = await api('/event/save', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -5655,7 +5896,8 @@ function setupEventButtons() {
         event_date: date,
         event_time: time || null,
         configuration_id: configId,
-        auto_run: autoRun
+        auto_run: autoRun,
+        nhi_password: nhiPassword || null
       })
     });
     
@@ -5711,6 +5953,16 @@ function setupEventButtons() {
       }
       
       try {
+        // If auto-run is enabled, ask for NHI credential password (hidden input)
+        let nhiPassword = null;
+        if (autoRun) {
+          nhiPassword = await promptForNhiPassword('Update Event');
+          if (nhiPassword === null) {
+            showStatus('Event update cancelled');
+            return;
+          }
+        }
+
         const res = await api('/event/save', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -5720,7 +5972,8 @@ function setupEventButtons() {
             event_date: date,
             event_time: time || null,
             configuration_id: configId,
-            auto_run: autoRun
+            auto_run: autoRun,
+            nhi_password: nhiPassword || null
           })
         });
         
@@ -6113,8 +6366,8 @@ async function editNhi(nhiId) {
   try {
     showStatus(`Loading NHI credential for editing...`);
     
-    // Ask for encryption password
-    const encryptionPassword = prompt('Enter encryption password to decrypt the credential:');
+    // Ask for encryption password (hidden while typing)
+    const encryptionPassword = await promptForNhiPassword('Edit NHI Credential');
     if (!encryptionPassword) {
       showStatus('Edit cancelled - password required');
       return;

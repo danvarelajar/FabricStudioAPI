@@ -7,6 +7,7 @@ import itertools
 import logging
 
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.WARNING)
 
 def check_tasks(fabric_host, access_token, display_progress=False):
     logger.info("Checking for running tasks on host %s", fabric_host)
@@ -177,23 +178,37 @@ def get_userId(fabric_host, access_token, username):
 
 
 def change_password(fabric_host, access_token, user_id, password):
-    # API fails
     logger.info("Changing password for user_id %s on host %s", user_id, fabric_host)
+    # Correct endpoint path is /system/user/password/{id}
     url = f"https://{fabric_host}/api/v1/system/user/password/{user_id}"
     headers = {
         "Authorization": f"Bearer {access_token}",
-        "Cache-Control": "no-cache"
+        "Cache-Control": "no-cache",
+        "Content-Type": "application/json"
     }
     data = {
-        "current_password": "Fortinet#123",
+        "current_password": "",
         "new_password": password,
         "encrypted": False
     }
+    
+    # Log request details
+    logger.info("Password change request - URL: %s", url)
+    logger.info("Password change request - Headers: %s", {k: v if k != "Authorization" else "Bearer ***" for k, v in headers.items()})
+    logger.info("Password change request - Data: %s", {**data, "new_password": "***" if data.get("new_password") else ""})
+    
     try:
         response = requests.post(url, headers=headers, json=data, verify=False, timeout=30)
+        
+        # Log response details
+        logger.info("Password change response - Status: %s", response.status_code)
+        logger.info("Password change response - Headers: %s", dict(response.headers))
+        logger.info("Password change response - Body: %s", response.text)
+        
     except requests.RequestException as exc:
-        logger.error("Error updating guest user password: %s", exc)
+        logger.error("Error updating guest user password: %s", exc, exc_info=True)
         return None
+    
     if response.status_code == 200:
         logger.info("Password updated for user_id %s", user_id)
         return None
@@ -270,6 +285,20 @@ def refresh_repositories(fabric_host, access_token):
 
 def get_repositoryId(fabric_host, access_token, repo_name):
     logger.info("Getting repository id for '%s' on host %s", repo_name, fabric_host)
+    # Prefer listing and matching case-insensitively to avoid select quirks
+    repos = list_repositories(fabric_host, access_token)
+    if repos:
+        wanted = (repo_name or "").strip().lower()
+        for r in repos:
+            name = (r.get('name') or "").strip().lower()
+            code = (r.get('code') or "").strip().lower()
+            if name == wanted or code == wanted:
+                repo_id = r.get('id')
+                logger.info("Repository '%s' resolved to id %s via list match", repo_name, repo_id)
+                return repo_id
+        logger.info("Repository '%s' not found in %d repos", repo_name, len(repos))
+        return None
+    # Fallback to direct query if listing failed returned empty
     url = f"https://{fabric_host}/api/v1/system/repository/remote"
     headers = {
         "Authorization": f"Bearer {access_token}",
@@ -281,6 +310,29 @@ def get_repositoryId(fabric_host, access_token, repo_name):
     except requests.RequestException as exc:
         logger.error("Error finding Repository Id: %s", exc)
         return None
+
+
+def list_repositories(fabric_host, access_token):
+    """Return list of remote repositories (objects)."""
+    url = f"https://{fabric_host}/api/v1/system/repository/remote"
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Cache-Control": "no-cache"
+    }
+    try:
+        response = requests.get(url, headers=headers, verify=False, timeout=30)
+    except requests.RequestException as exc:
+        logger.error("Error listing repositories: %s", exc)
+        return []
+    if response.status_code != 200:
+        logger.error("Error listing repositories: %s - %s", response.status_code, response.text)
+        return []
+    try:
+        data = response.json()
+    except ValueError:
+        logger.error("Error parsing repositories response as JSON")
+        return []
+    return data.get('object', [])
     if response.status_code == 200:
         try:
             data = response.json()
@@ -300,18 +352,79 @@ def get_repositoryId(fabric_host, access_token, repo_name):
 
 
 def get_template(fabric_host, access_token, template, repo_name, version):
-    logger.info("Getting template '%s' (v%s) in repo '%s' on host %s", template, version, repo_name, fabric_host)
+    logger.info("Getting template '%s' (version=%s) in repo '%s' on host %s", template, version, repo_name, fabric_host)
     repo_id = get_repositoryId(fabric_host, access_token, repo_name)
-    url_templates = f"https://{fabric_host}/api/v1/system/repository/template?select=repository={repo_id}"
+    if not repo_id:
+        logger.error("Repository '%s' not found when resolving template", repo_name)
+        return None
+    items = list_templates_for_repo(fabric_host, access_token, repo_id)
+    t_norm = (template or "").strip().lower()
+    v_norm = (version or "").strip()
+    for item in items:
+        name_norm = (item.get('name') or "").strip().lower()
+        ver_val = (item.get('version') or "").strip()
+        if name_norm == t_norm and ver_val == v_norm:
+            logger.info("Template '%s' (version=%s) resolved to id %s", template, version, item.get('id'))
+            return item.get('id')
+    logger.info("Template '%s' (version=%s) not found", template, version)
+    return None
+
+
+def list_templates_for_repo(fabric_host, access_token, repo_id):
+    base_url = f"https://{fabric_host}/api/v1/system/repository/template"
     headers = {
         "Authorization": f"Bearer {access_token}",
         "Cache-Control": "no-cache"
     }
-    try:
-        response = requests.get(url_templates, headers=headers, verify=False, timeout=30)
-    except requests.RequestException as exc:
-        logger.error("Error listing templates: %s", exc)
-        return None
+    all_items = []
+    page = 1
+    per_page = 500
+    while True:
+        params = {
+            "select": f"repository={repo_id}",
+            "page": page,
+            "per_page": per_page,
+        }
+        try:
+            response = requests.get(base_url, headers=headers, params=params, verify=False, timeout=30)
+        except requests.RequestException as exc:
+            logger.error("Error listing templates for repo %s (page %s): %s", repo_id, page, exc)
+            break
+        if response.status_code != 200:
+            logger.error("Error listing templates for repo %s (page %s): %s - %s", repo_id, page, response.status_code, response.text)
+            break
+        try:
+            data = response.json()
+        except ValueError:
+            logger.error("Error parsing templates response as JSON for repo %s (page %s)", repo_id, page)
+            break
+        items = data.get('object', [])
+        if not items:
+            break
+        all_items.extend(items)
+        # If fewer than per_page returned, likely last page
+        if len(items) < per_page:
+            break
+        page += 1
+    return all_items
+
+
+def list_all_templates(fabric_host, access_token):
+    """Return flattened list of all templates across repositories with repo info."""
+    repos = list_repositories(fabric_host, access_token)
+    results = []
+    for repo in repos:
+        rid = repo.get('id')
+        rname = repo.get('name')
+        if not rid:
+            continue
+        templates = list_templates_for_repo(fabric_host, access_token, rid)
+        for t in templates:
+            t_copy = dict(t)
+            t_copy['repository_id'] = rid
+            t_copy['repository_name'] = rname
+            results.append(t_copy)
+    return results
     if response.status_code == 200:
         try:
             data = response.json()
@@ -320,9 +433,9 @@ def get_template(fabric_host, access_token, template, repo_name, version):
             return None
         for item in data.get("object", []):
             if item.get('name') == template and item.get('version') == version:
-                logger.info("Template '%s' (v%s) resolved to id %s", template, version, item.get('id'))
+                logger.info("Template '%s' (version=%s) resolved to id %s", template, version, item.get('id'))
                 return item.get('id')
-        logger.info("Template '%s' (v%s) not found", template, version)
+        logger.info("Template '%s' (version=%s) not found", template, version)
         return None
     else:
         logger.error("Error listing templates: %s - %s", response.status_code, response.text)

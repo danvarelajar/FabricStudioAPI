@@ -5,6 +5,18 @@
     <input id="apiBase" value="" size="40" type="text" />
   </div>
   <div class="row">
+    <label>NHI Credential</label>
+    <select id="nhiCredentialSelect" style="width: 287px;">
+      <option value="">Select NHI credential...</option>
+    </select>
+  </div>
+  <div class="row">
+    <label>Encryption Password</label>
+    <input id="nhiDecryptPassword" type="password" size="40" placeholder="Enter password to decrypt credential" />
+    <button id="btnLoadNhiCredential" style="margin-left: 4px;">Load</button>
+    <span id="nhiLoadStatus" style="font-size: 12px; color: #86868b; margin-left: 8px;"></span>
+  </div>
+  <div class="row">
     <label>Fabric Host</label>
     <div style="display: flex; flex-direction: column; gap: 8px; width: 600px;">
       <div style="display: flex; gap: 16px; align-items: flex-start;">
@@ -33,18 +45,6 @@
         </label>
       </div>
     </div>
-  </div>
-  <div class="row">
-    <label>NHI Credential</label>
-    <select id="nhiCredentialSelect" style="width: 287px;">
-      <option value="">Select NHI credential...</option>
-    </select>
-  </div>
-  <div class="row">
-    <label>Encryption Password</label>
-    <input id="nhiDecryptPassword" type="password" size="40" placeholder="Enter password to decrypt credential" />
-    <button id="btnLoadNhiCredential" style="margin-left: 4px;">Load</button>
-    <span id="nhiLoadStatus" style="font-size: 12px; color: #86868b; margin-left: 8px;"></span>
   </div>
   <div class="row">
     <label></label>
@@ -84,6 +84,7 @@
     <button id="btnInstallSelected" disabled>Run</button>
     <button id="btnSaveConfig">Save</button>
     <button id="btnCancelConfig">Cancel</button>
+    <button id="btnResetPreparation">Reset</button>
   </div>
   <div id="runProgressContainer" style="display:none; margin: 10px 0;">
     <div class="row" style="margin-bottom: 4px;">
