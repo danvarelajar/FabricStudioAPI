@@ -1,3 +1,6 @@
+# Ignore local log files
+logs/
+logs/**
 # Python
 __pycache__/
 *.py[cod]

@@ -1,6 +1,7 @@
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.types import ASGIApp
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import sqlite3
@@ -9,18 +10,35 @@ from datetime import datetime, date, time as dt_time
 from typing import Optional, List
 import threading
 import time
+import logging
 from cryptography.fernet import Fernet
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 from cryptography.hazmat.backends import default_backend
 import base64
+import os
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+logger = logging.getLogger(__name__)
 
 from fabricstudio.auth import get_access_token
 from fabricstudio.fabricstudio_api import (
     query_hostname, change_hostname, get_userId, change_password,
     reset_fabric, batch_delete, refresh_repositories,
-    get_template, create_fabric, install_fabric, check_tasks, get_running_task_count
+    get_template, create_fabric, install_fabric, check_tasks, get_running_task_count,
+    list_all_templates, list_templates_for_repo, get_repositoryId, list_repositories
 )
+import sqlite3
+import time
+import logging
+
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.WARNING)
 import requests
 import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -193,6 +211,22 @@ def init_db():
             print(f"Warning: Could not migrate cached_templates table: {e}")
     
     conn.commit()
+    
+    # Create table to store encrypted NHI passwords per event (for auto-run)
+    # Uses a server-managed secret to encrypt/decrypt
+    c = conn.cursor()
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS event_nhi_passwords (
+            event_id INTEGER PRIMARY KEY,
+            nhi_credential_id INTEGER NOT NULL,
+            password_encrypted TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (event_id) REFERENCES event_schedules(id) ON DELETE CASCADE,
+            FOREIGN KEY (nhi_credential_id) REFERENCES nhi_credentials(id) ON DELETE CASCADE
+        )
+    ''')
+    conn.commit()
     conn.close()
 
 # Encryption/Decryption functions for NHI credentials
@@ -229,6 +263,27 @@ def decrypt_client_secret(encrypted_secret: str, password: str) -> str:
     except Exception as e:
         raise ValueError(f"Decryption failed. Incorrect password or corrupted data: {str(e)}")
 
+# Server-managed secret for encrypting sensitive data at rest
+def _get_server_fernet() -> Fernet:
+    secret = os.environ.get('FS_SERVER_SECRET', '').strip()
+    if not secret:
+        # Warning: for development only. In production, set FS_SERVER_SECRET environment variable.
+        logger.warning("FS_SERVER_SECRET not set - using a weak in-process default. Set FS_SERVER_SECRET for security.")
+        secret = 'fabricstudio_dev_server_secret'
+    key = derive_key_from_password(secret, b'fabricstudio_server_secret_2024')
+    return Fernet(key)
+
+def encrypt_with_server_secret(plaintext: str) -> str:
+    f = _get_server_fernet()
+    enc = f.encrypt(plaintext.encode())
+    return base64.urlsafe_b64encode(enc).decode()
+
+def decrypt_with_server_secret(ciphertext_b64: str) -> str:
+    f = _get_server_fernet()
+    enc_bytes = base64.urlsafe_b64decode(ciphertext_b64.encode())
+    dec = f.decrypt(enc_bytes)
+    return dec.decode()
+
 # Initialize database on startup
 init_db()
 
@@ -263,7 +318,22 @@ def serve_styles_css():
 # Root: serve the SPA index
 @app.get("/")
 def root():
-    return FileResponse("frontend/index.html")
+    return FileResponse("frontend/index.html", headers={
+        "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+        "Pragma": "no-cache",
+        "Expires": "0",
+    })
+
+# Global no-cache for HTML/JSON responses to avoid stale frontend
+@app.middleware("http")
+async def add_no_cache_headers(request, call_next):
+    response = await call_next(request)
+    ct = response.headers.get("content-type", "")
+    if "text/html" in ct or "application/json" in ct or request.url.path in {"/", "/frontend/index.html"}:
+        response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["Expires"] = "0"
+    return response
 
 # Serve section HTML files for dynamic loading
 @app.get("/frontend/preparation.html")
@@ -413,6 +483,176 @@ def tasks_status(fabric_host: str, access_token: str):
     if count is None:
         raise HTTPException(400, "Failed to get task status")
     return {"running_count": count}
+
+
+def _init_db():
+    conn = sqlite3.connect('cache.db')
+    cur = conn.cursor()
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS templates (
+            id INTEGER PRIMARY KEY,
+            name TEXT,
+            version TEXT,
+            repository_id INTEGER,
+            repository_name TEXT,
+            raw_json TEXT,
+            updated_at INTEGER
+        )
+        """
+    )
+    conn.commit()
+    return conn
+
+
+@app.post("/preparation/confirm")
+def preparation_confirm(fabric_host: str, access_token: str):
+    # 1) refresh repos (async on host)
+    refresh_repositories(fabric_host, access_token)
+    # Wait for background repo refresh tasks to complete to ensure templates are up to date
+    try:
+        check_tasks(fabric_host, access_token, display_progress=False)
+    except Exception:
+        # Best-effort wait; continue even if polling fails
+        pass
+    # 2) fetch all templates across repos
+    templates = list_all_templates(fabric_host, access_token)
+    # 3) store/refresh cache
+    conn = _init_db()
+    cur = conn.cursor()
+    # Only replace cache if we actually fetched templates
+    if templates:
+        cur.execute("DELETE FROM templates")
+    now = int(time.time())
+    for t in templates:
+        cur.execute(
+            "INSERT OR REPLACE INTO templates (id, name, version, repository_id, repository_name, raw_json, updated_at) VALUES (?,?,?,?,?,?,?)",
+            (
+                t.get('id'), t.get('name'), t.get('version'),
+                t.get('repository') or t.get('repository_id'), t.get('repository_name'),
+                str(t), now
+            )
+        )
+    conn.commit()
+    conn.close()
+    return {"count": len(templates)}
+
+
+@app.get("/cache/templates")
+def cache_templates_get():
+    conn = _init_db()
+    cur = conn.cursor()
+    cur.execute("SELECT id, name, version, repository_id, repository_name FROM templates")
+    rows = cur.fetchall()
+    conn.close()
+    templates = [
+        {
+            "template_id": r[0],
+            "template_name": r[1],
+            "version": r[2],
+            "repo_id": r[3],
+            "repo_name": r[4],
+        }
+        for r in rows
+    ]
+    return {"templates": templates}
+
+
+class CacheTemplatesReq(BaseModel):
+    templates: list
+
+
+@app.post("/cache/templates")
+def cache_templates_post(req: CacheTemplatesReq):
+    conn = _init_db()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM templates")
+    now = int(time.time())
+    count = 0
+    for t in req.templates:
+        cur.execute(
+            "INSERT OR REPLACE INTO templates (id, name, version, repository_id, repository_name, raw_json, updated_at) VALUES (?,?,?,?,?,?,?)",
+            (
+                t.get('template_id'), t.get('template_name'), t.get('version'),
+                None, t.get('repo_name'), str(t), now
+            )
+        )
+        count += 1
+    conn.commit()
+    conn.close()
+    return {"count": count}
+
+
+@app.get("/repo/templates/list")
+def repo_templates_list(fabric_host: str, access_token: str, repo_name: str):
+    repo_id = get_repositoryId(fabric_host, access_token, repo_name)
+    if not repo_id:
+        # Fallback: list repos and try case-insensitive/alt-field match
+        repos = list_repositories(fabric_host, access_token)
+        target = None
+        for r in repos:
+            name = (r.get("name") or "").strip()
+            code = (r.get("code") or "").strip()
+            if name.lower() == repo_name.strip().lower() or code.lower() == repo_name.strip().lower():
+                target = r
+                break
+        if target:
+            repo_id = target.get("id")
+        if not repo_id:
+            raise HTTPException(404, "Repository not found")
+    templates = list_templates_for_repo(fabric_host, access_token, repo_id)
+    # Normalize response to include name, version, id
+    out = [
+        {"id": t.get("id"), "name": t.get("name"), "version": t.get("version")}
+        for t in templates
+    ]
+    return {"templates": out}
+
+
+@app.get("/repo/remotes")
+def repo_remotes(fabric_host: str, access_token: str):
+    repos = list_repositories(fabric_host, access_token)
+    out = [
+        {"id": r.get("id"), "name": r.get("name")}
+        for r in repos
+    ]
+    return {"repositories": out}
+
+
+# Compatibility endpoint used by preparation flow to resolve a single template_id
+@app.get("/repo/template")
+def repo_template_single(fabric_host: str, access_token: str, template_name: str, repo_name: str, version: str):
+    logger.info("/repo/template called with host=%s repo=%s template=%s version=%s", fabric_host, repo_name, template_name, version)
+    # Strict: resolve repository by name/code (case-insensitive), but DO NOT search other repos for the template
+    repos = list_repositories(fabric_host, access_token)
+    logger.info("Fetched %d repositories from host %s", len(repos), fabric_host)
+    repo_input = (repo_name or "").strip()
+    match = None
+    for r in repos:
+        name = (r.get("name") or "").strip()
+        code = (r.get("code") or "").strip()
+        if name.lower() == repo_input.lower() or code.lower() == repo_input.lower():
+            match = r
+            break
+    if not match:
+        logger.warning("Repository not found for repo_name='%s'. Available repos: %s", repo_input, [ (r.get('id'), r.get('name')) for r in repos ])
+        raise HTTPException(404, "Repository not found")
+
+    rid = match.get("id")
+    logger.info("Matched repository id=%s name=%s", rid, match.get("name"))
+    templates = list_templates_for_repo(fabric_host, access_token, rid)
+    logger.info("Retrieved %d templates from repo id=%s", len(templates), rid)
+    tname_norm = (template_name or "").strip().lower()
+    ver_norm = (version or "").strip()
+    for t in templates:
+        name_norm = (t.get("name") or "").strip().lower()
+        ver_val = (t.get("version") or "").strip()
+        if name_norm == tname_norm and ver_val == ver_norm:
+            logger.info("Template matched in repo id=%s: id=%s name='%s' version='%s'", rid, t.get("id"), t.get("name"), t.get("version"))
+            return {"template_id": t.get("id")}
+    sample = [{"id": x.get("id"), "name": x.get("name"), "version": x.get("version")} for x in templates[:5]]
+    logger.warning("Template not found in repo '%s'. Looking for name='%s' version='%s'. Sample: %s", match.get("name"), template_name, version, sample)
+    raise HTTPException(404, "Template not found")
 
 
 # New lightweight proxy endpoints for repository/template metadata
@@ -715,6 +955,7 @@ class CreateEventReq(BaseModel):
     configuration_id: int
     auto_run: bool = False
     id: int = None  # Optional ID for updating existing event
+    nhi_password: Optional[str] = None  # Optional password to decrypt NHI client secret for auto-run
 
 
 class EventListItem(BaseModel):
@@ -770,6 +1011,32 @@ def save_event(req: CreateEventReq):
             ''', (req.name.strip(), req.event_date, req.event_time, req.configuration_id, 1 if req.auto_run else 0))
             action = "saved"
             event_id = c.lastrowid
+        
+        # If an NHI password was provided, find the configuration's NHI credential and store password encrypted
+        try:
+            if req.nhi_password and req.nhi_password.strip():
+                # Load configuration to extract nhiCredentialId
+                c.execute('SELECT config_data FROM configurations WHERE id = ?', (req.configuration_id,))
+                cfg_row = c.fetchone()
+                if cfg_row:
+                    cfg = json.loads(cfg_row[0])
+                    nhi_cred_id = cfg.get('nhiCredentialId')
+                    if nhi_cred_id:
+                        pwd_enc = encrypt_with_server_secret(req.nhi_password.strip())
+                        # Upsert into event_nhi_passwords
+                        c.execute('''
+                            INSERT INTO event_nhi_passwords (event_id, nhi_credential_id, password_encrypted, updated_at)
+                            VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+                            ON CONFLICT(event_id) DO UPDATE SET
+                                nhi_credential_id=excluded.nhi_credential_id,
+                                password_encrypted=excluded.password_encrypted,
+                                updated_at=CURRENT_TIMESTAMP
+                        ''', (event_id, int(nhi_cred_id), pwd_enc))
+                        logger.info(f"Stored encrypted NHI password for event_id={event_id}, nhi_credential_id={nhi_cred_id}")
+                    else:
+                        logger.warning(f"Configuration {req.configuration_id} has no nhiCredentialId; skipping password store")
+        except Exception as e:
+            logger.error(f"Error storing NHI password for event {event_id}: {e}", exc_info=True)
         
         conn.commit()
         return {"status": "ok", "message": f"Event '{req.name}' {action} successfully", "id": event_id}
@@ -915,10 +1182,11 @@ def execute_event(event_id: int, background_tasks: BackgroundTasks):
         config_id, config_data_json, event_name = row
         config_data = json.loads(config_data_json)
         
-        # Execute in background
-        background_tasks.add_task(run_configuration, config_data, event_name)
-        
-        return {"status": "ok", "message": f"Event '{event_name}' execution started"}
+        # Execute synchronously to return detailed status
+        result = run_configuration(config_data, event_name, event_id)
+        if isinstance(result, dict):
+            return result
+        return {"status": "ok", "message": f"Event '{event_name}' executed"}
     except json.JSONDecodeError:
         raise HTTPException(500, "Invalid configuration data")
     except sqlite3.Error as e:
@@ -927,16 +1195,17 @@ def execute_event(event_id: int, background_tasks: BackgroundTasks):
         conn.close()
 
 
-def run_configuration(config_data: dict, event_name: str):
+def run_configuration(config_data: dict, event_name: str, event_id: Optional[int] = None):
     """Execute a configuration (same logic as frontend Run button)"""
-    print(f"[AUTO-RUN] Starting execution for event: {event_name}")
+    logger.info(f"Starting auto-run execution for event: {event_name}")
     
     try:
+        errors = []
         # Extract configuration data
         hosts = config_data.get('confirmedHosts', [])
         if not hosts:
-            print(f"[AUTO-RUN] No hosts configured for event {event_name}")
-            return
+            logger.warning(f"No hosts configured for event {event_name}")
+            return {"status": "error", "message": "No hosts configured", "errors": ["No hosts configured"], "event": event_name}
         
         client_id = config_data.get('clientId', '')
         client_secret = config_data.get('clientSecret', '')
@@ -945,8 +1214,35 @@ def run_configuration(config_data: dict, event_name: str):
         templates_list = config_data.get('templates', [])
         install_select = config_data.get('installSelect', '')
         
+        logger.info(f"Event '{event_name}': Configuration loaded - {len(hosts)} host(s), {len(templates_list)} template(s)")
+        
+        # If client_secret missing, try retrieving from stored NHI password and credential
+        if not client_secret and event_id is not None:
+            try:
+                conn = sqlite3.connect(DB_PATH)
+                c = conn.cursor()
+                # Get stored password and related credential id
+                c.execute('SELECT nhi_credential_id, password_encrypted FROM event_nhi_passwords WHERE event_id = ?', (event_id,))
+                row = c.fetchone()
+                if row:
+                    nhi_cred_id, pwd_enc = row
+                    nhi_password = decrypt_with_server_secret(pwd_enc)
+                    # Fetch encrypted client secret and client_id
+                    c.execute('SELECT client_id, client_secret_encrypted FROM nhi_credentials WHERE id = ?', (nhi_cred_id,))
+                    cred = c.fetchone()
+                    if cred:
+                        client_id_db, client_secret_encrypted = cred
+                        if not client_id:
+                            client_id = client_id_db or client_id
+                        if client_secret_encrypted:
+                            client_secret = decrypt_client_secret(client_secret_encrypted, nhi_password)
+                            logger.info(f"Event '{event_name}': Retrieved and decrypted client secret from stored credential (id={nhi_cred_id})")
+                conn.close()
+            except Exception as e:
+                logger.error(f"Event '{event_name}': Failed to retrieve/decrypt client secret for event {event_id}: {e}", exc_info=True)
+
         # Step 1: Get fresh tokens for all hosts
-        print(f"[AUTO-RUN] Acquiring tokens for {len(hosts)} host(s)...")
+        logger.info(f"Event '{event_name}': Acquiring tokens for {len(hosts)} host(s)...")
         host_tokens = {}
         for host_info in hosts:
             host = host_info.get('host', '')
@@ -954,68 +1250,89 @@ def run_configuration(config_data: dict, event_name: str):
                 token_data = get_access_token(client_id, client_secret, host)
                 if token_data and token_data.get("access_token"):
                     host_tokens[host] = token_data.get("access_token")
-                    print(f"[AUTO-RUN] Token acquired for {host}")
+                    logger.info(f"Event '{event_name}': Token acquired for host {host}")
                 else:
-                    print(f"[AUTO-RUN] Failed to acquire token for {host}")
-                    return
+                    msg = f"Failed to acquire token for host {host}"
+                    logger.error(f"Event '{event_name}': {msg}")
+                    errors.append(msg)
+                    return {"status": "error", "message": msg, "errors": errors, "event": event_name}
             except Exception as e:
-                print(f"[AUTO-RUN] Error acquiring token for {host}: {e}")
-                return
+                msg = f"Error acquiring token for host {host}: {e}"
+                logger.error(f"Event '{event_name}': {msg}")
+                errors.append(msg)
+                return {"status": "error", "message": msg, "errors": errors, "event": event_name}
         
         # Step 2: Execute preparation steps
-        print(f"[AUTO-RUN] Executing preparation steps...")
+        logger.info(f"Event '{event_name}': Executing preparation steps...")
         
         # Refresh repositories
-        print(f"[AUTO-RUN] Refreshing repositories...")
+        logger.info(f"Event '{event_name}': Refreshing repositories...")
         for host in host_tokens.keys():
             try:
                 refresh_repositories(host, host_tokens[host])
-                print(f"[AUTO-RUN] Repositories refreshed for {host}")
+                logger.info(f"Event '{event_name}': Repositories refreshed for host {host}")
             except Exception as e:
-                print(f"[AUTO-RUN] Error refreshing repositories on {host}: {e}")
+                msg = f"Error refreshing repositories on host {host}: {e}"
+                logger.error(f"Event '{event_name}': {msg}")
+                errors.append(msg)
         
         # Uninstall workspaces (reset)
-        print(f"[AUTO-RUN] Uninstalling workspaces...")
+        logger.info(f"Event '{event_name}': Uninstalling workspaces...")
         for host in host_tokens.keys():
             try:
                 reset_fabric(host, host_tokens[host])
-                print(f"[AUTO-RUN] Workspaces uninstalled for {host}")
+                logger.info(f"Event '{event_name}': Workspaces uninstalled for host {host}")
             except Exception as e:
-                print(f"[AUTO-RUN] Error uninstalling workspaces on {host}: {e}")
+                msg = f"Error uninstalling workspaces on host {host}: {e}"
+                logger.error(f"Event '{event_name}': {msg}")
+                errors.append(msg)
         
         # Remove workspaces (batch delete)
-        print(f"[AUTO-RUN] Removing workspaces...")
+        logger.info(f"Event '{event_name}': Removing workspaces...")
         for host in host_tokens.keys():
             try:
                 batch_delete(host, host_tokens[host])
-                print(f"[AUTO-RUN] Workspaces removed for {host}")
+                logger.info(f"Event '{event_name}': Workspaces removed for host {host}")
             except Exception as e:
-                print(f"[AUTO-RUN] Error removing workspaces on {host}: {e}")
+                msg = f"Error removing workspaces on host {host}: {e}"
+                logger.error(f"Event '{event_name}': {msg}")
+                errors.append(msg)
         
         # Change hostname if provided
         if new_hostname:
-            print(f"[AUTO-RUN] Changing hostnames...")
+            logger.info(f"Event '{event_name}': Changing hostnames to base '{new_hostname}'...")
             for i, host in enumerate(host_tokens.keys()):
                 try:
                     hostname = f"{new_hostname}{i + 1}"
                     change_hostname(host, host_tokens[host], hostname)
-                    print(f"[AUTO-RUN] Hostname changed to {hostname} for {host}")
+                    logger.info(f"Event '{event_name}': Hostname changed to {hostname} for host {host}")
                 except Exception as e:
-                    print(f"[AUTO-RUN] Error changing hostname on {host}: {e}")
+                    msg = f"Error changing hostname on host {host}: {e}"
+                    logger.error(f"Event '{event_name}': {msg}")
+                    errors.append(msg)
         
         # Change password if provided
         if new_password:
-            print(f"[AUTO-RUN] Changing password...")
+            logger.info(f"Event '{event_name}': Changing guest password...")
             for host in host_tokens.keys():
                 try:
-                    change_password(host, host_tokens[host], 'guest', new_password)
-                    print(f"[AUTO-RUN] Password changed for {host}")
+                    # Resolve user id for 'guest' first
+                    user_id = get_userId(host, host_tokens[host], 'guest')
+                    if not user_id:
+                        msg = f"Guest user not found on host {host}"
+                        logger.error(f"Event '{event_name}': {msg}")
+                        errors.append(msg)
+                        continue
+                    change_password(host, host_tokens[host], user_id, new_password)
+                    logger.info(f"Event '{event_name}': Password changed for host {host}")
                 except Exception as e:
-                    print(f"[AUTO-RUN] Error changing password on {host}: {e}")
+                    msg = f"Error changing password on host {host}: {e}"
+                    logger.error(f"Event '{event_name}': {msg}")
+                    errors.append(msg)
         
         # Step 3: Create all workspace templates
         if templates_list:
-            print(f"[AUTO-RUN] Creating {len(templates_list)} workspace template(s)...")
+            logger.info(f"Event '{event_name}': Creating {len(templates_list)} workspace template(s)...")
             for template_info in templates_list:
                 template_name = template_info.get('template_name', '')
                 repo_name = template_info.get('repo_name', '')
@@ -1024,17 +1341,17 @@ def run_configuration(config_data: dict, event_name: str):
                 if not (template_name and repo_name and version):
                     continue
                 
-                print(f"[AUTO-RUN] Creating template: {template_name} v{version}")
+                logger.info(f"Event '{event_name}': Creating template '{template_name}' v{version} from repo '{repo_name}'...")
                 
                 # Check for running tasks before creating
                 for host in host_tokens.keys():
                     try:
                         running_count = get_running_task_count(host, host_tokens[host])
                         if running_count > 0:
-                            print(f"[AUTO-RUN] Waiting for {running_count} running task(s) on {host}...")
+                            logger.info(f"Event '{event_name}': Waiting for {running_count} running task(s) on host {host}...")
                             check_tasks(host, host_tokens[host], display_progress=False)
                     except Exception as e:
-                        print(f"[AUTO-RUN] Warning: Error checking tasks on {host}: {e}")
+                        logger.warning(f"Event '{event_name}': Error checking tasks on host {host}: {e}")
                 
                 # Create template on all hosts
                 for host in host_tokens.keys():
@@ -1042,20 +1359,24 @@ def run_configuration(config_data: dict, event_name: str):
                         # Get template ID
                         template_id = get_template(host, host_tokens[host], template_name, repo_name, version)
                         if template_id:
-                            # Create fabric
-                            create_fabric(host, host_tokens[host], template_id)
-                            print(f"[AUTO-RUN] Template {template_name} created on {host}")
+                            # Create fabric (pass template name and version per API signature)
+                            create_fabric(host, host_tokens[host], template_id, template_name, version)
+                            logger.info(f"Event '{event_name}': Template '{template_name}' v{version} created on host {host}")
                         else:
-                            print(f"[AUTO-RUN] Template {template_name} not found on {host}")
+                            logger.warning(f"Event '{event_name}': Template '{template_name}' v{version} not found on host {host}")
                     except Exception as e:
-                        print(f"[AUTO-RUN] Error creating template {template_name} on {host}: {e}")
+                        msg = f"Error creating template '{template_name}' v{version} on host {host}: {e}"
+                        logger.error(f"Event '{event_name}': {msg}")
+                        errors.append(msg)
                 
                 # Wait for tasks to complete after each template
                 for host in host_tokens.keys():
                     try:
                         check_tasks(host, host_tokens[host], display_progress=False)
                     except Exception as e:
-                        print(f"[AUTO-RUN] Warning: Error waiting for tasks on {host}: {e}")
+                        msg = f"Error waiting for tasks on host {host}: {e}"
+                        logger.warning(f"Event '{event_name}': {msg}")
+                        errors.append(msg)
         
         # Step 4: Install selected workspace
         if install_select:
@@ -1068,28 +1389,35 @@ def run_configuration(config_data: dict, event_name: str):
                     break
             
             if repo_name:
-                print(f"[AUTO-RUN] Installing workspace: {template_name} v{version}")
+                logger.info(f"Event '{event_name}': Installing workspace '{template_name}' v{version} from repo '{repo_name}'...")
                 for host in host_tokens.keys():
                     try:
                         template_id = get_template(host, host_tokens[host], template_name, repo_name, version)
                         if template_id:
-                            install_fabric(host, host_tokens[host], template_id)
-                            print(f"[AUTO-RUN] Workspace {template_name} installed on {host}")
+                            # install_fabric expects template name and version, not id
+                            install_fabric(host, host_tokens[host], template_name, version)
+                            logger.info(f"Event '{event_name}': Workspace '{template_name}' v{version} installed on host {host}")
                         else:
-                            print(f"[AUTO-RUN] Template {template_name} not found on {host} for installation")
+                            logger.warning(f"Event '{event_name}': Template '{template_name}' v{version} not found on host {host} for installation")
                     except Exception as e:
-                        print(f"[AUTO-RUN] Error installing workspace {template_name} on {host}: {e}")
+                        msg = f"Error installing workspace '{template_name}' v{version} on host {host}: {e}"
+                        logger.error(f"Event '{event_name}': {msg}")
+                        errors.append(msg)
             else:
-                print(f"[AUTO-RUN] Repository name not found for {template_name} v{version}")
+                msg = f"Repository name not found for template '{template_name}' v{version}"
+                logger.warning(f"Event '{event_name}': {msg}")
+                errors.append(msg)
         else:
-            print(f"[AUTO-RUN] No workspace selected for installation")
+            logger.info(f"Event '{event_name}': No workspace selected for installation")
         
-        print(f"[AUTO-RUN] Execution completed for event: {event_name}")
-        
+        if errors:
+            logger.error(f"Auto-run execution completed with errors for event: {event_name}")
+            return {"status": "error", "message": "Auto-run completed with errors", "errors": errors, "event": event_name}
+        logger.info(f"Auto-run execution completed successfully for event: {event_name}")
+        return {"status": "ok", "message": "Auto-run execution completed successfully", "event": event_name}
     except Exception as e:
-        print(f"[AUTO-RUN] Error executing configuration for event {event_name}: {e}")
-        import traceback
-        traceback.print_exc()
+        logger.error(f"Error executing configuration for event '{event_name}': {e}", exc_info=True)
+        return {"status": "error", "message": str(e), "errors": [str(e)], "event": event_name}
 
 
 # NHI Management endpoints
@@ -1449,9 +1777,15 @@ def delete_nhi(nhi_id: int):
         conn.close()
 
 
+# Track events that have been executed to prevent duplicates
+executed_events = set()
+
 # Background scheduler to check for events that need to run
 def check_and_run_events():
     """Check for events that should run now and execute them"""
+    global executed_events
+    logger.info("Background event scheduler started and running...")
+    
     while True:
         try:
             now = datetime.now()
@@ -1462,39 +1796,66 @@ def check_and_run_events():
             c = conn.cursor()
             
             # Find events that should run now (auto_run enabled, date matches, time matches or no time specified)
+            # Compare times by converting to string format HH:MM:SS or HH:MM
+            current_time_str = current_time.strftime('%H:%M:%S') if current_time else None
+            
             c.execute('''
                 SELECT id, name, event_date, event_time
                 FROM event_schedules
                 WHERE auto_run = 1
                 AND event_date = ?
-                AND (event_time IS NULL OR event_time = ?)
-            ''', (str(current_date), str(current_time)))
+                AND (event_time IS NULL OR event_time = ? OR SUBSTR(event_time, 1, 5) = ?)
+            ''', (str(current_date), current_time_str, current_time.strftime('%H:%M') if current_time else None))
             
             events_to_run = c.fetchall()
-            conn.close()
+            
+            if events_to_run:
+                logger.info(f"Scheduler check at {now.strftime('%Y-%m-%d %H:%M:%S')}: Found {len(events_to_run)} event(s) to run")
+            
+            # Clean up executed events from previous days
+            if events_to_run:
+                today_str = str(current_date)
+                executed_events = {e for e in executed_events if str(e).startswith(today_str)}
             
             for event_id, event_name, event_date, event_time in events_to_run:
-                print(f"[SCHEDULER] Found event to run: {event_name} (ID: {event_id})")
+                # Create unique key for this event execution
+                event_key = f"{event_date}_{event_time or 'all'}_{event_id}"
+                
+                # Skip if already executed
+                if event_key in executed_events:
+                    logger.info(f"Skipping event '{event_name}' (ID: {event_id}) - already executed today")
+                    continue
+                
+                logger.info(f"Found scheduled event to run: '{event_name}' (ID: {event_id}) scheduled for {event_date} at {event_time or '00:00:00'}")
+                
+                # Mark as executed before starting (to prevent duplicate if scheduler runs again)
+                executed_events.add(event_key)
+                
                 try:
-                    # Make internal request to execute endpoint
-                    # We'll use threading to execute in background
-                    thread = threading.Thread(target=execute_event_internal, args=(event_id,))
-                    thread.daemon = True
+                    # Execute in background thread
+                    thread = threading.Thread(target=execute_event_internal, args=(event_id, event_name))
+                    thread.daemon = False  # Keep thread alive until execution completes
                     thread.start()
+                    logger.info(f"Started execution thread for event '{event_name}' (ID: {event_id})")
                 except Exception as e:
-                    print(f"[SCHEDULER] Error executing event {event_id}: {e}")
+                    logger.error(f"Error starting execution thread for event {event_id}: {e}", exc_info=True)
+                    # Remove from executed set if we failed to start
+                    executed_events.discard(event_key)
             
-            # Check every minute
-            time.sleep(60)
+            conn.close()
+            
+            # Check every 30 seconds for more accurate timing
+            time.sleep(30)
             
         except Exception as e:
-            print(f"[SCHEDULER] Error in scheduler: {e}")
+            logger.error(f"Error in scheduler: {e}", exc_info=True)
             time.sleep(60)
 
 
-def execute_event_internal(event_id: int):
+def execute_event_internal(event_id: int, event_name: str = None):
     """Internal function to execute an event"""
     try:
+        logger.info(f"Executing event internally: event_id={event_id}, event_name={event_name or 'unknown'}")
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
         
@@ -1508,11 +1869,16 @@ def execute_event_internal(event_id: int):
         conn.close()
         
         if row:
-            config_id, config_data_json, event_name = row
+            config_id, config_data_json, db_event_name = row
+            event_name = event_name or db_event_name
             config_data = json.loads(config_data_json)
-            run_configuration(config_data, event_name)
+            logger.info(f"Starting auto-run execution for event '{event_name}' (ID: {event_id})")
+            run_configuration(config_data, event_name, event_id)
+            logger.info(f"Completed auto-run execution for event '{event_name}' (ID: {event_id})")
+        else:
+            logger.warning(f"Event {event_id} not found or auto_run is disabled")
     except Exception as e:
-        print(f"[AUTO-RUN] Error executing event {event_id}: {e}")
+        logger.error(f"Error executing event {event_id}: {e}", exc_info=True)
 
 
 # Start scheduler in background thread on startup
@@ -1522,9 +1888,12 @@ scheduler_thread = None
 def start_scheduler():
     """Start the background scheduler on application startup"""
     global scheduler_thread
-    scheduler_thread = threading.Thread(target=check_and_run_events)
-    scheduler_thread.daemon = True
-    scheduler_thread.start()
-    print("[SCHEDULER] Background event scheduler started")
+    if scheduler_thread is None or not scheduler_thread.is_alive():
+        scheduler_thread = threading.Thread(target=check_and_run_events)
+        scheduler_thread.daemon = True  # Allow main process to exit
+        scheduler_thread.start()
+        logger.info("Background event scheduler thread started")
+    else:
+        logger.info("Background event scheduler already running")
 
 
