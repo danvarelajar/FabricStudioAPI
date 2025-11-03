@@ -39,11 +39,112 @@ Or the database will be automatically created when you first run the application
 
 ### Running the Application
 
+**Option 1: Run locally (without Docker)**
 ```bash
 uvicorn app:app --reload --port 8000
 ```
 
+**Option 2: Run with Docker (Recommended)**
+
+This project uses **Colima** (a lightweight Docker alternative for Mac) instead of Docker Desktop. See [Docker Deployment](#docker-deployment) section below for details.
+
 The application will be available at `http://localhost:8000`
+
+## Docker Deployment
+
+This project uses **Colima** as a lightweight Docker alternative for Mac. Colima is much lighter than Docker Desktop (~200MB vs 1GB+) and works seamlessly with Docker commands.
+
+### Prerequisites
+
+- Colima installed (see setup instructions below)
+- Docker Compose installed
+
+### Quick Setup
+
+1. **Install Colima (one command):**
+   ```bash
+   ./setup-colima.sh
+   ```
+
+2. **Set up environment variables:**
+   ```bash
+   cp env.example .env
+   # Edit .env and set FS_SERVER_SECRET (generate with: openssl rand -base64 32)
+   ```
+
+3. **Start the application:**
+   ```bash
+   ./docker-start.sh
+   ```
+
+### Manual Setup
+
+If you prefer to set up manually:
+
+1. **Install Colima:**
+   ```bash
+   brew install colima docker docker-compose
+   colima start
+   ```
+
+2. **Create environment file:**
+   ```bash
+   cp env.example .env
+   # Edit .env and set FS_SERVER_SECRET
+   ```
+
+3. **Build and start:**
+   ```bash
+   docker-compose build
+   docker-compose up -d
+   ```
+
+### Building the Docker Image
+
+To build the Docker image:
+```bash
+docker-compose build
+```
+
+To rebuild from scratch (no cache):
+```bash
+docker-compose build --no-cache
+```
+
+### Starting/Stopping the Container
+
+**Start:**
+```bash
+docker-compose up -d
+```
+
+**Stop:**
+```bash
+docker-compose down
+```
+
+**View logs:**
+```bash
+docker-compose logs -f
+```
+
+### Database Persistence
+
+The database and logs are stored in the `./data` and `./logs` directories, which are mounted as volumes. This ensures:
+- Data persists across container restarts
+- Easy backup and restore
+- Data survives container deletion
+
+**Important:** Backup the `./data` directory regularly!
+
+### Security Notes
+
+- The `FS_SERVER_SECRET` environment variable is **required** for encrypting sensitive data in the database
+- Never commit `.env` file to version control
+- The container runs as a non-root user for enhanced security
+- All sensitive data (passwords, tokens) are encrypted before storage
+
+For more detailed Docker documentation, see [DOCKER.md](DOCKER.md) or [README-DOCKER.md](README-DOCKER.md).
 
 ## Database
 
