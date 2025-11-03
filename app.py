@@ -6,7 +6,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import sqlite3
 import json
-from datetime import datetime, date, time as dt_time
+from datetime import datetime, date, time as dt_time, timedelta
 from typing import Optional, List
 import threading
 import time
@@ -1358,18 +1358,114 @@ def run_configuration(config_data: dict, event_name: str, event_id: Optional[int
             except Exception as e:
                 logger.error(f"Event '{event_name}': Failed to retrieve/decrypt client secret for event {event_id}: {e}", exc_info=True)
 
-        # Step 1: Get fresh tokens for all hosts
+        # Step 1: Get tokens for all hosts (reuse stored if valid, otherwise fetch new)
         logger.info(f"Event '{event_name}': Acquiring tokens for {len(hosts)} host(s)...")
         host_tokens = {}
+        
+        # Check if we have NHI credential ID to look up stored tokens
+        nhi_cred_id = None
+        nhi_password = None
+        if event_id is not None:
+            try:
+                conn = sqlite3.connect(DB_PATH)
+                c = conn.cursor()
+                c.execute('SELECT nhi_credential_id, password_encrypted FROM event_nhi_passwords WHERE event_id = ?', (event_id,))
+                nhi_row = c.fetchone()
+                if nhi_row:
+                    nhi_cred_id = nhi_row[0]
+                    nhi_password = decrypt_with_server_secret(nhi_row[1])
+                conn.close()
+            except Exception as e:
+                logger.warning(f"Event '{event_name}': Could not retrieve NHI credential info: {e}")
+        
         for host_info in hosts:
             host = host_info.get('host', '')
-            try:
-                token_data = get_access_token(client_id, client_secret, host)
-                if token_data and token_data.get("access_token"):
-                    host_tokens[host] = token_data.get("access_token")
-                    logger.info(f"Event '{event_name}': Token acquired for host {host}")
-                else:
-                    msg = f"Failed to acquire token for host {host}"
+            token_fetched = False
+            
+            # First, try to reuse stored token from NHI credential if available
+            if nhi_cred_id and nhi_password:
+                try:
+                    conn = sqlite3.connect(DB_PATH)
+                    c = conn.cursor()
+                    c.execute('SELECT token_encrypted, token_expires_at FROM nhi_tokens WHERE nhi_credential_id = ? AND fabric_host = ?', (nhi_cred_id, host))
+                    token_row = c.fetchone()
+                    if token_row:
+                        token_encrypted, token_expires_at_str = token_row
+                        if token_expires_at_str:
+                            expires_at = datetime.fromisoformat(token_expires_at_str)
+                            now = datetime.now()
+                            if expires_at > now:
+                                # Token is still valid, reuse it
+                                decrypted_token = decrypt_client_secret(token_encrypted, nhi_password)
+                                host_tokens[host] = decrypted_token
+                                delta = expires_at - now
+                                hours = int(delta.total_seconds() // 3600)
+                                minutes = int((delta.total_seconds() % 3600) // 60)
+                                logger.info(f"Event '{event_name}': Reusing stored token for host {host} (expires in {hours}h {minutes}m)")
+                                token_fetched = True
+                            else:
+                                logger.info(f"Event '{event_name}': Stored token for host {host} has expired, will fetch new token")
+                    conn.close()
+                except Exception as e:
+                    logger.warning(f"Event '{event_name}': Error checking stored token for {host}: {e}, will fetch new token")
+            
+            # If no valid stored token, fetch a new one
+            if not token_fetched:
+                try:
+                    token_data = get_access_token(client_id, client_secret, host)
+                    if token_data and token_data.get("access_token"):
+                        host_tokens[host] = token_data.get("access_token")
+                        logger.info(f"Event '{event_name}': Token acquired for host {host}")
+                        
+                        # Store the new token in nhi_tokens if we have NHI credential
+                        if nhi_cred_id and nhi_password:
+                            try:
+                                expires_in = token_data.get("expires_in")
+                                if expires_in:
+                                    expires_at = datetime.now() + timedelta(seconds=expires_in)
+                                    token_expires_at = expires_at.isoformat()
+                                    token_encrypted = encrypt_client_secret(token_data.get("access_token"), nhi_password)
+                                    
+                                    conn = sqlite3.connect(DB_PATH)
+                                    c = conn.cursor()
+                                    c.execute('''
+                                        INSERT OR REPLACE INTO nhi_tokens 
+                                        (nhi_credential_id, fabric_host, token_encrypted, token_expires_at, updated_at)
+                                        VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+                                    ''', (nhi_cred_id, host, token_encrypted, token_expires_at))
+                                    conn.commit()
+                                    conn.close()
+                                    logger.info(f"Event '{event_name}': Stored new token for host {host} in NHI credential")
+                            except Exception as e:
+                                logger.warning(f"Event '{event_name}': Failed to store token for {host}: {e}")
+                    else:
+                        msg = f"Failed to acquire token for host {host}"
+                        logger.error(f"Event '{event_name}': {msg}")
+                        errors.append(msg)
+                        completed_at = datetime.now()
+                        if execution_record_id is not None:
+                            conn = sqlite3.connect(DB_PATH)
+                            c = conn.cursor()
+                            try:
+                                c.execute('''
+                                    UPDATE event_executions
+                                    SET status = ?, message = ?, errors = ?, completed_at = ?
+                                    WHERE id = ?
+                                ''', (
+                                    'error',
+                                    msg,
+                                    json.dumps(errors),
+                                    completed_at.isoformat(),
+                                    execution_record_id
+                                ))
+                                conn.commit()
+                            except sqlite3.Error as db_err:
+                                logger.error(f"Failed to update execution record: {db_err}")
+                            finally:
+                                conn.close()
+                        return {"status": "error", "message": msg, "errors": errors, "event": event_name}
+                except Exception as e:
+                    msg = f"Error acquiring token for host {host}: {e}"
                     logger.error(f"Event '{event_name}': {msg}")
                     errors.append(msg)
                     completed_at = datetime.now()
@@ -1394,32 +1490,6 @@ def run_configuration(config_data: dict, event_name: str, event_id: Optional[int
                         finally:
                             conn.close()
                     return {"status": "error", "message": msg, "errors": errors, "event": event_name}
-            except Exception as e:
-                msg = f"Error acquiring token for host {host}: {e}"
-                logger.error(f"Event '{event_name}': {msg}")
-                errors.append(msg)
-                completed_at = datetime.now()
-                if execution_record_id is not None:
-                    conn = sqlite3.connect(DB_PATH)
-                    c = conn.cursor()
-                    try:
-                        c.execute('''
-                            UPDATE event_executions
-                            SET status = ?, message = ?, errors = ?, completed_at = ?
-                            WHERE id = ?
-                        ''', (
-                            'error',
-                            msg,
-                            json.dumps(errors),
-                            completed_at.isoformat(),
-                            execution_record_id
-                        ))
-                        conn.commit()
-                    except sqlite3.Error as db_err:
-                        logger.error(f"Failed to update execution record: {db_err}")
-                    finally:
-                        conn.close()
-                return {"status": "error", "message": msg, "errors": errors, "event": event_name}
         
         # Step 2: Execute preparation steps
         logger.info(f"Event '{event_name}': Executing preparation steps...")
@@ -1510,7 +1580,9 @@ def run_configuration(config_data: dict, event_name: str, event_id: Optional[int
                             logger.info(f"Event '{event_name}': Waiting for {running_count} running task(s) on host {host}...")
                             check_tasks(host, host_tokens[host], display_progress=False)
                     except Exception as e:
-                        logger.warning(f"Event '{event_name}': Error checking tasks on host {host}: {e}")
+                        msg = f"Error checking tasks on host {host}: {e}"
+                        logger.error(f"Event '{event_name}': {msg}")
+                        errors.append(msg)
                 
                 # Create template on all hosts
                 for host in host_tokens.keys():
@@ -1522,7 +1594,9 @@ def run_configuration(config_data: dict, event_name: str, event_id: Optional[int
                             create_fabric(host, host_tokens[host], template_id, template_name, version)
                             logger.info(f"Event '{event_name}': Template '{template_name}' v{version} created on host {host}")
                         else:
-                            logger.warning(f"Event '{event_name}': Template '{template_name}' v{version} not found on host {host}")
+                            msg = f"Template '{template_name}' v{version} not found on host {host}"
+                            logger.error(f"Event '{event_name}': {msg}")
+                            errors.append(msg)
                     except Exception as e:
                         msg = f"Error creating template '{template_name}' v{version} on host {host}: {e}"
                         logger.error(f"Event '{event_name}': {msg}")
@@ -1557,7 +1631,9 @@ def run_configuration(config_data: dict, event_name: str, event_id: Optional[int
                             install_fabric(host, host_tokens[host], template_name, version)
                             logger.info(f"Event '{event_name}': Workspace '{template_name}' v{version} installed on host {host}")
                         else:
-                            logger.warning(f"Event '{event_name}': Template '{template_name}' v{version} not found on host {host} for installation")
+                            msg = f"Template '{template_name}' v{version} not found on host {host} for installation"
+                            logger.error(f"Event '{event_name}': {msg}")
+                            errors.append(msg)
                     except Exception as e:
                         msg = f"Error installing workspace '{template_name}' v{version} on host {host}: {e}"
                         logger.error(f"Event '{event_name}': {msg}")
