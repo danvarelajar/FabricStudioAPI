@@ -38,7 +38,6 @@ import time
 import logging
 
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.WARNING)
 import requests
 import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -224,6 +223,21 @@ def init_db():
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (event_id) REFERENCES event_schedules(id) ON DELETE CASCADE,
             FOREIGN KEY (nhi_credential_id) REFERENCES nhi_credentials(id) ON DELETE CASCADE
+        )
+    ''')
+    
+    # Create table to store execution records for scheduled events
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS event_executions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_id INTEGER NOT NULL,
+            status TEXT NOT NULL,
+            message TEXT,
+            errors TEXT,
+            started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            completed_at TIMESTAMP,
+            execution_details TEXT,
+            FOREIGN KEY (event_id) REFERENCES event_schedules(id) ON DELETE CASCADE
         )
     ''')
     conn.commit()
@@ -1001,6 +1015,10 @@ def save_event(req: CreateEventReq):
                 SET name = ?, event_date = ?, event_time = ?, configuration_id = ?, auto_run = ?, updated_at = CURRENT_TIMESTAMP
                 WHERE id = ?
             ''', (req.name.strip(), req.event_date, req.event_time, req.configuration_id, 1 if req.auto_run else 0, req.id))
+            
+            # Clear execution records when event is updated so badge returns to green
+            c.execute('DELETE FROM event_executions WHERE event_id = ?', (req.id,))
+            
             action = "updated"
             event_id = req.id
         else:
@@ -1064,28 +1082,29 @@ def list_events():
                 e.auto_run,
                 c.name as configuration_name,
                 e.created_at, 
-                e.updated_at
+                e.updated_at,
+                (SELECT COUNT(*) FROM event_executions WHERE event_id = e.id) as execution_count
             FROM event_schedules e
             LEFT JOIN configurations c ON e.configuration_id = c.id
             ORDER BY e.event_date ASC, COALESCE(e.event_time, '') ASC, e.name ASC
         ''')
         rows = c.fetchall()
-        return {
-            "events": [
-                {
-                    "id": row[0],
-                    "name": row[1],
-                    "event_date": row[2],
-                    "event_time": row[3] if row[3] else None,
-                    "configuration_id": row[4],
-                    "auto_run": bool(row[5]),
-                    "configuration_name": row[6] if row[6] else "Unknown",
-                    "created_at": row[7],
-                    "updated_at": row[8]
-                }
-                for row in rows
-            ]
-        }
+        events_list = []
+        for row in rows:
+            execution_count = row[9] if row[9] is not None else 0
+            events_list.append({
+                "id": row[0],
+                "name": row[1],
+                "event_date": row[2],
+                "event_time": row[3] if row[3] else None,
+                "configuration_id": row[4],
+                "auto_run": bool(row[5]),
+                "configuration_name": row[6] if row[6] else "Unknown",
+                "created_at": row[7],
+                "updated_at": row[8],
+                "has_executions": execution_count > 0
+            })
+        return {"events": events_list}
     except Exception as e:
         import traceback
         error_detail = traceback.format_exc()
@@ -1159,6 +1178,64 @@ def delete_event(event_id: int):
         conn.close()
 
 
+@app.get("/event/executions/{event_id}")
+def get_event_executions(event_id: int):
+    """Get all execution records for an event"""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    
+    try:
+        # Verify event exists
+        c.execute('SELECT id, name FROM event_schedules WHERE id = ?', (event_id,))
+        event_row = c.fetchone()
+        if not event_row:
+            raise HTTPException(404, f"Event with id {event_id} not found")
+        
+        # Get all executions for this event
+        c.execute('''
+            SELECT 
+                id,
+                status,
+                message,
+                errors,
+                started_at,
+                completed_at,
+                execution_details
+            FROM event_executions
+            WHERE event_id = ?
+            ORDER BY started_at DESC
+        ''', (event_id,))
+        rows = c.fetchall()
+        
+        executions = []
+        for row in rows:
+            exec_id, status, message, errors_json, started_at, completed_at, details_json = row
+            errors = json.loads(errors_json) if errors_json else []
+            details = json.loads(details_json) if details_json else {}
+            
+            executions.append({
+                "id": exec_id,
+                "status": status,
+                "message": message or "",
+                "errors": errors,
+                "started_at": started_at,
+                "completed_at": completed_at,
+                "execution_details": details
+            })
+        
+        return {
+            "event_id": event_id,
+            "event_name": event_row[1],
+            "executions": executions
+        }
+    except HTTPException:
+        raise
+    except sqlite3.Error as e:
+        raise HTTPException(500, f"Database error: {str(e)}")
+    finally:
+        conn.close()
+
+
 # Auto-run execution endpoint
 @app.post("/event/execute/{event_id}")
 def execute_event(event_id: int, background_tasks: BackgroundTasks):
@@ -1199,12 +1276,52 @@ def run_configuration(config_data: dict, event_name: str, event_id: Optional[int
     """Execute a configuration (same logic as frontend Run button)"""
     logger.info(f"Starting auto-run execution for event: {event_name}")
     
+    execution_record_id = None
+    started_at = datetime.now()
+    
     try:
         errors = []
+        
+        # Create execution record in database
+        if event_id is not None:
+            conn = sqlite3.connect(DB_PATH)
+            c = conn.cursor()
+            try:
+                c.execute('''
+                    INSERT INTO event_executions (event_id, status, started_at)
+                    VALUES (?, ?, ?)
+                ''', (event_id, 'running', started_at.isoformat()))
+                execution_record_id = c.lastrowid
+                conn.commit()
+            except sqlite3.Error as e:
+                logger.error(f"Failed to create execution record: {e}")
+            finally:
+                conn.close()
         # Extract configuration data
         hosts = config_data.get('confirmedHosts', [])
         if not hosts:
             logger.warning(f"No hosts configured for event {event_name}")
+            completed_at = datetime.now()
+            if execution_record_id is not None:
+                conn = sqlite3.connect(DB_PATH)
+                c = conn.cursor()
+                try:
+                    c.execute('''
+                        UPDATE event_executions
+                        SET status = ?, message = ?, errors = ?, completed_at = ?
+                        WHERE id = ?
+                    ''', (
+                        'error',
+                        "No hosts configured",
+                        json.dumps(["No hosts configured"]),
+                        completed_at.isoformat(),
+                        execution_record_id
+                    ))
+                    conn.commit()
+                except sqlite3.Error as e:
+                    logger.error(f"Failed to update execution record: {e}")
+                finally:
+                    conn.close()
             return {"status": "error", "message": "No hosts configured", "errors": ["No hosts configured"], "event": event_name}
         
         client_id = config_data.get('clientId', '')
@@ -1255,11 +1372,53 @@ def run_configuration(config_data: dict, event_name: str, event_id: Optional[int
                     msg = f"Failed to acquire token for host {host}"
                     logger.error(f"Event '{event_name}': {msg}")
                     errors.append(msg)
+                    completed_at = datetime.now()
+                    if execution_record_id is not None:
+                        conn = sqlite3.connect(DB_PATH)
+                        c = conn.cursor()
+                        try:
+                            c.execute('''
+                                UPDATE event_executions
+                                SET status = ?, message = ?, errors = ?, completed_at = ?
+                                WHERE id = ?
+                            ''', (
+                                'error',
+                                msg,
+                                json.dumps(errors),
+                                completed_at.isoformat(),
+                                execution_record_id
+                            ))
+                            conn.commit()
+                        except sqlite3.Error as db_err:
+                            logger.error(f"Failed to update execution record: {db_err}")
+                        finally:
+                            conn.close()
                     return {"status": "error", "message": msg, "errors": errors, "event": event_name}
             except Exception as e:
                 msg = f"Error acquiring token for host {host}: {e}"
                 logger.error(f"Event '{event_name}': {msg}")
                 errors.append(msg)
+                completed_at = datetime.now()
+                if execution_record_id is not None:
+                    conn = sqlite3.connect(DB_PATH)
+                    c = conn.cursor()
+                    try:
+                        c.execute('''
+                            UPDATE event_executions
+                            SET status = ?, message = ?, errors = ?, completed_at = ?
+                            WHERE id = ?
+                        ''', (
+                            'error',
+                            msg,
+                            json.dumps(errors),
+                            completed_at.isoformat(),
+                            execution_record_id
+                        ))
+                        conn.commit()
+                    except sqlite3.Error as db_err:
+                        logger.error(f"Failed to update execution record: {db_err}")
+                    finally:
+                        conn.close()
                 return {"status": "error", "message": msg, "errors": errors, "event": event_name}
         
         # Step 2: Execute preparation steps
@@ -1410,6 +1569,58 @@ def run_configuration(config_data: dict, event_name: str, event_id: Optional[int
         else:
             logger.info(f"Event '{event_name}': No workspace selected for installation")
         
+        completed_at = datetime.now()
+        
+        # Update execution record in database
+        if execution_record_id is not None:
+            conn = sqlite3.connect(DB_PATH)
+            c = conn.cursor()
+            try:
+                if errors:
+                    status = 'error'
+                    message = "Auto-run completed with errors"
+                else:
+                    status = 'success'
+                    message = "Auto-run execution completed successfully"
+                
+                c.execute('''
+                    UPDATE event_executions
+                    SET status = ?, message = ?, errors = ?, completed_at = ?, execution_details = ?
+                    WHERE id = ?
+                ''', (
+                    status,
+                    message,
+                    json.dumps(errors) if errors else None,
+                    completed_at.isoformat(),
+                    json.dumps({
+                        "hosts": [h.get('host') for h in hosts if isinstance(h, dict)] if isinstance(hosts, list) else [],
+                        "hosts_count": len(hosts),
+                        "templates": [
+                            {
+                                "repo_name": t.get('repo_name'),
+                                "template_name": t.get('template_name'),
+                                "version": t.get('version')
+                            } for t in (templates_list or []) if isinstance(t, dict)
+                        ],
+                        "templates_count": len(templates_list),
+                        "installed": (
+                            {
+                                "repo_name": repo_name if 'repo_name' in locals() else '',
+                                "template_name": template_name if 'template_name' in locals() else '',
+                                "version": version if 'version' in locals() else ''
+                            } if install_select else None
+                        ),
+                        "install_select": install_select,
+                        "duration_seconds": (completed_at - started_at).total_seconds()
+                    }),
+                    execution_record_id
+                ))
+                conn.commit()
+            except sqlite3.Error as e:
+                logger.error(f"Failed to update execution record: {e}")
+            finally:
+                conn.close()
+        
         if errors:
             logger.error(f"Auto-run execution completed with errors for event: {event_name}")
             return {"status": "error", "message": "Auto-run completed with errors", "errors": errors, "event": event_name}
@@ -1417,6 +1628,41 @@ def run_configuration(config_data: dict, event_name: str, event_id: Optional[int
         return {"status": "ok", "message": "Auto-run execution completed successfully", "event": event_name}
     except Exception as e:
         logger.error(f"Error executing configuration for event '{event_name}': {e}", exc_info=True)
+        
+        # Update execution record with error
+        completed_at = datetime.now()
+        if execution_record_id is not None:
+            conn = sqlite3.connect(DB_PATH)
+            c = conn.cursor()
+            try:
+                c.execute('''
+                    UPDATE event_executions
+                    SET status = ?, message = ?, errors = ?, completed_at = ?, execution_details = ?
+                    WHERE id = ?
+                ''', (
+                    'error',
+                    str(e),
+                    json.dumps([str(e)]),
+                    completed_at.isoformat(),
+                    json.dumps({
+                        "hosts": [h.get('host') for h in hosts] if 'hosts' in locals() and isinstance(hosts, list) else [],
+                        "templates": [
+                            {
+                                "repo_name": t.get('repo_name'),
+                                "template_name": t.get('template_name'),
+                                "version": t.get('version')
+                            } for t in (templates_list or []) if isinstance(t, dict)
+                        ] if 'templates_list' in locals() else [],
+                        "install_select": install_select if 'install_select' in locals() else ''
+                    }),
+                    execution_record_id
+                ))
+                conn.commit()
+            except sqlite3.Error as db_err:
+                logger.error(f"Failed to update execution record with error: {db_err}")
+            finally:
+                conn.close()
+        
         return {"status": "error", "message": str(e), "errors": [str(e)], "event": event_name}
 
 
@@ -1871,14 +2117,123 @@ def execute_event_internal(event_id: int, event_name: str = None):
         if row:
             config_id, config_data_json, db_event_name = row
             event_name = event_name or db_event_name
-            config_data = json.loads(config_data_json)
+            try:
+                config_data = json.loads(config_data_json)
+            except json.JSONDecodeError as je:
+                logger.error(f"Error parsing configuration JSON for event {event_id}: {je}", exc_info=True)
+                # Update execution record with error
+                completed_at = datetime.now()
+                conn = sqlite3.connect(DB_PATH)
+                c = conn.cursor()
+                try:
+                    # Find the latest running execution record
+                    c.execute('SELECT id FROM event_executions WHERE event_id = ? AND status = ? ORDER BY id DESC LIMIT 1', (event_id, 'running'))
+                    exec_row = c.fetchone()
+                    if exec_row:
+                        c.execute('''
+                            UPDATE event_executions
+                            SET status = ?, message = ?, errors = ?, completed_at = ?
+                            WHERE id = ?
+                        ''', (
+                            'error',
+                            f"Invalid configuration JSON: {str(je)}",
+                            json.dumps([f"Invalid configuration JSON: {str(je)}"]),
+                            completed_at.isoformat(),
+                            exec_row[0]
+                        ))
+                        conn.commit()
+                except sqlite3.Error as db_err:
+                    logger.error(f"Failed to update execution record with JSON error: {db_err}")
+                finally:
+                    conn.close()
+                return
+            
             logger.info(f"Starting auto-run execution for event '{event_name}' (ID: {event_id})")
-            run_configuration(config_data, event_name, event_id)
-            logger.info(f"Completed auto-run execution for event '{event_name}' (ID: {event_id})")
+            try:
+                run_configuration(config_data, event_name, event_id)
+                logger.info(f"Completed auto-run execution for event '{event_name}' (ID: {event_id})")
+            except Exception as run_err:
+                logger.error(f"Error in run_configuration for event {event_id}: {run_err}", exc_info=True)
+                # Update execution record with error if run_configuration didn't update it
+                completed_at = datetime.now()
+                conn = sqlite3.connect(DB_PATH)
+                c = conn.cursor()
+                try:
+                    # Check if record was already updated (run_configuration might have updated it)
+                    c.execute('SELECT id, status FROM event_executions WHERE event_id = ? ORDER BY id DESC LIMIT 1', (event_id,))
+                    exec_row = c.fetchone()
+                    if exec_row and exec_row[1] == 'running':
+                        # Still in running state, update it
+                        c.execute('''
+                            UPDATE event_executions
+                            SET status = ?, message = ?, errors = ?, completed_at = ?
+                            WHERE id = ?
+                        ''', (
+                            'error',
+                            f"Execution failed: {str(run_err)}",
+                            json.dumps([str(run_err)]),
+                            completed_at.isoformat(),
+                            exec_row[0]
+                        ))
+                        conn.commit()
+                except sqlite3.Error as db_err:
+                    logger.error(f"Failed to update execution record with run error: {db_err}")
+                finally:
+                    conn.close()
         else:
             logger.warning(f"Event {event_id} not found or auto_run is disabled")
+            # Update execution record if it exists
+            completed_at = datetime.now()
+            conn = sqlite3.connect(DB_PATH)
+            c = conn.cursor()
+            try:
+                # Find the latest running execution record
+                c.execute('SELECT id FROM event_executions WHERE event_id = ? AND status = ? ORDER BY id DESC LIMIT 1', (event_id, 'running'))
+                exec_row = c.fetchone()
+                if exec_row:
+                    c.execute('''
+                        UPDATE event_executions
+                        SET status = ?, message = ?, errors = ?, completed_at = ?
+                        WHERE id = ?
+                    ''', (
+                        'error',
+                        "Event not found or auto_run is disabled",
+                        json.dumps(["Event not found or auto_run is disabled"]),
+                        completed_at.isoformat(),
+                        exec_row[0]
+                    ))
+                    conn.commit()
+            except sqlite3.Error as db_err:
+                logger.error(f"Failed to update execution record: {db_err}")
+            finally:
+                conn.close()
     except Exception as e:
         logger.error(f"Error executing event {event_id}: {e}", exc_info=True)
+        # Update execution record with error
+        completed_at = datetime.now()
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        try:
+            # Find the latest running execution record
+            c.execute('SELECT id FROM event_executions WHERE event_id = ? AND status = ? ORDER BY id DESC LIMIT 1', (event_id, 'running'))
+            exec_row = c.fetchone()
+            if exec_row:
+                c.execute('''
+                    UPDATE event_executions
+                    SET status = ?, message = ?, errors = ?, completed_at = ?
+                    WHERE id = ?
+                ''', (
+                    'error',
+                    f"Execution failed: {str(e)}",
+                    json.dumps([str(e)]),
+                    completed_at.isoformat(),
+                    exec_row[0]
+                ))
+                conn.commit()
+        except sqlite3.Error as db_err:
+            logger.error(f"Failed to update execution record with exception: {db_err}")
+        finally:
+            conn.close()
 
 
 # Start scheduler in background thread on startup

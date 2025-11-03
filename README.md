@@ -61,7 +61,6 @@ The database contains the following tables:
 ```
 FabricStudioAPI/
 ├── app.py                 # FastAPI application and API endpoints
-├── main.py                # Example/test script
 ├── init_empty_db.py       # Database initialization script
 ├── fabricstudio/
 │   ├── auth.py           # Authentication utilities

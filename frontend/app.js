@@ -923,13 +923,7 @@ async function apiJson(path, options = {}) {
   }
 }
 
-// Minimal logging mode: disable console.log unless explicitly enabled
-(() => {
-  const DEBUG_LOGS = false; // set true when debugging
-  if (!DEBUG_LOGS && typeof console !== 'undefined' && typeof console.log === 'function') {
-    try { console.log = function(){}; } catch(_) {}
-  }
-})();
+// Logging enabled - console.log available for debugging
 
 // Reset Preparation UI/state so it can be reused for a new run
 function resetPreparationForNewRun() {
@@ -2720,7 +2714,26 @@ async function loadEvents() {
     const data = await res.json();
     const events = data.events || [];
     
-    if (events.length === 0) {
+    // Fallback: if has_executions is undefined, fetch executions to determine it
+    const enrichedEvents = await Promise.all(events.map(async (ev) => {
+      if (ev && ev.auto_run && typeof ev.has_executions === 'undefined') {
+        try {
+          const exRes = await api(`/event/executions/${ev.id}`);
+          if (exRes.ok) {
+            const exData = await exRes.json();
+            const exCount = (exData && Array.isArray(exData.executions)) ? exData.executions.length : 0;
+            ev.has_executions = exCount > 0;
+          } else {
+            ev.has_executions = false;
+          }
+        } catch (_) {
+          ev.has_executions = false;
+        }
+      }
+      return ev;
+    }));
+
+    if (enrichedEvents.length === 0) {
       eventsList.innerHTML = '<p>No events scheduled.</p>';
       return;
     }
@@ -2733,7 +2746,7 @@ async function loadEvents() {
       </div>
     `;
     html += '<div style="display: flex; flex-direction: column; gap: 12px;">';
-    events.forEach(event => {
+    enrichedEvents.forEach(event => {
       const eventDate = new Date(event.event_date + 'T00:00:00').toLocaleDateString();
       let dateTimeDisplay = eventDate;
       if (event.event_time) {
@@ -2748,6 +2761,13 @@ async function loadEvents() {
       const createdDate = new Date(event.created_at).toLocaleString();
       const updatedDate = new Date(event.updated_at).toLocaleString();
       
+      // Determine badge color: orange if auto_run and has_executions, green if auto_run without executions
+      let autoRunBadge = '';
+      if (event.auto_run) {
+        const badgeColor = (event.has_executions === true || event.has_executions === 1) ? '#f97316' : '#34d399';
+        autoRunBadge = `<span style="font-size: 12px; color: ${badgeColor}; margin-left: 12px; font-weight: 600;">[Auto Run]</span>`;
+      }
+      
       html += `
         <div class="event-item" data-event-id="${event.id}" style="padding: 12px; border: 1px solid #d2d2d7; border-radius: 4px; background: #f5f5f7;">
           <div style="display: flex; align-items: center; gap: 8px; margin-bottom: 8px;">
@@ -2755,8 +2775,9 @@ async function loadEvents() {
             <label for="event-${event.id}" style="margin: 0; font-weight: 600; cursor: pointer; flex: 1;">
               <span style="font-size: 16px;">${event.name}</span>
               <span style="font-size: 14px; color: #86868b; margin-left: 12px;">- ${dateTimeDisplay}</span>
-              ${event.auto_run ? '<span style="font-size: 12px; color: #34d399; margin-left: 12px; font-weight: 600;">[Auto Run]</span>' : ''}
+              ${autoRunBadge}
             </label>
+            <button class="btn-event-view" data-event-id="${event.id}" style="padding: 4px 12px; font-size: 12px; background: #34d399; border-color: #34d399; color: white;">View</button>
             <button class="btn-event-edit" data-event-id="${event.id}" style="padding: 4px 12px; font-size: 12px; background: #60a5fa; border-color: #60a5fa; color: white;">Edit</button>
             <button class="btn-event-delete" data-event-id="${event.id}" style="padding: 4px 12px; font-size: 12px; background: #f87171; border-color: #f87171;">Delete</button>
           </div>
@@ -2770,6 +2791,15 @@ async function loadEvents() {
     });
     html += '</div>';
     eventsList.innerHTML = html;
+    
+    // Add event listeners for view buttons
+    document.querySelectorAll('.btn-event-view').forEach(btn => {
+      btn.addEventListener('click', async (e) => {
+        e.stopPropagation();
+        const eventId = parseInt(btn.getAttribute('data-event-id'));
+        await viewEventExecutions(eventId);
+      });
+    });
     
     // Add event listeners for edit buttons
     document.querySelectorAll('.btn-event-edit').forEach(btn => {
@@ -2848,6 +2878,144 @@ async function deleteEvent(eventId) {
     showStatus(`Error deleting event: ${error.message || error}`);
     console.error('Error deleting event:', error);
   }
+}
+
+async function viewEventExecutions(eventId) {
+  try {
+    const res = await api(`/event/executions/${eventId}`);
+    if (!res.ok) {
+      showStatus('Failed to load execution records');
+      return;
+    }
+    
+    const data = await res.json();
+    showExecutionModal(data);
+  } catch (error) {
+    showStatus(`Error loading execution records: ${error.message || error}`);
+    console.error('Error loading execution records:', error);
+  }
+}
+
+function showExecutionModal(data) {
+  const { event_id, event_name, executions } = data;
+  
+  // Create modal overlay
+  const overlay = document.createElement('div');
+  overlay.style.cssText = `
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    background: rgba(0, 0, 0, 0.5);
+    z-index: 10000;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 20px;
+  `;
+  
+  // Create modal content
+  const modal = document.createElement('div');
+  modal.style.cssText = `
+    background: white;
+    border-radius: 8px;
+    padding: 24px;
+    max-width: 900px;
+    width: 100%;
+    max-height: 90vh;
+    overflow-y: auto;
+    box-shadow: 0 4px 20px rgba(0, 0, 0, 0.3);
+  `;
+  
+  let html = `
+    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px;">
+      <h2 style="margin: 0;">Execution History: ${event_name || `Event #${event_id}`}</h2>
+      <button id="btnCloseExecutionModal" style="padding: 8px 16px; background: #86868b; border: none; border-radius: 4px; color: white; cursor: pointer; font-size: 14px;">Close</button>
+    </div>
+  `;
+  
+  if (!executions || executions.length === 0) {
+    html += '<p style="color: #86868b; padding: 20px; text-align: center;">No execution records found for this event.</p>';
+  } else {
+    html += `<div style="display: flex; flex-direction: column; gap: 16px;">`;
+    
+    executions.forEach((exec, index) => {
+      const statusColor = exec.status === 'success' ? '#34d399' : exec.status === 'error' ? '#f87171' : '#60a5fa';
+      const statusIcon = exec.status === 'success' ? '✓' : exec.status === 'error' ? '✗' : '⟳';
+      
+      const startedDate = new Date(exec.started_at).toLocaleString();
+      const completedDate = exec.completed_at ? new Date(exec.completed_at).toLocaleString() : 'In Progress...';
+      const duration = exec.completed_at && exec.execution_details?.duration_seconds 
+        ? `${Math.round(exec.execution_details.duration_seconds)}s` 
+        : exec.completed_at ? 'N/A' : '';
+      
+      html += `
+        <div style="border: 1px solid #d2d2d7; border-radius: 6px; padding: 16px; background: #fafafa;">
+          <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">
+            <div style="display: flex; align-items: center; gap: 8px;">
+              <span style="font-size: 18px; color: ${statusColor}; font-weight: bold;">${statusIcon}</span>
+              <span style="font-weight: 600; font-size: 16px; text-transform: capitalize;">${exec.status}</span>
+              ${duration ? `<span style="font-size: 12px; color: #86868b;">(${duration})</span>` : ''}
+            </div>
+            <span style="font-size: 12px; color: #86868b;">Execution #${executions.length - index}</span>
+          </div>
+          
+          ${exec.message ? `<div style="margin-bottom: 8px; font-size: 14px; color: #1d1d1f;">${exec.message}</div>` : ''}
+          
+          <div style="font-size: 12px; color: #86868b; margin-bottom: 12px;">
+            <div>Started: ${startedDate}</div>
+            <div>Completed: ${completedDate}</div>
+            ${Array.isArray(exec.execution_details?.hosts) && exec.execution_details.hosts.length > 0 
+              ? `<div>Hosts: ${exec.execution_details.hosts.map(h => `<code>${h}</code>`).join(', ')}</div>` 
+              : (exec.execution_details?.hosts_count !== undefined ? `<div>Hosts: ${exec.execution_details.hosts_count}</div>` : '')}
+            ${Array.isArray(exec.execution_details?.templates) && exec.execution_details.templates.length > 0 
+              ? `<div>Templates:<ul style=\"margin: 4px 0 0 16px;\">${exec.execution_details.templates.map(t => `<li>${t.repo_name ? `<code>${t.repo_name}</code>/` : ''}<strong>${t.template_name || ''}</strong> v${t.version || ''}</li>`).join('')}</ul></div>`
+              : (exec.execution_details?.templates_count !== undefined ? `<div>Templates: ${exec.execution_details.templates_count}</div>` : '')}
+            ${exec.execution_details?.installed 
+              ? `<div>Installed: ${exec.execution_details.installed.repo_name ? `<code>${exec.execution_details.installed.repo_name}</code>/` : ''}<strong>${exec.execution_details.installed.template_name || ''}</strong> v${exec.execution_details.installed.version || ''}</div>`
+              : (exec.execution_details?.install_select ? `<div>Installed: ${exec.execution_details.install_select}</div>` : '')}
+          </div>
+          
+          ${exec.errors && exec.errors.length > 0 ? `
+            <div style="margin-top: 12px; padding: 12px; background: #fef2f2; border: 1px solid #fecaca; border-radius: 4px;">
+              <div style="font-weight: 600; color: #dc2626; margin-bottom: 8px; font-size: 13px;">Errors:</div>
+              <ul style="margin: 0; padding-left: 20px; color: #991b1b; font-size: 12px;">
+                ${exec.errors.map(err => `<li style="margin-bottom: 4px;">${err}</li>`).join('')}
+              </ul>
+            </div>
+          ` : ''}
+        </div>
+      `;
+    });
+    
+    html += `</div>`;
+  }
+  
+  modal.innerHTML = html;
+  overlay.appendChild(modal);
+  document.body.appendChild(overlay);
+  
+  // Close button handler
+  const closeBtn = modal.querySelector('#btnCloseExecutionModal');
+  const closeModal = () => {
+    document.body.removeChild(overlay);
+  };
+  closeBtn.addEventListener('click', closeModal);
+  overlay.addEventListener('click', (e) => {
+    if (e.target === overlay) {
+      closeModal();
+    }
+  });
+  
+  // Escape key to close
+  const escapeHandler = (e) => {
+    if (e.key === 'Escape') {
+      closeModal();
+      document.removeEventListener('keydown', escapeHandler);
+    }
+  };
+  document.addEventListener('keydown', escapeHandler);
 }
 
 // Load and display configurations from database

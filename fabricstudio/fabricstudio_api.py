@@ -7,7 +7,6 @@ import itertools
 import logging
 
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.WARNING)
 
 def check_tasks(fabric_host, access_token, display_progress=False):
     logger.info("Checking for running tasks on host %s", fabric_host)
