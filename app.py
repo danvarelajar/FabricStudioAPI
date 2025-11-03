@@ -329,6 +329,20 @@ def serve_app_js():
 def serve_styles_css():
     return FileResponse("frontend/styles.css")
 
+@app.get("/Fortinet-logomark-rgb-red.svg")
+@app.get("/frontend/images/Fortinet-logomark-rgb-red.svg")
+def serve_fortinet_logo():
+    import os
+    # Try images directory first, then fallback to frontend root
+    svg_path = "frontend/images/Fortinet-logomark-rgb-red.svg"
+    if not os.path.exists(svg_path):
+        svg_path = "frontend/Fortinet-logomark-rgb-red.svg"
+    if not os.path.exists(svg_path):
+        raise HTTPException(404, "Fortinet logo not found")
+    return FileResponse(svg_path, media_type="image/svg+xml", headers={
+        "Cache-Control": "public, max-age=3600"
+    })
+
 # Root: serve the SPA index
 @app.get("/")
 def root():

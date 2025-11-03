@@ -3167,18 +3167,82 @@ async function loadConfigurations() {
   }
 }
 
+function showLoadingScreen(message = 'Loading configuration...') {
+  // Try multiple ways to find the element
+  let overlay = document.getElementById('loadingOverlay');
+  if (!overlay) {
+    overlay = document.querySelector('#loadingOverlay');
+  }
+  if (!overlay) {
+    overlay = el('loadingOverlay');
+  }
+  
+  if (!overlay) {
+    console.error('Loading overlay element not found!', document.body.innerHTML.substring(0, 500));
+    // Create the overlay if it doesn't exist
+    overlay = document.createElement('div');
+    overlay.id = 'loadingOverlay';
+    overlay.className = 'loading-overlay';
+    overlay.innerHTML = `
+      <div class="loading-logo-container">
+        <img src="/frontend/images/Fortinet-logomark-rgb-red.svg" alt="Fortinet" class="loading-logo" id="loadingLogo">
+        <div class="loading-text" id="loadingText">${message}</div>
+        <div class="loading-spinner"></div>
+      </div>
+    `;
+    document.body.appendChild(overlay);
+    console.log('Created loading overlay dynamically');
+  }
+  
+  const loadingText = document.getElementById('loadingText');
+  if (loadingText && message) {
+    loadingText.textContent = message;
+  }
+  
+  // Force show
+  overlay.style.display = 'flex';
+  overlay.style.opacity = '1';
+  overlay.style.visibility = 'visible';
+  overlay.classList.add('show');
+  console.log('Loading screen shown:', message);
+}
+
+function hideLoadingScreen() {
+  let overlay = document.getElementById('loadingOverlay');
+  if (!overlay) {
+    overlay = document.querySelector('#loadingOverlay');
+  }
+  if (!overlay) {
+    overlay = el('loadingOverlay');
+  }
+  
+  if (overlay) {
+    overlay.classList.remove('show');
+    overlay.style.opacity = '0';
+    overlay.style.visibility = 'hidden';
+    // Hide after transition
+    setTimeout(() => {
+      overlay.style.display = 'none';
+    }, 300);
+    console.log('Loading screen hidden');
+  }
+}
+
 async function loadConfigurationById(configId) {
+  showLoadingScreen('Loading configuration...');
   try {
     showStatus(`Loading configuration...`);
     const getRes = await api(`/config/get/${configId}`);
     if (!getRes.ok) {
       showStatus('Failed to retrieve configuration');
+      hideLoadingScreen();
       return;
     }
     
     const configData = await getRes.json();
     if (!configData || !configData.config_data) {
       showStatus('Invalid configuration data received');
+      hideLoadingScreen();
       return;
     }
     
@@ -3219,6 +3283,7 @@ async function loadConfigurationById(configId) {
       if (!el('apiBase')) {
         console.error('Preparation section elements not found after waiting');
         showStatus('Error: Preparation section not loaded. Please try clicking on FabricStudio Preparation manually.');
+        hideLoadingScreen();
         return;
       }
       
@@ -3233,32 +3298,46 @@ async function loadConfigurationById(configId) {
       }
     } else {
       showStatus('Error: Could not find preparation section menu item');
+      hideLoadingScreen();
       return;
     }
     
     // Restore configuration
     await restoreConfiguration(configData.config_data);
+    
+    // Wait for async operations in restoreConfiguration to complete
+    // Template restoration can take time (each template row takes ~1-2 seconds)
+    const templatesCount = configData.config_data.templates ? configData.config_data.templates.length : 0;
+    const waitTime = templatesCount > 0 ? Math.max(2000, templatesCount * 1500) + 500 : 500;
+    console.log(`Waiting ${waitTime}ms for configuration restoration to complete (${templatesCount} templates)...`);
+    await new Promise(resolve => setTimeout(resolve, waitTime));
+    
     showStatus(`Configuration '${configName}' loaded successfully`);
     logMsg(`Configuration loaded: ${configName}`);
+    hideLoadingScreen();
   } catch (error) {
     showStatus(`Error loading configuration: ${error.message || error}`);
     logMsg(`Error loading configuration: ${error.message || error}`);
     console.error('Error loading configuration:', error);
+    hideLoadingScreen();
   }
 }
 
 async function editConfiguration(configId) {
+  showLoadingScreen('Loading configuration for editing...');
   try {
     showStatus(`Loading configuration for editing...`);
     const getRes = await api(`/config/get/${configId}`);
     if (!getRes.ok) {
       showStatus('Failed to retrieve configuration');
+      hideLoadingScreen();
       return;
     }
     
     const configData = await getRes.json();
     if (!configData || !configData.config_data) {
       showStatus('Invalid configuration data received');
+      hideLoadingScreen();
       return;
     }
     
@@ -3280,11 +3359,25 @@ async function editConfiguration(configId) {
     // Populate edit form (async function)
     await populateConfigEditForm(configName, config);
     
+    // Wait for any remaining async operations in populateConfigEditForm to complete
+    // The function uses setTimeout for template row initialization, so wait for that
+    const templatesCount = config.templates ? config.templates.length : 0;
+    if (templatesCount > 0) {
+      const waitTime = Math.max(2000, templatesCount * 1200) + 500; // Wait for setTimeout + buffer
+      console.log(`Waiting ${waitTime}ms for template rows to fully initialize...`);
+      await new Promise(resolve => setTimeout(resolve, waitTime));
+    } else {
+      // Still wait a bit for form to settle
+      await new Promise(resolve => setTimeout(resolve, 300));
+    }
+    
     showStatus(`Configuration '${configName}' loaded for editing`);
     logMsg(`Configuration loaded for editing: ${configName} (ID: ${configId})`);
+    hideLoadingScreen();
   } catch (error) {
     showStatus(`Error loading configuration for editing: ${error.message || error}`);
     logMsg(`Error loading configuration for editing: ${error.message || error}`);
+    hideLoadingScreen();
   }
 }
 
