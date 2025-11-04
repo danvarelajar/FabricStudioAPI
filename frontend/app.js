@@ -166,7 +166,7 @@ function removeValidatedHost(index) {
   
   // Update confirmed hosts
   confirmedHosts = validatedHosts.map(({host, port}) => ({host, port}));
-  renderFabricHostList();
+  renderFabricHostList(); // Fire and forget - async call
 }
 
 function validateAndAddHost(hostText) {
@@ -563,17 +563,24 @@ function handleSessionExpired() {
   // Show message to user
   showStatus('Session expired. Please reload NHI credential.');
   // Update UI
-  renderFabricHostList();
+  renderFabricHostList(); // Fire and forget - async call
 }
 
 // Removed mergeAuth - tokens are now managed server-side via session cookies
 
-function renderFabricHostList() {
+async function renderFabricHostList() {
   const listEl = el('fabricHostList');
   if (!listEl) return;
   listEl.innerHTML = '';
   const items = parseFabricHosts();
   confirmedHosts = items; // Store confirmed hosts
+  
+  // Check session status if sessionExpiresAt is not set
+  if (!sessionExpiresAt) {
+    const session = await checkSessionStatus();
+    // sessionExpiresAt is updated by checkSessionStatus()
+  }
+  
   items.forEach(({host, port}, i) => {
     const li = document.createElement('li');
     // Session-based: tokens are managed server-side
@@ -1296,7 +1303,7 @@ async function acquireTokens() {
   }
   
   // Session is active - tokens are stored server-side
-  renderFabricHostList();
+  await renderFabricHostList();
   el('tokenStatus').textContent = 'Session OK - Tokens managed server-side';
   showStatus('Session active - tokens are managed server-side');
   return true;
@@ -2481,7 +2488,7 @@ function initializePreparationSection() {
         fabricHostFromNhiInput.style.cursor = 'not-allowed';
       }
       
-      renderFabricHostList();
+      await renderFabricHostList();
       // Show the hosts list after confirmation
       const hostsListRow = el('hostsListRow');
       if (hostsListRow) hostsListRow.style.display = '';
@@ -5522,7 +5529,7 @@ async function restoreConfiguration(config) {
         }));
         
         // Render the host list and chips
-        renderFabricHostList();
+        await renderFabricHostList();
         renderHostChips();
         
         // Also update the fabricHost input to show the hosts as space-separated
@@ -5541,7 +5548,7 @@ async function restoreConfiguration(config) {
         const hosts = parseFabricHosts();
         confirmedHosts = hosts.map(h => ({ host: h.host, port: h.port }));
         validatedHosts = hosts.map(h => ({ host: h.host, port: h.port, isValid: true }));
-        renderFabricHostList();
+        await renderFabricHostList();
         renderHostChips();
       }
     } catch (err) {
