@@ -851,11 +851,10 @@ async function loadSelectedNhiCredential() {
     }
     
     const nhiHosts = [];
-    if (nhiData.tokens_by_host && Object.keys(nhiData.tokens_by_host).length > 0) {
-      // Collect host list from tokens_by_host (session is created automatically)
-      for (const [host, tokenInfo] of Object.entries(nhiData.tokens_by_host)) {
-        nhiHosts.push(host);
-      }
+    // Session-based: tokens are stored server-side, backend returns hosts_with_tokens array
+    if (nhiData.hosts_with_tokens && Array.isArray(nhiData.hosts_with_tokens) && nhiData.hosts_with_tokens.length > 0) {
+      // Collect host list from hosts_with_tokens array
+      nhiHosts.push(...nhiData.hosts_with_tokens);
       console.log(`NHI credential contains ${nhiHosts.length} stored token(s) for host(s): ${nhiHosts.join(', ')}`);
     }
     
@@ -917,6 +916,9 @@ async function loadSelectedNhiCredential() {
     if (nhiHosts.length === 0) {
       showStatus(`NHI credential '${nhiData.name}' loaded successfully (no hosts in credential)`);
     }
+    
+    // Update fabric host list to show session status
+    await renderFabricHostList();
   } catch (error) {
     if (statusSpan) {
       statusSpan.textContent = 'Error';
@@ -6799,8 +6801,8 @@ async function editNhi(nhiId) {
     
     // Populate fabric hosts field with hosts that have tokens
     const fabricHostsInput = el('nhiFabricHosts');
-    if (fabricHostsInput && nhiData.tokens_by_host) {
-      const hosts = Object.keys(nhiData.tokens_by_host).sort();
+    if (fabricHostsInput && nhiData.hosts_with_tokens && Array.isArray(nhiData.hosts_with_tokens)) {
+      const hosts = nhiData.hosts_with_tokens.sort();
       fabricHostsInput.value = hosts.join(' ');
     } else if (fabricHostsInput) {
       fabricHostsInput.value = '';

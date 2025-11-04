@@ -3,11 +3,12 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.types import ASGIApp
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.exceptions import RequestValidationError
 from typing import Optional
 from pydantic import BaseModel
 import sqlite3
 import json
-from datetime import datetime, date, time as dt_time, timedelta
+from datetime import datetime, date, time as dt_time, timedelta, timezone
 from typing import Optional, List
 import threading
 import time
@@ -48,6 +49,20 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = FastAPI()
 
+# Exception handler for request validation errors
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    logger.error(f"Validation error on {request.method} {request.url.path}: {exc.errors()}")
+    try:
+        body = await request.body()
+        logger.error(f"Request body: {body.decode() if body else 'empty'}")
+    except Exception as e:
+        logger.error(f"Could not read request body: {e}")
+    return JSONResponse(
+        status_code=422,
+        content={"detail": exc.errors()}
+    )
+
 # Helper function to extract access_token from Authorization header or session
 def get_access_token_from_request(request: Request, fabric_host: str = None) -> Optional[str]:
     """
@@ -69,11 +84,10 @@ def get_access_token_from_request(request: Request, fabric_host: str = None) -> 
                         needs_refresh = False
                         if not is_token_valid(token_info):
                             # Token expired - try to refresh
-                            logger.info(f"Token expired for {fabric_host}, attempting refresh...")
+                            # Token expired - refresh silently
                             needs_refresh = True
                         elif is_token_expiring_soon(token_info, minutes=1):
                             # Token expiring soon - refresh proactively
-                            logger.info(f"Token expiring soon for {fabric_host}, refreshing proactively...")
                             needs_refresh = True
                         
                         if needs_refresh:
@@ -498,7 +512,7 @@ def refresh_token_for_host(session_id: str, fabric_host: str) -> bool:
                 WHERE session_id = ?
             ''', (tokens_encrypted, session_id))
             conn.commit()
-            logger.info(f"Successfully refreshed token for {fabric_host} in session {session_id}")
+            # Token refreshed successfully
             return True
         finally:
             conn.close()
@@ -543,7 +557,7 @@ def create_session(nhi_credential_id: int, encryption_password: str, tokens_by_h
     tokens_encrypted = encrypt_tokens_for_session(tokens_to_store, session_key)
     
     # Session expires after 1 hour of inactivity
-    expires_at = datetime.now() + timedelta(hours=1)
+    expires_at = datetime.now(timezone.utc) + timedelta(hours=1)
     
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
@@ -577,8 +591,15 @@ def get_session(session_id: str) -> Optional[dict]:
         if not row:
             return None
         
-        expires_at = datetime.fromisoformat(row[6])
-        if datetime.now() >= expires_at:
+        expires_at_str = row[6]
+        expires_at = datetime.fromisoformat(expires_at_str)
+        # If naive datetime, assume UTC (from old code)
+        if expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=timezone.utc)
+        
+        # Compare with timezone-aware datetime
+        now = datetime.now(timezone.utc)
+        if now >= expires_at:
             # Session expired, delete it
             delete_session(session_id)
             return None
@@ -590,7 +611,7 @@ def get_session(session_id: str) -> Optional[dict]:
             "session_key_hash": row[3],
             "created_at": row[4],
             "last_used": row[5],
-            "expires_at": row[6]
+            "expires_at": row[6]  # Return original string, will be formatted in endpoint
         }
     finally:
         conn.close()
@@ -625,7 +646,7 @@ def update_session_tokens(session_id: str, tokens_encrypted: str):
 
 def refresh_session(session_id: str) -> Optional[datetime]:
     """Refresh session expiration time"""
-    expires_at = datetime.now() + timedelta(hours=1)
+    expires_at = datetime.now(timezone.utc) + timedelta(hours=1)
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     try:
@@ -1118,10 +1139,8 @@ def repo_template_single(request: Request, fabric_host: str, template_name: str,
     token = get_access_token_from_request(request, fabric_host)
     if not token:
         raise HTTPException(401, "Missing access_token in session or Authorization header")
-    logger.info("/repo/template called with host=%s repo=%s template=%s version=%s", fabric_host, repo_name, template_name, version)
-    # Strict: resolve repository by name/code (case-insensitive), but DO NOT search other repos for the template
+    # Resolve repository by name/code (case-insensitive)
     repos = list_repositories(fabric_host, token)
-    logger.info("Fetched %d repositories from host %s", len(repos), fabric_host)
     repo_input = (repo_name or "").strip()
     match = None
     for r in repos:
@@ -1135,16 +1154,13 @@ def repo_template_single(request: Request, fabric_host: str, template_name: str,
         raise HTTPException(404, "Repository not found")
 
     rid = match.get("id")
-    logger.info("Matched repository id=%s name=%s", rid, match.get("name"))
     templates = list_templates_for_repo(fabric_host, token, rid)
-    logger.info("Retrieved %d templates from repo id=%s", len(templates), rid)
     tname_norm = (template_name or "").strip().lower()
     ver_norm = (version or "").strip()
     for t in templates:
         name_norm = (t.get("name") or "").strip().lower()
         ver_val = (t.get("version") or "").strip()
         if name_norm == tname_norm and ver_val == ver_norm:
-            logger.info("Template matched in repo id=%s: id=%s name='%s' version='%s'", rid, t.get("id"), t.get("name"), t.get("version"))
             return {"template_id": t.get("id")}
     sample = [{"id": x.get("id"), "name": x.get("name"), "version": x.get("version")} for x in templates[:5]]
     logger.warning("Template not found in repo '%s'. Looking for name='%s' version='%s'. Sample: %s", match.get("name"), template_name, version, sample)
@@ -2558,102 +2574,133 @@ def list_nhi():
 
 
 @app.post("/nhi/get/{nhi_id}")
-def get_nhi(nhi_id: int, req: GetNhiReq):
+async def get_nhi(nhi_id: int, request: Request):
     """Retrieve an NHI credential by ID without returning the client secret"""
-    encryption_password = req.encryption_password
-    if not encryption_password or not encryption_password.strip():
-        raise HTTPException(400, "Encryption password is required")
-    
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    
     try:
-        c.execute('''
-            SELECT name, client_id, client_secret_encrypted, created_at, updated_at
-            FROM nhi_credentials
-            WHERE id = ?
-        ''', (nhi_id,))
-        row = c.fetchone()
+        body = await request.json()
+        encryption_password = body.get("encryption_password", "").strip() if body else ""
         
-        if not row:
-            raise HTTPException(404, f"NHI credential with id {nhi_id} not found")
+        if not encryption_password:
+            raise HTTPException(400, "Encryption password is required")
         
-        # Decrypt client_secret for storing in session (needed for token refresh)
-        # We don't return it to the frontend, but store it encrypted in the session
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        
         try:
-            decrypted_client_secret = decrypt_client_secret(row[2], encryption_password)
-        except ValueError as e:
-            raise HTTPException(400, str(e))
-        
-        client_id = row[1]
-        
-        # Get all tokens for this credential (decrypted)
-        c.execute('''
-            SELECT fabric_host, token_encrypted, token_expires_at
-            FROM nhi_tokens
-            WHERE nhi_credential_id = ?
-            ORDER BY fabric_host ASC
-        ''', (nhi_id,))
-        token_rows = c.fetchall()
-        
-        tokens_by_host = {}
-        for token_row in token_rows:
-            fabric_host = token_row[0]
-            token_encrypted = token_row[1]
-            token_expires_at = token_row[2]
+            c.execute('''
+                SELECT name, client_id, client_secret_encrypted, created_at, updated_at
+                FROM nhi_credentials
+                WHERE id = ?
+            ''', (nhi_id,))
+            row = c.fetchone()
             
-            # Decrypt and check if valid
+            if not row:
+                raise HTTPException(404, f"NHI credential with id {nhi_id} not found")
+            
+            # Decrypt client_secret for storing in session (needed for token refresh)
+            # We don't return it to the frontend, but store it encrypted in the session
             try:
-                from datetime import datetime
-                expires_at = datetime.fromisoformat(token_expires_at)
-                now = datetime.now()
-                if expires_at > now:
-                    # Token is valid, decrypt it
-                    decrypted_token = decrypt_client_secret(token_encrypted, encryption_password)
-                    tokens_by_host[fabric_host] = {
-                        "token": decrypted_token,
-                        "expires_at": token_expires_at
-                    }
-            except:
-                # If decryption or date parsing fails, skip this token
-                pass
-        
-        result = {
-            "id": nhi_id,
-            "name": row[0],
-            "client_id": row[1],
-            "tokens_by_host": tokens_by_host,
-            "created_at": row[3],
-            "updated_at": row[4]
-        }
-        
-        # Create session with tokens and credentials (for automatic token refresh)
-        session_id, session_key, expires_at = create_session(
-            nhi_id, 
-            encryption_password, 
-            tokens_by_host,
-            client_id=client_id,
-            client_secret=decrypted_client_secret
-        )
-        
-        # Create response with cookie
-        response = JSONResponse(result)
-        response.set_cookie(
-            key="fabricstudio_session",
-            value=session_id,
-            httponly=True,
-            secure=False,  # Set to True in production with HTTPS
-            samesite="lax",
-            max_age=3600  # 1 hour
-        )
-        
-        return response
+                decrypted_client_secret = decrypt_client_secret(row[2], encryption_password)
+            except ValueError as e:
+                raise HTTPException(400, str(e))
+            
+            client_id = row[1]
+            
+            # Get all tokens for this credential (decrypted)
+            c.execute('''
+                SELECT fabric_host, token_encrypted, token_expires_at
+                FROM nhi_tokens
+                WHERE nhi_credential_id = ?
+                ORDER BY fabric_host ASC
+            ''', (nhi_id,))
+            token_rows = c.fetchall()
+            
+            # Don't return tokens to frontend - they're stored server-side in the session
+            # Just collect host list for display purposes
+            hosts_with_tokens = []
+            for token_row in token_rows:
+                fabric_host = token_row[0]
+                token_encrypted = token_row[1]
+                token_expires_at = token_row[2]
+                
+                # Check if token is valid (for display purposes only)
+                try:
+                    from datetime import datetime
+                    expires_at = datetime.fromisoformat(token_expires_at)
+                    now = datetime.now()
+                    if expires_at > now:
+                        # Token is valid - add to host list
+                        hosts_with_tokens.append(fabric_host)
+                except:
+                    # If date parsing fails, skip this token
+                    pass
+            
+            result = {
+                "id": nhi_id,
+                "name": row[0],
+                "client_id": row[1],
+                # Don't return tokens - they're stored server-side in the session
+                "hosts_with_tokens": hosts_with_tokens,  # Just list of hosts that have valid tokens
+                "created_at": row[3],
+                "updated_at": row[4]
+            }
+            
+            # Create session with tokens and credentials (for automatic token refresh)
+            # Decrypt tokens for storing in session
+            tokens_by_host_for_session = {}
+            for token_row in token_rows:
+                fabric_host = token_row[0]
+                token_encrypted = token_row[1]
+                token_expires_at = token_row[2]
+                
+                # Decrypt and check if valid for session storage
+                try:
+                    from datetime import datetime
+                    expires_at = datetime.fromisoformat(token_expires_at)
+                    now = datetime.now()
+                    if expires_at > now:
+                        # Token is valid, decrypt it for session storage
+                        decrypted_token = decrypt_client_secret(token_encrypted, encryption_password)
+                        tokens_by_host_for_session[fabric_host] = {
+                            "token": decrypted_token,
+                            "expires_at": token_expires_at
+                        }
+                except:
+                    # If decryption or date parsing fails, skip this token
+                    pass
+            
+            session_id, session_key, expires_at = create_session(
+                nhi_id, 
+                encryption_password, 
+                tokens_by_host_for_session,
+                client_id=client_id,
+                client_secret=decrypted_client_secret
+            )
+            
+            # Create response with cookie
+            response = JSONResponse(result)
+            response.set_cookie(
+                key="fabricstudio_session",
+                value=session_id,
+                httponly=True,
+                secure=False,  # Set to True in production with HTTPS
+                samesite="lax",
+                max_age=3600,  # 1 hour
+                path="/"  # Make cookie available for all paths
+            )
+            
+            return response
+        except HTTPException:
+            raise
+        except sqlite3.Error as e:
+            raise HTTPException(500, f"Database error: {str(e)}")
+        finally:
+            conn.close()
     except HTTPException:
         raise
-    except sqlite3.Error as e:
-        raise HTTPException(500, f"Database error: {str(e)}")
-    finally:
-        conn.close()
+    except Exception as e:
+        logger.error(f"Error in get_nhi endpoint: {e}", exc_info=True)
+        raise HTTPException(500, f"Internal server error: {str(e)}")
 
 
 @app.post("/nhi/update-token/{nhi_id}")
@@ -2866,12 +2913,30 @@ def get_session_status(request: Request):
     if not session:
         raise HTTPException(401, "No active session")
     
+    # Ensure expires_at is properly formatted with timezone info
+    expires_at_str = session['expires_at']
+    try:
+        # Parse and ensure UTC timezone
+        if isinstance(expires_at_str, str):
+            expires_at = datetime.fromisoformat(expires_at_str)
+            # If naive datetime, assume it's UTC (from old code)
+            if expires_at.tzinfo is None:
+                expires_at = expires_at.replace(tzinfo=timezone.utc)
+        else:
+            expires_at = expires_at_str
+        
+        # Return ISO format with timezone (JavaScript will parse this correctly)
+        expires_at_iso = expires_at.isoformat()
+    except Exception as e:
+        logger.error(f"Error formatting expires_at: {e}")
+        expires_at_iso = expires_at_str
+    
     return {
         "session_id": session['session_id'],
         "nhi_credential_id": session['nhi_credential_id'],
         "created_at": session['created_at'],
         "last_used": session['last_used'],
-        "expires_at": session['expires_at']
+        "expires_at": expires_at_iso
     }
 
 @app.post("/auth/session/refresh")
@@ -2954,7 +3019,6 @@ def refresh_expiring_tokens():
                             # Refresh this token
                             if refresh_token_for_host(session_id, host):
                                 refreshed_count += 1
-                                logger.info(f"Proactively refreshed token for {host} in session {session_id}")
                 except Exception as e:
                     logger.warning(f"Error processing session {session_id} for token refresh: {e}")
                     continue
@@ -3010,7 +3074,9 @@ def check_and_run_events():
             events_to_run = c.fetchall()
             
             if events_to_run:
-                logger.info(f"Scheduler check at {now.strftime('%Y-%m-%d %H:%M:%S')}: Found {len(events_to_run)} event(s) to run")
+                # Only log if there are events to run
+                if len(events_to_run) > 0:
+                    logger.info(f"Scheduler: {len(events_to_run)} event(s) to run")
             
             # Clean up executed events from previous days
             if events_to_run:
