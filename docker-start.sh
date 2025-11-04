@@ -90,11 +90,22 @@ EOF
 fi
 
 # Build and start containers
-echo "🐳 Building Docker image..."
-$DOCKER_CMD build
+REBUILD=false
+if [ "$1" = "--rebuild" ] || [ "$1" = "--no-cache" ]; then
+    REBUILD=true
+    echo "🐳 Building Docker image without cache..."
+    $DOCKER_CMD build --no-cache
+else
+    echo "🐳 Building Docker image..."
+    $DOCKER_CMD build
+fi
 
 echo ""
-echo "🚀 Starting containers..."
+echo "🔄 Stopping existing containers..."
+$DOCKER_CMD down
+
+echo ""
+echo "🚀 Starting containers with new image..."
 $DOCKER_CMD up -d
 
 echo ""
@@ -103,5 +114,7 @@ echo ""
 echo "📊 View logs: $DOCKER_CMD logs -f"
 echo "🌐 Access at: http://localhost:8000"
 echo "🛑 Stop with: $DOCKER_CMD down"
+echo ""
+echo "💡 Tip: Use './docker-start.sh --rebuild' to rebuild without cache"
 echo ""
 

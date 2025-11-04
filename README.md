@@ -79,6 +79,11 @@ This project uses **Colima** as a lightweight Docker alternative for Mac. Colima
    ```bash
    ./docker-start.sh
    ```
+   
+   **To rebuild without cache:**
+   ```bash
+   ./docker-start.sh --rebuild
+   ```
 
 ### Manual Setup
 
@@ -112,7 +117,16 @@ docker-compose build
 To rebuild from scratch (no cache):
 ```bash
 docker-compose build --no-cache
+docker-compose down  # Stop existing containers
+docker-compose up -d  # Start with new image
 ```
+
+**Using the helper script:**
+```bash
+./docker-start.sh --rebuild
+```
+
+This will rebuild without cache and restart containers automatically.
 
 ### Starting/Stopping the Container
 
@@ -126,10 +140,42 @@ docker-compose up -d
 docker-compose down
 ```
 
+**Restart (to pick up code changes):**
+```bash
+docker-compose down
+docker-compose up -d
+```
+
 **View logs:**
 ```bash
 docker-compose logs -f
 ```
+
+### Troubleshooting Docker Build Issues
+
+**If changes aren't reflected after rebuilding:**
+
+1. **Ensure containers are stopped and restarted:**
+   ```bash
+   docker-compose down
+   docker-compose build --no-cache
+   docker-compose up -d
+   ```
+
+2. **Clear browser cache:**
+   - Hard refresh: `Ctrl+Shift+R` (Windows/Linux) or `Cmd+Shift+R` (Mac)
+   - Or use incognito/private browsing mode
+   - The application sets no-cache headers for all frontend files to prevent caching
+
+3. **Verify the new image is being used:**
+   ```bash
+   docker-compose ps  # Check container status
+   docker-compose logs -f  # Check logs for errors
+   ```
+
+4. **Check if files are in the build context:**
+   - Ensure `.dockerignore` isn't excluding files you've changed
+   - Frontend files should be in `frontend/` directory
 
 ### Database Persistence
 

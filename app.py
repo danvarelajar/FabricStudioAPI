@@ -696,11 +696,19 @@ app.mount("/frontend", StaticFiles(directory="frontend", html=True), name="front
 # Serve static assets at root paths for index.html references
 @app.get("/app.js")
 def serve_app_js():
-    return FileResponse("frontend/app.js")
+    return FileResponse("frontend/app.js", headers={
+        "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+        "Pragma": "no-cache",
+        "Expires": "0",
+    })
 
 @app.get("/styles.css")
 def serve_styles_css():
-    return FileResponse("frontend/styles.css")
+    return FileResponse("frontend/styles.css", headers={
+        "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+        "Pragma": "no-cache",
+        "Expires": "0",
+    })
 
 @app.get("/Fortinet-logomark-rgb-red.svg")
 @app.get("/frontend/images/Fortinet-logomark-rgb-red.svg")
@@ -725,12 +733,17 @@ def root():
         "Expires": "0",
     })
 
-# Global no-cache for HTML/JSON responses to avoid stale frontend
+# Global no-cache for HTML/JSON/JS/CSS responses to avoid stale frontend
 @app.middleware("http")
 async def add_no_cache_headers(request, call_next):
     response = await call_next(request)
     ct = response.headers.get("content-type", "")
-    if "text/html" in ct or "application/json" in ct or request.url.path in {"/", "/frontend/index.html"}:
+    path = request.url.path
+    # Add no-cache headers for frontend files (HTML, JSON, JS, CSS)
+    if ("text/html" in ct or "application/json" in ct or 
+        "application/javascript" in ct or "text/css" in ct or
+        path in {"/", "/frontend/index.html", "/app.js", "/styles.css"} or
+        path.startswith("/frontend/")):
         response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
         response.headers["Pragma"] = "no-cache"
         response.headers["Expires"] = "0"

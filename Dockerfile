@@ -30,8 +30,11 @@ COPY --from=builder /install /usr/local
 # Verify uvicorn is accessible
 RUN python -c "import uvicorn" && which uvicorn
 
-# Copy application code
-COPY --chown=fabricstudio:fabricstudio . .
+# Copy application code - copy frontend separately to ensure cache invalidation on frontend changes
+COPY --chown=fabricstudio:fabricstudio frontend/ ./frontend/
+COPY --chown=fabricstudio:fabricstudio fabricstudio/ ./fabricstudio/
+COPY --chown=fabricstudio:fabricstudio *.py ./
+COPY --chown=fabricstudio:fabricstudio requirements.txt ./
 
 # Create directories for database and logs with proper permissions
 RUN mkdir -p /app/data /app/logs && \
