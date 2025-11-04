@@ -1,5 +1,22 @@
 * { box-sizing: border-box; }
 
+/* Inter Font Family */
+@font-face {
+  font-family: 'Inter';
+  src: url('/frontend/fonts/inter-regular.woff2') format('woff2');
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: 'Inter';
+  src: url('/frontend/fonts/inter-bold.woff2') format('woff2');
+  font-weight: 700;
+  font-style: normal;
+  font-display: swap;
+}
+
 /* Loading overlay with Fortinet logo */
 .loading-overlay {
   position: fixed;
@@ -88,7 +105,7 @@
 }
 
 body {
-  font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, "Helvetica Neue", Arial, "Noto Sans", "Liberation Sans", sans-serif;
+  font-family: 'Inter', ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, "Helvetica Neue", Arial, "Noto Sans", "Liberation Sans", sans-serif;
   padding: 0;
   margin: 0;
   background: white;
@@ -118,6 +135,7 @@ body {
 .sidebar-title {
   font-size: 20px;
   font-weight: 700;
+  font-family: 'Inter', ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, "Helvetica Neue", Arial, "Noto Sans", "Liberation Sans", sans-serif;
   padding: 0 16px 16px;
   margin: 0 0 8px;
   border-bottom: 1px solid rgba(255, 255, 255, 0.3);
@@ -126,6 +144,8 @@ body {
   -webkit-background-clip: unset;
   background-clip: unset;
   -webkit-text-fill-color: #ffffff;
+  display: flex;
+  align-items: center;
 }
 
 .sidebar-nav {
@@ -141,7 +161,8 @@ body {
   border: none;
   text-align: left;
   font-size: 14px;
-  font-weight: 500;
+  font-weight: 600;
+  font-family: 'Inter', ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, "Helvetica Neue", Arial, "Noto Sans", "Liberation Sans", sans-serif;
   color: #ffffff;
   cursor: pointer;
   border-radius: 0;
@@ -149,6 +170,8 @@ body {
   margin: 0;
   min-width: auto;
   box-shadow: none;
+  line-height: 1.4;
+  letter-spacing: 0;
 }
 
 .menu-item:hover {
@@ -163,6 +186,66 @@ body {
 
 .menu-item.active:hover {
   background: #c92216;
+}
+
+.menu-group {
+  display: flex;
+  flex-direction: column;
+}
+
+.menu-parent {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.menu-arrow {
+  width: 0;
+  height: 0;
+  border-top: 5px solid transparent;
+  border-bottom: 5px solid transparent;
+  border-right: 6px solid rgba(255, 255, 255, 0.7);
+  margin-left: auto;
+  padding-left: 8px;
+  transition: transform 0.2s ease;
+  display: inline-block;
+  vertical-align: middle;
+  transform: rotate(0deg);
+  flex-shrink: 0;
+}
+
+.menu-group.expanded .menu-arrow {
+  transform: rotate(-90deg);
+}
+
+.submenu {
+  display: none;
+  flex-direction: column;
+  padding-left: 16px;
+  gap: 2px;
+}
+
+.menu-group.expanded .submenu {
+  display: flex;
+}
+
+.submenu-item {
+  padding: 8px 16px;
+  font-size: 13px;
+  font-weight: 500;
+  font-family: 'Inter', ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, "Helvetica Neue", Arial, "Noto Sans", "Liberation Sans", sans-serif;
+  line-height: 1.4;
+  letter-spacing: 0;
+}
+
+.submenu-item.active {
+  background: rgba(218, 41, 28, 0.3);
+  color: #ffffff;
+  font-weight: 500;
+}
+
+.submenu-item:hover {
+  background: rgba(255, 255, 255, 0.1);
 }
 
 .main-content {
@@ -220,7 +303,7 @@ hr { border: none; border-top: 1px solid #d2d2d7; margin: 18px 0; }
 
 label { display: inline-block; width: 140px; font-weight: 500; color: #424245; flex-shrink: 0; }
 
-input[type="text"], input[type="password"], select {
+input[type="text"], input[type="password"], input[type="number"], input[type="date"], input[type="time"], select, textarea {
   margin: 0;
   padding: 6px 10px;
   border: 1px solid #d2d2d7;
@@ -231,17 +314,24 @@ input[type="text"], input[type="password"], select {
   color: #1d1d1f;
   box-sizing: border-box;
   display: inline-block;
-  vertical-align: middle;
+  vertical-align: top;
   min-height: 32px;
+  font-family: inherit;
 }
 
-input[type="text"]:focus, input[type="password"]:focus, select:focus {
+textarea {
+  resize: vertical;
+  min-height: 120px;
+  line-height: 1.4;
+}
+
+input[type="text"]:focus, input[type="password"]:focus, input[type="number"]:focus, input[type="date"]:focus, input[type="time"]:focus, select:focus, textarea:focus {
   outline: none;
   border-color: #da291c;
   box-shadow: 0 0 0 4px rgba(218, 41, 28, 0.2);
 }
 
-input[type="text"]:disabled, input[type="password"]:disabled, select:disabled {
+input[type="text"]:disabled, input[type="password"]:disabled, input[type="number"]:disabled, input[type="date"]:disabled, input[type="time"]:disabled, select:disabled, textarea:disabled {
   background: #f5f5f7;
   color: #86868b;
   cursor: not-allowed;
@@ -395,6 +485,19 @@ select { padding: 6px 10px; }
 .btn-config-delete:hover {
   background: #c92216 !important;
   border-color: #c92216 !important;
+}
+
+.btn-config-run {
+  background: #34d399 !important;
+  border-color: #34d399 !important;
+  color: white !important;
+  min-width: auto !important;
+  padding: 4px 12px !important;
+}
+
+.btn-config-run:hover {
+  background: #10b981 !important;
+  border-color: #10b981 !important;
 }
 
 .btn-event-edit {

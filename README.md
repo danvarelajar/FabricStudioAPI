@@ -5,13 +5,18 @@ A FastAPI-based web application for managing FabricStudio configurations, NHI cr
 ## Features
 
 - **FabricStudio Preparation**: Configure and manage FabricStudio hosts, authenticate, and create/run workspaces
+- **SSH Profile Execution**: Execute SSH commands on fabric hosts before workspace installation, with configurable wait times between commands
 - **NHI Management**: Store and manage NHI credentials with encrypted client secrets
+- **SSH Key Management**: Securely store and manage SSH key pairs (public and encrypted private keys)
+- **SSH Command Profiles**: Create reusable SSH command profiles with optional SSH key association
 - **Session-Based Token Management**: Secure server-side token storage with automatic refresh
 - **Automatic Token Refresh**: Tokens refresh automatically before expiration (proactive and on-demand)
 - **Configuration Management**: Save, load, and edit FabricStudio configurations
-- **Event Scheduling**: Schedule automated tasks with date and time support
+- **Event Scheduling**: Schedule automated tasks with date and time support, including validation to prevent past scheduling
+- **Execution History**: Track detailed execution history for scheduled events, including SSH command execution results
 - **Template Caching**: Cache templates for faster access
 - **Expert Mode Logging**: Detailed logging with timestamps for debugging
+- **Modern UI**: Clean, responsive interface with Inter font family and styled navigation menu
 
 ## Setup
 
@@ -202,11 +207,13 @@ The application uses SQLite for data storage. The database file `fabricstudio_ui
 The database contains the following tables:
 - `configurations`: Saved FabricStudio configurations
 - `event_schedules`: Scheduled events
-- `event_executions`: Execution history for scheduled events
+- `event_executions`: Execution history for scheduled events (including SSH execution details)
 - `nhi_credentials`: NHI credential storage (with encrypted secrets)
 - `nhi_tokens`: Encrypted tokens per host per credential
 - `sessions`: Server-side session storage for token management
 - `cached_templates`: Cached template information
+- `ssh_keys`: SSH key pairs (public keys and encrypted private keys)
+- `ssh_command_profiles`: SSH command profiles with optional SSH key association
 
 ## Project Structure
 
@@ -224,7 +231,12 @@ FabricStudioAPI/
 │   ├── preparation.html  # FabricStudio Preparation section
 │   ├── configurations.html # Configurations section
 │   ├── event-schedule.html # Event Schedule section
-│   └── nhi-management.html # NHI Management section
+│   ├── nhi-management.html # NHI Management section
+│   ├── ssh-command-profiles.html # SSH Command Profiles section
+│   ├── ssh-keys.html     # SSH Keys section
+│   └── fonts/            # Custom font files (Inter)
+│       ├── inter-regular.woff2
+│       └── inter-bold.woff2
 └── requirements.txt       # Python dependencies
 ```
 
@@ -233,10 +245,12 @@ FabricStudioAPI/
 - **Session-Based Token Management**: Tokens are stored server-side in encrypted sessions, never exposed to the frontend
 - **Automatic Token Refresh**: Tokens refresh automatically before expiration (5 minutes before) to prevent interruptions
 - **NHI Credential Security**: Client secrets are encrypted using Fernet (symmetric encryption) and never returned to the frontend
+- **SSH Key Security**: Private SSH keys are encrypted using Fernet before storage and are never returned to the frontend
 - **Token Encryption**: All tokens are encrypted before storage in the database
 - **Password-Based Key Derivation**: Passwords are used to derive encryption keys using PBKDF2 (100,000 iterations)
 - **HTTP-Only Cookies**: Session cookies are HTTP-only, preventing JavaScript access
 - **Secure Session Keys**: Session keys are derived from encryption passwords and session IDs
+- **SSH Command Execution**: SSH commands are executed securely using Paramiko, with error validation and output checking
 
 ### Token Management
 

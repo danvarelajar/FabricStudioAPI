@@ -81,6 +81,21 @@
   <div class="row">
     <button id="btnAddRow" disabled>Add Row</button>
   </div>
+  
+  <h3>SSH Profiles</h3>
+  <div class="row">
+    <label>SSH Commands Profile</label>
+    <select id="sshProfileSelect" style="width: 287px;">
+      <option value="">None (select SSH profile)</option>
+    </select>
+    <span style="font-size: 12px; color: #86868b; margin-left: 8px;">Optional - execute SSH commands before Install Workspace</span>
+  </div>
+  <div class="row">
+    <label>Wait Time</label>
+    <input id="sshWaitTime" type="number" min="0" value="60" placeholder="60" size="40" />
+    <span style="font-size: 12px; color: #86868b; margin-left: 8px;">Seconds to wait between each SSH command execution (default: 60)</span>
+  </div>
+  
   <h3>Run Workspace</h3>
   <div class="row">
     <label>Select Template</label>

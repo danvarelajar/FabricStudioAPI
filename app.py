@@ -4,12 +4,13 @@ from fastapi.staticfiles import StaticFiles
 from starlette.types import ASGIApp
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.exceptions import RequestValidationError
-from typing import Optional
+from typing import Optional, List
 from pydantic import BaseModel
 import sqlite3
 import json
 from datetime import datetime, date, time as dt_time, timedelta, timezone
-from typing import Optional, List
+import paramiko
+import io
 import threading
 import time
 import logging
@@ -223,6 +224,44 @@ def init_db():
             UNIQUE(nhi_credential_id, fabric_host)
         )
     ''')
+    
+    # Create SSH keys table
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS ssh_keys (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL UNIQUE,
+            public_key TEXT NOT NULL,
+            private_key_encrypted TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    
+    # Create SSH command profiles table
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS ssh_command_profiles (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL UNIQUE,
+            commands TEXT NOT NULL,
+            description TEXT,
+            ssh_key_id INTEGER,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (ssh_key_id) REFERENCES ssh_keys(id) ON DELETE SET NULL
+        )
+    ''')
+    
+    # Migrate existing ssh_command_profiles table - add ssh_key_id column if it doesn't exist
+    c.execute("PRAGMA table_info(ssh_command_profiles)")
+    columns = [column[1] for column in c.fetchall()]
+    if 'ssh_key_id' not in columns:
+        try:
+            c.execute('ALTER TABLE ssh_command_profiles ADD COLUMN ssh_key_id INTEGER')
+            # Add foreign key constraint (SQLite doesn't support adding FK constraints to existing tables easily,
+            # but we can recreate the table if needed, or just document it)
+            conn.commit()
+        except sqlite3.OperationalError as e:
+            print(f"Warning: Could not add ssh_key_id column: {e}")
     
     # Migrate existing nhi_credentials table - remove old token columns if they exist and create nhi_tokens table
     c.execute("PRAGMA table_info(nhi_credentials)")
@@ -786,6 +825,14 @@ def serve_event_schedule():
 @app.get("/frontend/nhi-management.html")
 def serve_nhi_management():
     return FileResponse("frontend/nhi-management.html", media_type="text/html")
+
+@app.get("/frontend/ssh-keys.html")
+def serve_ssh_keys():
+    return FileResponse("frontend/ssh-keys.html", media_type="text/html")
+
+@app.get("/frontend/ssh-command-profiles.html")
+def serve_ssh_command_profiles():
+    return FileResponse("frontend/ssh-command-profiles.html", media_type="text/html")
 
 
 class TokenReq(BaseModel):
@@ -1515,6 +1562,20 @@ def save_event(req: CreateEventReq):
     if not req.configuration_id:
         raise HTTPException(400, "Configuration is required")
     
+    # Validate that event date/time is not in the past
+    try:
+        event_time_str = req.event_time if req.event_time else "00:00:00"
+        # Normalize time format: HTML5 time input returns HH:MM, but we need HH:MM:SS
+        if event_time_str and len(event_time_str.split(':')) == 2:
+            event_time_str = event_time_str + ":00"
+        event_datetime_str = f"{req.event_date} {event_time_str}"
+        event_datetime = datetime.strptime(event_datetime_str, "%Y-%m-%d %H:%M:%S")
+        now = datetime.now()
+        if event_datetime < now:
+            raise HTTPException(400, "Event date and time cannot be in the past")
+    except ValueError as e:
+        raise HTTPException(400, f"Invalid date/time format: {str(e)}")
+    
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     
@@ -1573,7 +1634,6 @@ def save_event(req: CreateEventReq):
                                 password_encrypted=excluded.password_encrypted,
                                 updated_at=CURRENT_TIMESTAMP
                         ''', (event_id, int(nhi_cred_id), pwd_enc))
-                        logger.info(f"Stored encrypted NHI password for event_id={event_id}, nhi_credential_id={nhi_cred_id}")
                     else:
                         logger.warning(f"Configuration {req.configuration_id} has no nhiCredentialId; skipping password store")
         except Exception as e:
@@ -1797,7 +1857,6 @@ def execute_event(event_id: int, background_tasks: BackgroundTasks):
 
 def run_configuration(config_data: dict, event_name: str, event_id: Optional[int] = None):
     """Execute a configuration (same logic as frontend Run button)"""
-    logger.info(f"Starting auto-run execution for event: {event_name}")
     
     execution_record_id = None
     started_at = datetime.now()
@@ -1854,8 +1913,6 @@ def run_configuration(config_data: dict, event_name: str, event_id: Optional[int
         templates_list = config_data.get('templates', [])
         install_select = config_data.get('installSelect', '')
         
-        logger.info(f"Event '{event_name}': Configuration loaded - {len(hosts)} host(s), {len(templates_list)} template(s)")
-        
         # If client_secret missing, try retrieving from stored NHI password and credential
         if not client_secret and event_id is not None:
             try:
@@ -1876,13 +1933,11 @@ def run_configuration(config_data: dict, event_name: str, event_id: Optional[int
                             client_id = client_id_db or client_id
                         if client_secret_encrypted:
                             client_secret = decrypt_client_secret(client_secret_encrypted, nhi_password)
-                            logger.info(f"Event '{event_name}': Retrieved and decrypted client secret from stored credential (id={nhi_cred_id})")
                 conn.close()
             except Exception as e:
                 logger.error(f"Event '{event_name}': Failed to retrieve/decrypt client secret for event {event_id}: {e}", exc_info=True)
 
         # Step 1: Get tokens for all hosts (reuse stored if valid, otherwise fetch new)
-        logger.info(f"Event '{event_name}': Acquiring tokens for {len(hosts)} host(s)...")
         host_tokens = {}
         
         # Check if we have NHI credential ID to look up stored tokens
@@ -1924,10 +1979,7 @@ def run_configuration(config_data: dict, event_name: str, event_id: Optional[int
                                 delta = expires_at - now
                                 hours = int(delta.total_seconds() // 3600)
                                 minutes = int((delta.total_seconds() % 3600) // 60)
-                                logger.info(f"Event '{event_name}': Reusing stored token for host {host} (expires in {hours}h {minutes}m)")
                                 token_fetched = True
-                            else:
-                                logger.info(f"Event '{event_name}': Stored token for host {host} has expired, will fetch new token")
                     conn.close()
                 except Exception as e:
                     logger.warning(f"Event '{event_name}': Error checking stored token for {host}: {e}, will fetch new token")
@@ -1938,7 +1990,6 @@ def run_configuration(config_data: dict, event_name: str, event_id: Optional[int
                     token_data = get_access_token(client_id, client_secret, host)
                     if token_data and token_data.get("access_token"):
                         host_tokens[host] = token_data.get("access_token")
-                        logger.info(f"Event '{event_name}': Token acquired for host {host}")
                         
                         # Store the new token in nhi_tokens if we have NHI credential
                         if nhi_cred_id and nhi_password:
@@ -1958,7 +2009,6 @@ def run_configuration(config_data: dict, event_name: str, event_id: Optional[int
                                     ''', (nhi_cred_id, host, token_encrypted, token_expires_at))
                                     conn.commit()
                                     conn.close()
-                                    logger.info(f"Event '{event_name}': Stored new token for host {host} in NHI credential")
                             except Exception as e:
                                 logger.warning(f"Event '{event_name}': Failed to store token for {host}: {e}")
                     else:
@@ -2015,36 +2065,29 @@ def run_configuration(config_data: dict, event_name: str, event_id: Optional[int
                     return {"status": "error", "message": msg, "errors": errors, "event": event_name}
         
         # Step 2: Execute preparation steps
-        logger.info(f"Event '{event_name}': Executing preparation steps...")
         
         # Refresh repositories
-        logger.info(f"Event '{event_name}': Refreshing repositories...")
         for host in host_tokens.keys():
             try:
                 refresh_repositories(host, host_tokens[host])
-                logger.info(f"Event '{event_name}': Repositories refreshed for host {host}")
             except Exception as e:
                 msg = f"Error refreshing repositories on host {host}: {e}"
                 logger.error(f"Event '{event_name}': {msg}")
                 errors.append(msg)
         
         # Uninstall workspaces (reset)
-        logger.info(f"Event '{event_name}': Uninstalling workspaces...")
         for host in host_tokens.keys():
             try:
                 reset_fabric(host, host_tokens[host])
-                logger.info(f"Event '{event_name}': Workspaces uninstalled for host {host}")
             except Exception as e:
                 msg = f"Error uninstalling workspaces on host {host}: {e}"
                 logger.error(f"Event '{event_name}': {msg}")
                 errors.append(msg)
         
         # Remove workspaces (batch delete)
-        logger.info(f"Event '{event_name}': Removing workspaces...")
         for host in host_tokens.keys():
             try:
                 batch_delete(host, host_tokens[host])
-                logger.info(f"Event '{event_name}': Workspaces removed for host {host}")
             except Exception as e:
                 msg = f"Error removing workspaces on host {host}: {e}"
                 logger.error(f"Event '{event_name}': {msg}")
@@ -2052,12 +2095,10 @@ def run_configuration(config_data: dict, event_name: str, event_id: Optional[int
         
         # Change hostname if provided
         if new_hostname:
-            logger.info(f"Event '{event_name}': Changing hostnames to base '{new_hostname}'...")
             for i, host in enumerate(host_tokens.keys()):
                 try:
                     hostname = f"{new_hostname}{i + 1}"
                     change_hostname(host, host_tokens[host], hostname)
-                    logger.info(f"Event '{event_name}': Hostname changed to {hostname} for host {host}")
                 except Exception as e:
                     msg = f"Error changing hostname on host {host}: {e}"
                     logger.error(f"Event '{event_name}': {msg}")
@@ -2065,7 +2106,6 @@ def run_configuration(config_data: dict, event_name: str, event_id: Optional[int
         
         # Change password if provided
         if new_password:
-            logger.info(f"Event '{event_name}': Changing guest password...")
             for host in host_tokens.keys():
                 try:
                     # Resolve user id for 'guest' first
@@ -2076,7 +2116,6 @@ def run_configuration(config_data: dict, event_name: str, event_id: Optional[int
                         errors.append(msg)
                         continue
                     change_password(host, host_tokens[host], user_id, new_password)
-                    logger.info(f"Event '{event_name}': Password changed for host {host}")
                 except Exception as e:
                     msg = f"Error changing password on host {host}: {e}"
                     logger.error(f"Event '{event_name}': {msg}")
@@ -2084,7 +2123,6 @@ def run_configuration(config_data: dict, event_name: str, event_id: Optional[int
         
         # Step 3: Create all workspace templates
         if templates_list:
-            logger.info(f"Event '{event_name}': Creating {len(templates_list)} workspace template(s)...")
             for template_info in templates_list:
                 template_name = template_info.get('template_name', '')
                 repo_name = template_info.get('repo_name', '')
@@ -2093,14 +2131,11 @@ def run_configuration(config_data: dict, event_name: str, event_id: Optional[int
                 if not (template_name and repo_name and version):
                     continue
                 
-                logger.info(f"Event '{event_name}': Creating template '{template_name}' v{version} from repo '{repo_name}'...")
-                
                 # Check for running tasks before creating
                 for host in host_tokens.keys():
                     try:
                         running_count = get_running_task_count(host, host_tokens[host])
                         if running_count > 0:
-                            logger.info(f"Event '{event_name}': Waiting for {running_count} running task(s) on host {host}...")
                             check_tasks(host, host_tokens[host], display_progress=False)
                     except Exception as e:
                         msg = f"Error checking tasks on host {host}: {e}"
@@ -2122,7 +2157,7 @@ def run_configuration(config_data: dict, event_name: str, event_id: Optional[int
                                 task_errors = []
                             
                             if success:
-                                logger.info(f"Event '{event_name}': Template '{template_name}' v{version} created on host {host}")
+                                pass
                             else:
                                 if task_errors:
                                     msg = f"Failed to create template '{template_name}' v{version} on host {host}: " + "; ".join(task_errors)
@@ -2156,7 +2191,184 @@ def run_configuration(config_data: dict, event_name: str, event_id: Optional[int
                         logger.warning(f"Event '{event_name}': {msg}")
                         errors.append(msg)
         
-        # Step 4: Install selected workspace
+        # Step 4: Execute SSH Profiles (if selected) BEFORE Install Workspace
+        ssh_profile_id = config_data.get('sshProfileId', '')
+        ssh_wait_time = config_data.get('sshWaitTime', 0)  # Get wait time from config (default: 0)
+        ssh_execution_details = None  # Track SSH execution details
+        if ssh_profile_id:
+            # Execute SSH profiles before Install Workspace
+            try:
+                conn = sqlite3.connect(DB_PATH)
+                c = conn.cursor()
+                
+                try:
+                    # Get SSH profile
+                    c.execute('''
+                        SELECT name, commands, ssh_key_id
+                        FROM ssh_command_profiles
+                        WHERE id = ?
+                    ''', (int(ssh_profile_id),))
+                    profile_row = c.fetchone()
+                    
+                    if profile_row:
+                        profile_name = profile_row[0]
+                        commands = profile_row[1]
+                        ssh_key_id = profile_row[2]
+                        
+                        # Initialize SSH execution tracking
+                        ssh_execution_details = {
+                            "profile_id": int(ssh_profile_id),
+                            "profile_name": profile_name,
+                            "wait_time_seconds": ssh_wait_time,
+                            "commands": [cmd.strip() for cmd in commands.split('\n') if cmd.strip()],
+                            "hosts": []
+                        }
+                        
+                        if ssh_key_id:
+                            # Get SSH key
+                            c.execute('''
+                                SELECT private_key_encrypted
+                                FROM ssh_keys
+                                WHERE id = ?
+                            ''', (ssh_key_id,))
+                            key_row = c.fetchone()
+                            
+                            if key_row:
+                                encrypted_private_key = key_row[0]
+                                # Get encryption password from event_nhi_passwords if available
+                                encryption_password = None
+                                if event_id:
+                                    c.execute('''
+                                        SELECT password_encrypted
+                                        FROM event_nhi_passwords
+                                        WHERE event_id = ?
+                                    ''', (event_id,))
+                                    pwd_row = c.fetchone()
+                                    if pwd_row:
+                                        encryption_password = decrypt_with_server_secret(pwd_row[0])
+                                
+                                if encryption_password:
+                                    try:
+                                        private_key = decrypt_client_secret(encrypted_private_key, encryption_password)
+                                        
+                                        # Execute SSH commands on each host
+                                        for host in host_tokens.keys():
+                                            host_result = {
+                                                "host": host,
+                                                "success": False,
+                                                "commands_executed": 0,
+                                                "commands_failed": 0,
+                                                "error": None
+                                            }
+                                            try:
+                                                # Parse commands
+                                                command_list = [cmd.strip() for cmd in commands.split('\n') if cmd.strip()]
+                                                
+                                                if command_list:
+                                                    ssh_client = paramiko.SSHClient()
+                                                    ssh_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+                                                    
+                                                    try:
+                                                        # Try different key formats
+                                                        private_key_obj = None
+                                                        try:
+                                                            private_key_obj = paramiko.RSAKey.from_private_key(io.StringIO(private_key))
+                                                        except:
+                                                            try:
+                                                                private_key_obj = paramiko.Ed25519Key.from_private_key(io.StringIO(private_key))
+                                                            except:
+                                                                try:
+                                                                    private_key_obj = paramiko.DSSKey.from_private_key(io.StringIO(private_key))
+                                                                except:
+                                                                    try:
+                                                                        private_key_obj = paramiko.ECDSAKey.from_private_key(io.StringIO(private_key))
+                                                                    except:
+                                                                        private_key_obj = paramiko.ssh_private_key_from_string(private_key)
+                                                        
+                                                        if private_key_obj:
+                                                            ssh_client.connect(
+                                                                hostname=host,
+                                                                port=22,
+                                                                username='admin',
+                                                                pkey=private_key_obj,
+                                                                timeout=30,
+                                                                look_for_keys=False,
+                                                                allow_agent=False
+                                                            )
+                                                            
+                                                            # Execute commands
+                                                            for cmd in command_list:
+                                                                stdin, stdout, stderr = ssh_client.exec_command(cmd, timeout=300)
+                                                                exit_status = stdout.channel.recv_exit_status()
+                                                                stdout_text = stdout.read().decode('utf-8', errors='replace')
+                                                                stderr_text = stderr.read().decode('utf-8', errors='replace')
+                                                                
+                                                                host_result["commands_executed"] += 1
+                                                                
+                                                                if exit_status != 0:
+                                                                    host_result["commands_failed"] += 1
+                                                                    msg = f"SSH command '{cmd}' on {host} exited with status {exit_status}"
+                                                                    logger.warning(f"Event '{event_name}': {msg}")
+                                                                    errors.append(msg)
+                                                                
+                                                                # Check for error indicators
+                                                                output_lower = (stdout_text + stderr_text).lower()
+                                                                error_indicators = ['error', 'failed', 'failure', 'exception', 'cannot', 'unable', 'denied']
+                                                                if any(indicator in output_lower for indicator in error_indicators):
+                                                                    if exit_status == 0:
+                                                                        msg = f"Warning: Potential error detected in SSH command '{cmd}' output on {host}"
+                                                                        logger.warning(f"Event '{event_name}': {msg}")
+                                                                        errors.append(msg)
+                                                                
+                                                                # Wait after each command (including the last one)
+                                                                if ssh_wait_time > 0:
+                                                                    time.sleep(ssh_wait_time)
+                                                            
+                                                            host_result["success"] = host_result["commands_failed"] == 0
+                                                    except Exception as e:
+                                                        msg = f"Error executing SSH commands on {host}: {e}"
+                                                        host_result["error"] = str(e)
+                                                        logger.error(f"Event '{event_name}': {msg}")
+                                                        errors.append(msg)
+                                                    finally:
+                                                        ssh_client.close()
+                                            except Exception as e:
+                                                msg = f"Error connecting via SSH to {host}: {e}"
+                                                host_result["error"] = str(e)
+                                                logger.error(f"Event '{event_name}': {msg}")
+                                                errors.append(msg)
+                                            
+                                            ssh_execution_details["hosts"].append(host_result)
+                                    except ValueError as e:
+                                        msg = f"Failed to decrypt SSH key: {e}"
+                                        logger.error(f"Event '{event_name}': {msg}")
+                                        errors.append(msg)
+                                else:
+                                    msg = "Encryption password not available for SSH key decryption"
+                                    logger.warning(f"Event '{event_name}': {msg}")
+                                    errors.append(msg)
+                            else:
+                                msg = "SSH key not found in database"
+                                logger.warning(f"Event '{event_name}': {msg}")
+                                errors.append(msg)
+                        else:
+                            msg = "SSH key not assigned to profile"
+                            logger.warning(f"Event '{event_name}': {msg}")
+                            errors.append(msg)
+                    else:
+                        msg = f"SSH command profile with id {ssh_profile_id} not found"
+                        logger.warning(f"Event '{event_name}': {msg}")
+                        errors.append(msg)
+                except sqlite3.Error as e:
+                    logger.error(f"Event '{event_name}': Database error loading SSH profile: {e}")
+                    errors.append(f"Database error loading SSH profile: {e}")
+                finally:
+                    conn.close()
+            except Exception as e:
+                logger.error(f"Event '{event_name}': Error executing SSH profiles: {e}")
+                errors.append(f"Error executing SSH profiles: {e}")
+        
+        # Step 5: Install selected workspace
         if install_select:
             template_name, version = install_select.split('|||')
             # Find repo_name from templates list
@@ -2167,7 +2379,6 @@ def run_configuration(config_data: dict, event_name: str, event_id: Optional[int
                     break
             
             if repo_name:
-                logger.info(f"Event '{event_name}': Installing workspace '{template_name}' v{version} from repo '{repo_name}'...")
                 for host in host_tokens.keys():
                     try:
                         template_id = get_template(host, host_tokens[host], template_name, repo_name, version)
@@ -2181,7 +2392,7 @@ def run_configuration(config_data: dict, event_name: str, event_id: Optional[int
                                 task_errors = []
                             
                             if success:
-                                logger.info(f"Event '{event_name}': Workspace '{template_name}' v{version} installed on host {host}")
+                                pass
                             else:
                                 if task_errors:
                                     msg = f"Failed to install workspace '{template_name}' v{version} on host {host}: " + "; ".join(task_errors)
@@ -2204,7 +2415,7 @@ def run_configuration(config_data: dict, event_name: str, event_id: Optional[int
                 logger.warning(f"Event '{event_name}': {msg}")
                 errors.append(msg)
         else:
-            logger.info(f"Event '{event_name}': No workspace selected for installation")
+            pass
         
         completed_at = datetime.now()
         
@@ -2248,6 +2459,7 @@ def run_configuration(config_data: dict, event_name: str, event_id: Optional[int
                             } if install_select else None
                         ),
                         "install_select": install_select,
+                        "ssh_profile": ssh_execution_details if ssh_execution_details else None,
                         "duration_seconds": (completed_at - started_at).total_seconds()
                     }),
                     execution_record_id
@@ -2261,7 +2473,6 @@ def run_configuration(config_data: dict, event_name: str, event_id: Optional[int
         if errors:
             logger.error(f"Auto-run execution completed with errors for event: {event_name}")
             return {"status": "error", "message": "Auto-run completed with errors", "errors": errors, "event": event_name}
-        logger.info(f"Auto-run execution completed successfully for event: {event_name}")
         return {"status": "ok", "message": "Auto-run execution completed successfully", "event": event_name}
     except Exception as e:
         logger.error(f"Error executing configuration for event '{event_name}': {e}", exc_info=True)
@@ -2290,7 +2501,9 @@ def run_configuration(config_data: dict, event_name: str, event_id: Optional[int
                                 "version": t.get('version')
                             } for t in (templates_list or []) if isinstance(t, dict)
                         ] if 'templates_list' in locals() else [],
-                        "install_select": install_select if 'install_select' in locals() else ''
+                        "install_select": install_select if 'install_select' in locals() else '',
+                        "ssh_profile": ssh_execution_details if 'ssh_execution_details' in locals() and ssh_execution_details else None,
+                        "duration_seconds": (completed_at - started_at).total_seconds()
                     }),
                     execution_record_id
                 ))
@@ -2302,6 +2515,551 @@ def run_configuration(config_data: dict, event_name: str, event_id: Optional[int
         
         return {"status": "error", "message": str(e), "errors": [str(e)], "event": event_name}
 
+
+# SSH Keys Management endpoints
+
+class SaveSshKeyReq(BaseModel):
+    id: Optional[int] = None
+    name: str
+    public_key: str
+    private_key: Optional[str] = None  # Optional for updates
+    encryption_password: str
+
+@app.post("/ssh-keys/save")
+def save_ssh_key(req: SaveSshKeyReq):
+    """Save or update an SSH key"""
+    import re
+    
+    if not req.name or not req.name.strip():
+        raise HTTPException(400, "Name is required")
+    
+    # Validate name: alphanumeric, dash, underscore only
+    name_stripped = req.name.strip()
+    if not re.match(r'^[a-zA-Z0-9_-]+$', name_stripped):
+        raise HTTPException(400, "Name must contain only alphanumeric characters, dashes, and underscores")
+    
+    if not req.public_key or not req.public_key.strip():
+        raise HTTPException(400, "Public key is required")
+    
+    if not req.encryption_password or not req.encryption_password.strip():
+        raise HTTPException(400, "Encryption password is required")
+    
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    
+    try:
+        encrypted_private_key = None
+        provided_private_key = (req.private_key or '').strip()
+        
+        if req.id is None:
+            # Create requires a private key
+            if not provided_private_key:
+                raise HTTPException(400, "Private key is required for creating a new SSH key")
+            encrypted_private_key = encrypt_client_secret(provided_private_key, req.encryption_password)
+        else:
+            # Update - use provided private key if given, otherwise keep existing
+            if provided_private_key:
+                encrypted_private_key = encrypt_client_secret(provided_private_key, req.encryption_password)
+            else:
+                # Keep existing encrypted private key
+                c.execute('SELECT private_key_encrypted FROM ssh_keys WHERE id = ?', (req.id,))
+                existing_row = c.fetchone()
+                if not existing_row:
+                    raise HTTPException(404, f"SSH key with id {req.id} not found")
+                encrypted_private_key = existing_row[0]
+        
+        if req.id is not None:
+            # Update existing SSH key
+            c.execute('SELECT id FROM ssh_keys WHERE id = ?', (req.id,))
+            if not c.fetchone():
+                raise HTTPException(404, f"SSH key with id {req.id} not found")
+            
+            # Check for duplicate name (excluding current key)
+            c.execute('SELECT id FROM ssh_keys WHERE name = ? AND id != ?', (name_stripped, req.id))
+            if c.fetchone():
+                raise HTTPException(400, f"Name '{name_stripped}' already exists. Names must be unique.")
+            
+            c.execute('''
+                UPDATE ssh_keys 
+                SET name = ?, public_key = ?, private_key_encrypted = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+            ''', (name_stripped, req.public_key.strip(), encrypted_private_key, req.id))
+            action = "updated"
+            ssh_key_id = req.id
+        else:
+            # Insert new SSH key - check for duplicate name
+            c.execute('SELECT id FROM ssh_keys WHERE name = ?', (name_stripped,))
+            if c.fetchone():
+                raise HTTPException(400, f"Name '{name_stripped}' already exists. Names must be unique.")
+            
+            c.execute('''
+                INSERT INTO ssh_keys (name, public_key, private_key_encrypted, updated_at)
+                VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+            ''', (name_stripped, req.public_key.strip(), encrypted_private_key))
+            action = "saved"
+            ssh_key_id = c.lastrowid
+        
+        conn.commit()
+        return {"status": "ok", "message": f"SSH key {action} successfully", "id": ssh_key_id}
+    except sqlite3.IntegrityError as e:
+        conn.rollback()
+        if "UNIQUE constraint" in str(e):
+            raise HTTPException(400, f"Name '{name_stripped}' already exists. Names must be unique.")
+        raise HTTPException(500, f"Database constraint error: {str(e)}")
+    except sqlite3.Error as e:
+        conn.rollback()
+        raise HTTPException(500, f"Database error: {str(e)}")
+    finally:
+        conn.close()
+
+class GetSshKeyReq(BaseModel):
+    encryption_password: str
+
+@app.post("/ssh-keys/get/{ssh_key_id}")
+async def get_ssh_key(ssh_key_id: int, request: Request):
+    """Retrieve an SSH key by ID without returning the private key"""
+    try:
+        body = await request.json()
+        encryption_password = body.get("encryption_password", "").strip() if body else ""
+        
+        if not encryption_password:
+            raise HTTPException(400, "Encryption password is required")
+        
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        
+        try:
+            c.execute('''
+                SELECT name, public_key, created_at, updated_at
+                FROM ssh_keys
+                WHERE id = ?
+            ''', (ssh_key_id,))
+            row = c.fetchone()
+            
+            if not row:
+                raise HTTPException(404, f"SSH key with id {ssh_key_id} not found")
+            
+            result = {
+                "id": ssh_key_id,
+                "name": row[0],
+                "public_key": row[1],
+                "created_at": row[2],
+                "updated_at": row[3]
+            }
+            
+            return JSONResponse(result)
+        except HTTPException:
+            raise
+        except sqlite3.Error as e:
+            raise HTTPException(500, f"Database error: {str(e)}")
+        finally:
+            conn.close()
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error in get_ssh_key endpoint: {e}", exc_info=True)
+        raise HTTPException(500, f"Internal server error: {str(e)}")
+
+@app.get("/ssh-keys/list")
+def list_ssh_keys():
+    """List all SSH keys (without decrypting private keys)"""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    
+    try:
+        c.execute('''
+            SELECT id, name, public_key, created_at, updated_at
+            FROM ssh_keys
+            ORDER BY name ASC
+        ''')
+        rows = c.fetchall()
+        keys = []
+        for row in rows:
+            keys.append({
+                "id": row[0],
+                "name": row[1],
+                "public_key": row[2],
+                "created_at": row[3],
+                "updated_at": row[4]
+            })
+        return {"keys": keys}
+    except sqlite3.Error as e:
+        raise HTTPException(500, f"Database error: {str(e)}")
+    finally:
+        conn.close()
+
+@app.delete("/ssh-keys/delete/{ssh_key_id}")
+def delete_ssh_key(ssh_key_id: int):
+    """Delete an SSH key"""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    
+    try:
+        c.execute('SELECT id FROM ssh_keys WHERE id = ?', (ssh_key_id,))
+        if not c.fetchone():
+            raise HTTPException(404, f"SSH key with id {ssh_key_id} not found")
+        
+        c.execute('DELETE FROM ssh_keys WHERE id = ?', (ssh_key_id,))
+        conn.commit()
+        return {"status": "ok", "message": "SSH key deleted successfully"}
+    except HTTPException:
+        raise
+    except sqlite3.Error as e:
+        conn.rollback()
+        logger.error(f"Error deleting SSH key: {e}")
+        raise HTTPException(500, f"Database error: {str(e)}")
+    finally:
+        conn.close()
+
+# SSH Command Profiles Management endpoints
+
+class SaveSshCommandProfileReq(BaseModel):
+    id: Optional[int] = None
+    name: str
+    commands: str
+    description: Optional[str] = None
+    ssh_key_id: Optional[int] = None
+
+@app.post("/ssh-command-profiles/save")
+def save_ssh_command_profile(req: SaveSshCommandProfileReq):
+    """Save or update an SSH command profile"""
+    import re
+    
+    if not req.name or not req.name.strip():
+        raise HTTPException(400, "Name is required")
+    
+    # Validate name: alphanumeric, dash, underscore only
+    name_stripped = req.name.strip()
+    if not re.match(r'^[a-zA-Z0-9_-]+$', name_stripped):
+        raise HTTPException(400, "Name must contain only alphanumeric characters, dashes, and underscores")
+    
+    if not req.commands or not req.commands.strip():
+        raise HTTPException(400, "Commands are required")
+    
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    
+    try:
+        if req.id is not None:
+            # Update existing profile
+            c.execute('SELECT id FROM ssh_command_profiles WHERE id = ?', (req.id,))
+            if not c.fetchone():
+                raise HTTPException(404, f"SSH command profile with id {req.id} not found")
+            
+            # Check for duplicate name (excluding current profile)
+            c.execute('SELECT id FROM ssh_command_profiles WHERE name = ? AND id != ?', (name_stripped, req.id))
+            if c.fetchone():
+                raise HTTPException(400, f"Name '{name_stripped}' already exists. Names must be unique.")
+            
+            c.execute('''
+                UPDATE ssh_command_profiles 
+                SET name = ?, commands = ?, description = ?, ssh_key_id = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+            ''', (name_stripped, req.commands.strip(), req.description.strip() if req.description else None, req.ssh_key_id, req.id))
+            action = "updated"
+            profile_id = req.id
+        else:
+            # Insert new profile - check for duplicate name
+            c.execute('SELECT id FROM ssh_command_profiles WHERE name = ?', (name_stripped,))
+            if c.fetchone():
+                raise HTTPException(400, f"Name '{name_stripped}' already exists. Names must be unique.")
+            
+            c.execute('''
+                INSERT INTO ssh_command_profiles (name, commands, description, ssh_key_id, updated_at)
+                VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+            ''', (name_stripped, req.commands.strip(), req.description.strip() if req.description else None, req.ssh_key_id))
+            action = "saved"
+            profile_id = c.lastrowid
+        
+        conn.commit()
+        return {"status": "ok", "message": f"SSH command profile {action} successfully", "id": profile_id}
+    except sqlite3.IntegrityError as e:
+        conn.rollback()
+        if "UNIQUE constraint" in str(e):
+            raise HTTPException(400, f"Name '{name_stripped}' already exists. Names must be unique.")
+        raise HTTPException(500, f"Database constraint error: {str(e)}")
+    except sqlite3.Error as e:
+        conn.rollback()
+        raise HTTPException(500, f"Database error: {str(e)}")
+    finally:
+        conn.close()
+
+@app.get("/ssh-command-profiles/get/{profile_id}")
+def get_ssh_command_profile(profile_id: int):
+    """Retrieve an SSH command profile by ID"""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    
+    try:
+        c.execute('''
+            SELECT name, commands, description, ssh_key_id, created_at, updated_at
+            FROM ssh_command_profiles
+            WHERE id = ?
+        ''', (profile_id,))
+        row = c.fetchone()
+        
+        if not row:
+            raise HTTPException(404, f"SSH command profile with id {profile_id} not found")
+        
+        # Get SSH key name if ssh_key_id exists
+        ssh_key_name = None
+        if row[3]:  # ssh_key_id
+            c.execute('SELECT name FROM ssh_keys WHERE id = ?', (row[3],))
+            key_row = c.fetchone()
+            if key_row:
+                ssh_key_name = key_row[0]
+        
+        result = {
+            "id": profile_id,
+            "name": row[0],
+            "commands": row[1],
+            "description": row[2] or "",
+            "ssh_key_id": row[3],
+            "ssh_key_name": ssh_key_name or "",
+            "created_at": row[4],
+            "updated_at": row[5]
+        }
+        
+        return result
+    except HTTPException:
+        raise
+    except sqlite3.Error as e:
+        raise HTTPException(500, f"Database error: {str(e)}")
+    finally:
+        conn.close()
+
+@app.get("/ssh-command-profiles/list")
+def list_ssh_command_profiles():
+    """List all SSH command profiles"""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    
+    try:
+        c.execute('''
+            SELECT p.id, p.name, p.commands, p.description, p.ssh_key_id, p.created_at, p.updated_at, k.name as ssh_key_name
+            FROM ssh_command_profiles p
+            LEFT JOIN ssh_keys k ON p.ssh_key_id = k.id
+            ORDER BY p.name ASC
+        ''')
+        rows = c.fetchall()
+        profiles = []
+        for row in rows:
+            profiles.append({
+                "id": row[0],
+                "name": row[1],
+                "commands": row[2],
+                "description": row[3] or "",
+                "ssh_key_id": row[4],
+                "ssh_key_name": row[7] or "",
+                "created_at": row[5],
+                "updated_at": row[6]
+            })
+        return {"profiles": profiles}
+    except sqlite3.Error as e:
+        raise HTTPException(500, f"Database error: {str(e)}")
+    finally:
+        conn.close()
+
+@app.delete("/ssh-command-profiles/delete/{profile_id}")
+def delete_ssh_command_profile(profile_id: int):
+    """Delete an SSH command profile"""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    
+    try:
+        c.execute('SELECT id FROM ssh_command_profiles WHERE id = ?', (profile_id,))
+        if not c.fetchone():
+            raise HTTPException(404, f"SSH command profile with id {profile_id} not found")
+        
+        c.execute('DELETE FROM ssh_command_profiles WHERE id = ?', (profile_id,))
+        conn.commit()
+        return {"status": "ok", "message": "SSH command profile deleted successfully"}
+    except HTTPException:
+        raise
+    except sqlite3.Error as e:
+        conn.rollback()
+        logger.error(f"Error deleting SSH command profile: {e}")
+        raise HTTPException(500, f"Database error: {str(e)}")
+    finally:
+        conn.close()
+
+# SSH Profile Execution endpoints
+
+class ExecuteSshProfileReq(BaseModel):
+    fabric_host: str
+    ssh_profile_id: int
+    ssh_port: int = 22
+    encryption_password: str
+    wait_time_seconds: int = 0  # Wait time between commands (default: 0)
+
+@app.post("/ssh-profiles/execute")
+async def execute_ssh_profile(req: ExecuteSshProfileReq):
+    """Execute SSH commands from a profile on a fabric host"""
+    try:
+        # Get SSH profile
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        
+        try:
+            c.execute('''
+                SELECT commands, ssh_key_id
+                FROM ssh_command_profiles
+                WHERE id = ?
+            ''', (req.ssh_profile_id,))
+            profile_row = c.fetchone()
+            
+            if not profile_row:
+                raise HTTPException(404, f"SSH command profile with id {req.ssh_profile_id} not found")
+            
+            commands = profile_row[0]
+            ssh_key_id = profile_row[1]
+            
+            if not ssh_key_id:
+                raise HTTPException(400, "SSH command profile must have an SSH key pair assigned")
+            
+            # Get SSH key details
+            c.execute('''
+                SELECT name, private_key_encrypted
+                FROM ssh_keys
+                WHERE id = ?
+            ''', (ssh_key_id,))
+            key_row = c.fetchone()
+            
+            if not key_row:
+                raise HTTPException(404, f"SSH key with id {ssh_key_id} not found")
+            
+            key_name = key_row[0]
+            encrypted_private_key = key_row[1]
+            
+            if not req.encryption_password or not req.encryption_password.strip():
+                raise HTTPException(400, "Encryption password is required to decrypt SSH private key")
+            
+            # Decrypt private key
+            try:
+                private_key = decrypt_client_secret(encrypted_private_key, req.encryption_password)
+            except ValueError as e:
+                raise HTTPException(400, f"Failed to decrypt SSH key: {str(e)}")
+            
+            # Execute SSH commands
+            # Parse commands (one per line)
+            command_list = [cmd.strip() for cmd in commands.split('\n') if cmd.strip()]
+            
+            if not command_list:
+                raise HTTPException(400, "No commands found in SSH profile")
+            
+            # Execute commands via SSH
+            output_lines = []
+            error_lines = []
+            success = True
+            
+            ssh_client = paramiko.SSHClient()
+            ssh_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            
+            try:
+                # Create key object from private key string - try different formats
+                private_key_obj = None
+                try:
+                    # Try RSA key
+                    private_key_obj = paramiko.RSAKey.from_private_key(io.StringIO(private_key))
+                except:
+                    try:
+                        # Try Ed25519 key
+                        private_key_obj = paramiko.Ed25519Key.from_private_key(io.StringIO(private_key))
+                    except:
+                        try:
+                            # Try DSA key
+                            private_key_obj = paramiko.DSSKey.from_private_key(io.StringIO(private_key))
+                        except:
+                            try:
+                                # Try ECDSA key
+                                private_key_obj = paramiko.ECDSAKey.from_private_key(io.StringIO(private_key))
+                            except:
+                                # Last resort: try parsing as OpenSSH format
+                                try:
+                                    private_key_obj = paramiko.ssh_private_key_from_string(private_key)
+                                except Exception as e:
+                                    raise HTTPException(500, f"Failed to parse SSH private key: {str(e)}")
+                
+                if not private_key_obj:
+                    raise HTTPException(500, "Failed to create SSH key object")
+                
+                # Connect to host
+                ssh_client.connect(
+                    hostname=req.fabric_host,
+                    port=req.ssh_port,
+                    username='admin',  # Default FabricStudio username
+                    pkey=private_key_obj,
+                    timeout=30,
+                    look_for_keys=False,
+                    allow_agent=False
+                )
+                
+                # Execute each command
+                for idx, cmd in enumerate(command_list):
+                    stdin, stdout, stderr = ssh_client.exec_command(cmd, timeout=300)
+                    exit_status = stdout.channel.recv_exit_status()
+                    
+                    stdout_text = stdout.read().decode('utf-8', errors='replace')
+                    stderr_text = stderr.read().decode('utf-8', errors='replace')
+                    
+                    output_lines.append(f"$ {cmd}")
+                    if stdout_text:
+                        output_lines.append(stdout_text.rstrip())
+                    if stderr_text:
+                        error_lines.append(f"Error from '{cmd}': {stderr_text.rstrip()}")
+                    
+                    # Check for errors in output
+                    if exit_status != 0:
+                        success = False
+                        error_lines.append(f"Command '{cmd}' exited with status {exit_status}")
+                    
+                    # Check for common error indicators in output
+                    output_lower = stdout_text.lower() + stderr_text.lower()
+                    error_indicators = ['error', 'failed', 'failure', 'exception', 'cannot', 'unable', 'denied', 'permission denied']
+                    if any(indicator in output_lower for indicator in error_indicators):
+                        # Don't fail immediately, but note it
+                        if exit_status == 0:
+                            error_lines.append(f"Warning: Potential error detected in output of '{cmd}'")
+                    
+                    # Wait after each command (including the last one)
+                    if req.wait_time_seconds > 0:
+                        import time
+                        time.sleep(req.wait_time_seconds)
+            
+            except paramiko.AuthenticationException as e:
+                raise HTTPException(401, f"SSH authentication failed: {str(e)}")
+            except paramiko.SSHException as e:
+                raise HTTPException(500, f"SSH connection error: {str(e)}")
+            except Exception as e:
+                raise HTTPException(500, f"Error executing SSH commands: {str(e)}")
+            finally:
+                ssh_client.close()
+            
+            output = '\n'.join(output_lines)
+            errors = '\n'.join(error_lines) if error_lines else None
+            
+            if errors:
+                success = False
+            
+            return {
+                "success": success,
+                "output": output,
+                "error": errors,
+                "key_name": key_name
+            }
+        
+        except HTTPException:
+            raise
+        except sqlite3.Error as e:
+            raise HTTPException(500, f"Database error: {str(e)}")
+        finally:
+            conn.close()
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error in execute_ssh_profile endpoint: {e}", exc_info=True)
+        raise HTTPException(500, f"Internal server error: {str(e)}")
 
 # NHI Management endpoints
 class SaveNhiReq(BaseModel):
@@ -2690,8 +3448,6 @@ async def get_nhi(nhi_id: int, request: Request):
             )
             
             return response
-        except HTTPException:
-            raise
         except sqlite3.Error as e:
             raise HTTPException(500, f"Database error: {str(e)}")
         finally:
@@ -3024,7 +3780,7 @@ def refresh_expiring_tokens():
                     continue
                     
             if refreshed_count > 0:
-                logger.info(f"Proactive token refresh: refreshed {refreshed_count} token(s)")
+                pass
         finally:
             conn.close()
     except Exception as e:
@@ -3032,7 +3788,6 @@ def refresh_expiring_tokens():
 
 def check_and_run_token_refresh():
     """Background thread to periodically refresh expiring tokens"""
-    logger.info("Background token refresh scheduler started")
     while True:
         try:
             time.sleep(120)  # Check every 2 minutes
@@ -3048,7 +3803,6 @@ executed_events = set()
 def check_and_run_events():
     """Check for events that should run now and execute them"""
     global executed_events
-    logger.info("Background event scheduler started and running...")
     
     while True:
         try:
@@ -3076,7 +3830,7 @@ def check_and_run_events():
             if events_to_run:
                 # Only log if there are events to run
                 if len(events_to_run) > 0:
-                    logger.info(f"Scheduler: {len(events_to_run)} event(s) to run")
+                    pass
             
             # Clean up executed events from previous days
             if events_to_run:
@@ -3089,10 +3843,7 @@ def check_and_run_events():
                 
                 # Skip if already executed
                 if event_key in executed_events:
-                    logger.info(f"Skipping event '{event_name}' (ID: {event_id}) - already executed today")
                     continue
-                
-                logger.info(f"Found scheduled event to run: '{event_name}' (ID: {event_id}) scheduled for {event_date} at {event_time or '00:00:00'}")
                 
                 # Mark as executed before starting (to prevent duplicate if scheduler runs again)
                 executed_events.add(event_key)
@@ -3102,7 +3853,6 @@ def check_and_run_events():
                     thread = threading.Thread(target=execute_event_internal, args=(event_id, event_name))
                     thread.daemon = False  # Keep thread alive until execution completes
                     thread.start()
-                    logger.info(f"Started execution thread for event '{event_name}' (ID: {event_id})")
                 except Exception as e:
                     logger.error(f"Error starting execution thread for event {event_id}: {e}", exc_info=True)
                     # Remove from executed set if we failed to start
@@ -3121,7 +3871,6 @@ def check_and_run_events():
 def execute_event_internal(event_id: int, event_name: str = None):
     """Internal function to execute an event"""
     try:
-        logger.info(f"Executing event internally: event_id={event_id}, event_name={event_name or 'unknown'}")
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
         
@@ -3168,10 +3917,9 @@ def execute_event_internal(event_id: int, event_name: str = None):
                     conn.close()
                 return
             
-            logger.info(f"Starting auto-run execution for event '{event_name}' (ID: {event_id})")
             try:
                 run_configuration(config_data, event_name, event_id)
-                logger.info(f"Completed auto-run execution for event '{event_name}' (ID: {event_id})")
+                pass
             except Exception as run_err:
                 logger.error(f"Error in run_configuration for event {event_id}: {run_err}", exc_info=True)
                 # Update execution record with error if run_configuration didn't update it
@@ -3268,17 +4016,17 @@ def start_scheduler():
         scheduler_thread = threading.Thread(target=check_and_run_events)
         scheduler_thread.daemon = True  # Allow main process to exit
         scheduler_thread.start()
-        logger.info("Background event scheduler thread started")
+        pass
     else:
-        logger.info("Background event scheduler already running")
+        pass
     
     # Start token refresh background task
     if token_refresh_thread is None or not token_refresh_thread.is_alive():
         token_refresh_thread = threading.Thread(target=check_and_run_token_refresh)
         token_refresh_thread.daemon = True
         token_refresh_thread.start()
-        logger.info("Background token refresh scheduler thread started")
+        pass
     else:
-        logger.info("Background token refresh scheduler already running")
+        pass
 
 

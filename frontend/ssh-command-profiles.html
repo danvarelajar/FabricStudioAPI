@@ -1,0 +1,41 @@
+<div id="ssh-command-profiles-section" class="content-section">
+  <h3>SSH Command Profiles</h3>
+  <div style="border: 1px solid #d2d2d7; padding: 16px; border-radius: 4px; background: #fafafa; margin-bottom: 20px;">
+    <h4 style="margin-top: 0; margin-bottom: 12px; font-size: 14px; font-weight: 600;">Create/Edit SSH Command Profile</h4>
+    <div class="row">
+      <label style="width: 120px;">Name</label>
+      <input id="sshProfileName" type="text" size="40" placeholder="Enter unique name (alphanumeric, dash, underscore only)" />
+      <span id="sshProfileNameError" style="font-size: 12px; color: #f87171; margin-left: 8px; display: none;"></span>
+    </div>
+    <div class="row">
+      <label style="width: 120px;">Description</label>
+      <input id="sshProfileDescription" type="text" size="40" placeholder="Optional description" />
+    </div>
+    <div class="row">
+      <label style="width: 120px;">SSH Key Pair</label>
+      <select id="sshProfileSshKeyId" style="width: 287px;">
+        <option value="">None (select SSH key pair)</option>
+      </select>
+      <span style="font-size: 12px; color: #86868b; margin-left: 8px;">Optional - select SSH key pair</span>
+    </div>
+    <div class="row">
+      <label style="width: 120px;">Commands</label>
+      <textarea id="sshProfileCommands" rows="8" cols="50" placeholder="Enter SSH commands (one per line)&#10;Example:&#10;ls -la&#10;cd /tmp&#10;cat file.txt"></textarea>
+      <span style="font-size: 12px; color: #86868b; margin-left: 8px;">One command per line</span>
+    </div>
+    <div class="row">
+      <label style="width: 120px;"></label>
+      <button id="btnSaveSshProfile" type="button" style="margin-right: 8px;">Save</button>
+      <button id="btnUpdateSshProfile" type="button" style="margin-right: 8px; display: none;">Update</button>
+      <button id="btnCancelSshProfile" type="button" style="display: none;">Cancel</button>
+    </div>
+  </div>
+  
+  <div style="border: 1px solid #d2d2d7; padding: 16px; border-radius: 4px; background: #fafafa;">
+    <h4 style="margin-top: 0; margin-bottom: 12px; font-size: 14px; font-weight: 600;">SSH Command Profiles List</h4>
+    <div id="sshProfilesList" style="margin-top: 12px;">
+      <p style="color: #86868b; margin: 0;">Loading SSH command profiles...</p>
+    </div>
+  </div>
+</div>
+

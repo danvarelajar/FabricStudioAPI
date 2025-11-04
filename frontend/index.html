@@ -9,12 +9,33 @@
   <body>
     <div class="app-container">
       <aside class="sidebar">
-        <h2 class="sidebar-title">FabricStudio UI</h2>
+        <h2 class="sidebar-title">
+          <img src="/frontend/images/Fortinet-logomark-rgb-red.svg" alt="Fortinet" style="height: 56px; width: auto; vertical-align: middle; margin-right: -8px; margin-left: -20px;" />
+          <span style="margin-left: -4px;">FabricStudio UI</span>
+        </h2>
         <nav class="sidebar-nav">
           <button type="button" class="menu-item active" data-section="preparation">FabricStudio Preparation</button>
           <button type="button" class="menu-item" data-section="event-schedule">Event Schedule</button>
-          <button type="button" class="menu-item" data-section="configurations">Configurations</button>
-          <button type="button" class="menu-item" data-section="nhi-management">NHI Management</button>
+          <div class="menu-group">
+            <button type="button" class="menu-item menu-parent" data-section="configurations" id="configurations-menu">
+              Configurations
+              <span class="menu-arrow"></span>
+            </button>
+            <div class="submenu" id="configurations-submenu">
+              <button type="button" class="menu-item submenu-item" data-section="configurations">Saved Configurations</button>
+              <button type="button" class="menu-item submenu-item" data-section="ssh-command-profiles">SSH Commands Profile</button>
+            </div>
+          </div>
+          <div class="menu-group">
+            <button type="button" class="menu-item menu-parent" data-section="nhi-management" id="nhi-management-menu">
+              NHI Management
+              <span class="menu-arrow"></span>
+            </button>
+            <div class="submenu" id="nhi-management-submenu">
+              <button type="button" class="menu-item submenu-item" data-section="nhi-management">NHI Credentials</button>
+              <button type="button" class="menu-item submenu-item" data-section="ssh-keys">SSH Keys</button>
+            </div>
+          </div>
         </nav>
       </aside>
       

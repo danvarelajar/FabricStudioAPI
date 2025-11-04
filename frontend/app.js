@@ -86,6 +86,159 @@ async function promptForNhiPassword(titleText) {
     });
   });
 }
+
+// Styled prompt modal
+async function promptStyled(titleText, labelText, inputType = 'text') {
+  return new Promise((resolve) => {
+    const overlay = document.createElement('div');
+    overlay.style.position = 'fixed';
+    overlay.style.top = '0';
+    overlay.style.left = '0';
+    overlay.style.right = '0';
+    overlay.style.bottom = '0';
+    overlay.style.background = 'rgba(0,0,0,0.4)';
+    overlay.style.display = 'flex';
+    overlay.style.alignItems = 'center';
+    overlay.style.justifyContent = 'center';
+    overlay.style.zIndex = '9999';
+
+    const dialog = document.createElement('div');
+    dialog.style.background = 'white';
+    dialog.style.border = '1px solid #d2d2d7';
+    dialog.style.boxShadow = '0 4px 12px rgba(0,0,0,0.2)';
+    dialog.style.width = '420px';
+    dialog.style.maxWidth = '90%';
+    dialog.style.padding = '16px';
+    dialog.style.borderRadius = '0';
+
+    const title = document.createElement('div');
+    title.textContent = titleText || 'Enter value';
+    title.style.fontWeight = '600';
+    title.style.marginBottom = '10px';
+    title.style.color = '#1d1d1f';
+    dialog.appendChild(title);
+
+    const label = document.createElement('div');
+    label.innerHTML = (labelText || 'Value').replace(/\n/g, '<br>');
+    label.style.display = 'block';
+    label.style.marginBottom = '6px';
+    label.style.color = '#424245';
+    label.style.fontSize = '13px';
+    dialog.appendChild(label);
+
+    const input = document.createElement('input');
+    input.type = inputType;
+    input.style.width = '100%';
+    input.style.boxSizing = 'border-box';
+    input.style.margin = '0 0 12px 0';
+    input.style.padding = '6px 10px';
+    input.style.border = '1px solid #d2d2d7';
+    input.style.minHeight = '32px';
+    input.style.fontSize = '13px';
+    input.style.color = '#1d1d1f';
+    dialog.appendChild(input);
+
+    const actions = document.createElement('div');
+    actions.style.display = 'flex';
+    actions.style.justifyContent = 'flex-end';
+    actions.style.gap = '8px';
+
+    const cancelBtn = document.createElement('button');
+    cancelBtn.type = 'button';
+    cancelBtn.textContent = 'Cancel';
+    cancelBtn.onclick = () => { document.body.removeChild(overlay); resolve(null); };
+
+    const okBtn = document.createElement('button');
+    okBtn.type = 'button';
+    okBtn.textContent = 'OK';
+    okBtn.onclick = () => { const val = input.value; document.body.removeChild(overlay); resolve(val); };
+
+    actions.appendChild(cancelBtn);
+    actions.appendChild(okBtn);
+    dialog.appendChild(actions);
+    overlay.appendChild(dialog);
+    document.body.appendChild(overlay);
+
+    // Focus and submit on Enter/Escape
+    input.focus();
+    input.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') okBtn.click();
+      if (e.key === 'Escape') cancelBtn.click();
+    });
+  });
+}
+
+// Styled alert modal
+function alertStyled(titleText, messageText, isError = false) {
+  return new Promise((resolve) => {
+    const overlay = document.createElement('div');
+    overlay.style.position = 'fixed';
+    overlay.style.top = '0';
+    overlay.style.left = '0';
+    overlay.style.right = '0';
+    overlay.style.bottom = '0';
+    overlay.style.background = 'rgba(0,0,0,0.4)';
+    overlay.style.display = 'flex';
+    overlay.style.alignItems = 'center';
+    overlay.style.justifyContent = 'center';
+    overlay.style.zIndex = '9999';
+
+    const dialog = document.createElement('div');
+    dialog.style.background = 'white';
+    dialog.style.border = '1px solid #d2d2d7';
+    dialog.style.boxShadow = '0 4px 12px rgba(0,0,0,0.2)';
+    dialog.style.width = '600px';
+    dialog.style.maxWidth = '90%';
+    dialog.style.maxHeight = '80vh';
+    dialog.style.padding = '16px';
+    dialog.style.borderRadius = '0';
+    dialog.style.overflow = 'auto';
+
+    const title = document.createElement('div');
+    title.textContent = titleText || (isError ? 'Error' : 'Success');
+    title.style.fontWeight = '600';
+    title.style.marginBottom = '12px';
+    title.style.color = isError ? '#f87171' : '#34d399';
+    title.style.fontSize = '16px';
+    dialog.appendChild(title);
+
+    const message = document.createElement('div');
+    message.textContent = messageText || '';
+    message.style.marginBottom = '16px';
+    message.style.color = '#1d1d1f';
+    message.style.fontSize = '13px';
+    message.style.whiteSpace = 'pre-wrap';
+    message.style.fontFamily = 'monospace';
+    message.style.background = '#f5f5f7';
+    message.style.padding = '12px';
+    message.style.border = '1px solid #d2d2d7';
+    message.style.maxHeight = '400px';
+    message.style.overflowY = 'auto';
+    dialog.appendChild(message);
+
+    const actions = document.createElement('div');
+    actions.style.display = 'flex';
+    actions.style.justifyContent = 'flex-end';
+    actions.style.gap = '8px';
+
+    const okBtn = document.createElement('button');
+    okBtn.type = 'button';
+    okBtn.textContent = 'OK';
+    okBtn.onclick = () => { document.body.removeChild(overlay); resolve(); };
+
+    actions.appendChild(okBtn);
+    dialog.appendChild(actions);
+    overlay.appendChild(dialog);
+    document.body.appendChild(overlay);
+
+    // Close on Escape
+    overlay.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape') okBtn.click();
+    });
+    
+    okBtn.focus();
+  });
+}
 function isValidIp(v) {
   // IPv4 dotted-quad, each octet 0-255
   if (!/^\d{1,3}(?:\.\d{1,3}){3}$/.test(v)) return false;
@@ -501,17 +654,28 @@ function getAllConfirmedHosts() {
 }
 
 function initGuestPasswordValidation() {
+  // Track which inputs already have listeners attached (by element reference, not ID)
+  const attachedInputs = new WeakSet();
+  
   // Add validation listeners to password fields when they exist
   const setupPasswordValidation = (inputId, errorId) => {
     const input = el(inputId);
-    if (input) {
-      input.addEventListener('input', () => {
-        validateGuestPasswordField(inputId, errorId);
-      });
-      input.addEventListener('blur', () => {
-        validateGuestPasswordField(inputId, errorId);
-      });
+    if (!input) return; // Field doesn't exist yet
+    
+    // Skip if already attached to this element
+    if (attachedInputs.has(input)) {
+      return;
     }
+    
+    // Mark this element as attached
+    attachedInputs.add(input);
+    
+    input.addEventListener('input', () => {
+      validateGuestPasswordField(inputId, errorId);
+    });
+    input.addEventListener('blur', () => {
+      validateGuestPasswordField(inputId, errorId);
+    });
   };
   
   // Set up validation for preparation section password field
@@ -521,14 +685,24 @@ function initGuestPasswordValidation() {
   setupPasswordValidation('editChgPass', 'editChgPassError');
   
   // Also set up when sections are loaded dynamically
-  const observer = new MutationObserver(() => {
-    setupPasswordValidation('chgPass', 'chgPassError');
-    setupPasswordValidation('editChgPass', 'editChgPassError');
+  // Only observe childList changes, not attribute changes (like style.display)
+  const observer = new MutationObserver((mutations) => {
+    // Only process if actual DOM nodes were added/removed
+    const hasNodeChanges = mutations.some(m => m.type === 'childList' && (m.addedNodes.length > 0 || m.removedNodes.length > 0));
+    if (hasNodeChanges) {
+      // Reset and re-attach for new elements (WeakSet automatically handles removed elements)
+      setupPasswordValidation('chgPass', 'chgPassError');
+      setupPasswordValidation('editChgPass', 'editChgPassError');
+    }
   });
   
   const contentContainer = document.getElementById('content-container');
   if (contentContainer) {
-    observer.observe(contentContainer, { childList: true, subtree: true });
+    observer.observe(contentContainer, { 
+      childList: true, 
+      subtree: true,
+      attributes: false  // Don't observe attribute changes (prevents loop when error spans show/hide)
+    });
   }
 }
 
@@ -855,7 +1029,8 @@ async function loadSelectedNhiCredential() {
     if (nhiData.hosts_with_tokens && Array.isArray(nhiData.hosts_with_tokens) && nhiData.hosts_with_tokens.length > 0) {
       // Collect host list from hosts_with_tokens array
       nhiHosts.push(...nhiData.hosts_with_tokens);
-      console.log(`NHI credential contains ${nhiHosts.length} stored token(s) for host(s): ${nhiHosts.join(', ')}`);
+      // NHI credential contains stored tokens
+      // console.log(`NHI credential contains ${nhiHosts.length} stored token(s) for host(s): ${nhiHosts.join(', ')}`);
     }
     
     // Handle Fabric Host population from NHI credential
@@ -924,10 +1099,10 @@ async function loadSelectedNhiCredential() {
       statusSpan.textContent = 'Error';
       statusSpan.style.color = '#f87171';
     }
-      showStatus(`Error loading NHI credential: ${error.message || error}`);
-      decryptedClientId = '';
+    showStatus(`Error loading NHI credential: ${error.message || error}`);
+    decryptedClientId = '';
       // Session-based: client_secret is no longer used
-      currentNhiId = null;
+    currentNhiId = null;
       sessionExpiresAt = null;
       // Session-based: tokens are managed server-side
     
@@ -971,12 +1146,19 @@ if (!window.validatedNhiHosts) window.validatedNhiHosts = [];
 // which is called when the preparation section is loaded
 
 function logMsg(msg) {
+  // Expert Mode logging - only log when Expert Mode is enabled
+  const expertMode = el('expertMode');
+  if (!expertMode || !expertMode.checked) {
+    return; // Don't log if Expert Mode is disabled
+  }
+  
   const out = el('out');
   if (out) {
-    // Add timestamp to each log message
     const now = new Date();
-    const timestamp = now.toISOString().replace('T', ' ').substring(0, 19); // Format: YYYY-MM-DD HH:MM:SS
+    const timestamp = now.toISOString().replace('T', ' ').substring(0, 19);
     out.textContent += `[${timestamp}] ${msg}\n`;
+    // Auto-scroll to bottom
+    out.scrollTop = out.scrollHeight;
   }
 }
 
@@ -1029,7 +1211,7 @@ function showNhiStatus(msg, opts = {}) {
     box.style.margin = '12px 0';
     box.style.borderRadius = '4px';
   }
-  console.log('NHI Status:', msg);
+  // console.log('NHI Status:', msg);
   if (opts.hideAfterMs) {
     const ms = opts.hideAfterMs;
     setTimeout(() => { if (box.innerHTML === msg.replace(/\n/g, '<br>')) box.style.display = 'none'; }, ms);
@@ -1142,7 +1324,7 @@ async function apiJson(path, options = {}) {
   }
 }
 
-// Logging enabled - console.log available for debugging
+// Logging disabled for minimal output
 
 // Reset Preparation UI/state so it can be reused for a new run
 function resetPreparationForNewRun() {
@@ -1284,9 +1466,9 @@ async function acquireTokens() {
           showStatus('Failed to create session. Please check encryption password.');
           return false;
         }
-      } else {
+        } else {
         showStatus('Please select NHI credential and enter encryption password to acquire tokens');
-        return false;
+          return false;
       }
     }
   } catch (e) {
@@ -1306,7 +1488,7 @@ async function acquireTokens() {
   await renderFabricHostList();
   el('tokenStatus').textContent = 'Session OK - Tokens managed server-side';
   showStatus('Session active - tokens are managed server-side');
-  return true;
+    return true;
 }
 
 // Cache all templates from all repositories for all confirmed hosts
@@ -1349,7 +1531,7 @@ async function cacheAllTemplates() {
         
         const reposData = await reposRes.json();
         const repositories = reposData.repositories || [];
-        console.log(`Found ${repositories.length} repositories on ${host}`);
+        // console.log(`Found ${repositories.length} repositories on ${host}`);
         
         // For each repository, get all templates
         for (const repo of repositories) {
@@ -1365,7 +1547,7 @@ async function cacheAllTemplates() {
               params: { fabric_host: host, repo_name: repoName }
             });
             const templates = templatesData.templates || [];
-            console.log(`Found ${templates.length} templates in repo ${repoName} on ${host}`);
+            // console.log(`Found ${templates.length} templates in repo ${repoName} on ${host}`);
             
             // Add templates to collection, deduplicating by repo_name + template_name + version
             for (const tpl of templates) {
@@ -1444,7 +1626,7 @@ function updateInstallSelect() {
   // First, collect templates from rows (workspaces that haven't been created yet)
   const rowTemplates = new Map();
   const allRows = document.querySelectorAll('.tpl-row');
-  console.log(`updateInstallSelect: Found ${allRows.length} template rows to process`);
+  // console.log(`updateInstallSelect: Found ${allRows.length} template rows to process`);
   
   allRows.forEach((row, idx) => {
     const selects = row.querySelectorAll('select');
@@ -1456,19 +1638,19 @@ function updateInstallSelect() {
     const template_name = templateFiltered ? templateFiltered.getValue() : '';
     const version = versionSelect?.value || '';
     
-    console.log(`  Row ${idx + 1}: repo="${repo_name}", template="${template_name}", version="${version}"`);
+    // console.log(`  Row ${idx + 1}: repo="${repo_name}", template="${template_name}", version="${version}"`);
     
     // Require template_name and version to be non-empty (repo_name is optional but helpful)
     if (template_name && template_name.trim() && version && version.trim()) {
       const key = `${template_name}|||${version}`;
       if (!rowTemplates.has(key)) {
         rowTemplates.set(key, { template_name, version, repo_name });
-        console.log(`    -> Added to install select: ${template_name} (v${version})`);
+        // console.log(`    -> Added to install select: ${template_name} (v${version})`);
       } else {
-        console.log(`    -> Skipped (duplicate): ${template_name} (v${version})`);
+        // console.log(`    -> Skipped (duplicate): ${template_name} (v${version})`);
       }
     } else {
-      console.log(`    -> Skipped (incomplete): missing template_name or version`);
+      // console.log(`    -> Skipped (incomplete): missing template_name or version`);
     }
   });
   
@@ -1979,6 +2161,12 @@ function addTplRow(prefill) {
 
   // Handle repository change
   r.addEventListener('change', async () => {
+    // Don't reset if this repo was restored from cache and change event was not user-initiated
+    if (r._restoredFromCache && !r._userInitiatedChange) {
+      console.log(`Repo change event ignored - restored from cache`);
+      return;
+    }
+    
     // reset dependent selects
     templateFiltered.populateOptions([]);
     templateFiltered.disable();
@@ -2165,6 +2353,16 @@ function initializeSection(sectionName) {
     setupNhiButtons();
     loadNhiCredentials();
     setTimeout(() => updateNhiButtons(), 100);
+  } else if (sectionName === 'ssh-keys') {
+    // SSH Keys section initialization
+    initSshKeyFormValidation();
+    setupSshKeyButtons();
+    loadSshKeys();
+  } else if (sectionName === 'ssh-command-profiles') {
+    // SSH Command Profiles section initialization
+    initSshCommandProfileFormValidation();
+    setupSshCommandProfileButtons();
+    loadSshCommandProfiles();
   } else if (sectionName === 'preparation') {
     // Initialize preparation section
     initializePreparationSection();
@@ -2363,12 +2561,23 @@ function initializePreparationSection() {
   // Load NHI credentials for authentication section
   loadNhiCredentialsForAuth();
   
+  // Load SSH profiles for preparation section
+  loadSshProfilesForPreparation();
+  
   // Set up expert mode toggle
   const exp = el('expertMode');
   if (exp) {
     exp.addEventListener('change', () => {
       const out = el('out');
-      if (out) out.style.display = exp.checked ? '' : 'none';
+      if (out) {
+        if (exp.checked) {
+          out.style.display = '';
+        } else {
+          out.style.display = 'none';
+          // Clear output when disabling Expert Mode
+          out.textContent = '';
+        }
+      }
     });
   }
   
@@ -2557,10 +2766,48 @@ function initMenu() {
     return;
   }
   
+  // Handle parent menu items (with submenus)
+  const menuGroups = document.querySelectorAll('.menu-group');
+  menuGroups.forEach(group => {
+    const parentButton = group.querySelector('.menu-parent');
+    if (parentButton) {
+      parentButton.addEventListener('click', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        // Toggle submenu expansion
+        const isExpanded = group.classList.contains('expanded');
+        group.classList.toggle('expanded');
+        
+        // If expanding and no submenu item is active, load the first submenu item
+        if (!isExpanded) {
+          const firstSubmenuItem = group.querySelector('.submenu-item');
+          if (firstSubmenuItem) {
+            // Remove active class from all items
+            document.querySelectorAll('.menu-item').forEach(mi => mi.classList.remove('active'));
+            // Add active class to first submenu item
+            firstSubmenuItem.classList.add('active');
+            // Load the section
+            const section = firstSubmenuItem.getAttribute('data-section');
+            if (section) {
+              loadSection(section);
+            }
+          }
+        }
+      });
+    }
+  });
+  
+  // Handle all menu item clicks (including submenu items)
   menuItems.forEach(item => {
     item.addEventListener('click', (e) => {
       e.preventDefault();
       e.stopPropagation();
+      
+      // Skip if this is a parent menu item (let the group handler handle it)
+      if (item.classList.contains('menu-parent')) {
+        return;
+      }
+      
       const section = item.getAttribute('data-section');
       console.log('Menu item clicked, section:', section);
       
@@ -2575,10 +2822,34 @@ function initMenu() {
       // Add active class to clicked item
       item.classList.add('active');
       
+      // Expand parent menu group if this is a submenu item
+      const menuGroup = item.closest('.menu-group');
+      if (menuGroup) {
+        menuGroup.classList.add('expanded');
+      }
+      
       // Load the section HTML file
       loadSection(section);
     });
   });
+  
+  // Expand NHI Management menu by default if it's the active section
+  const nhiManagementGroup = document.querySelector('#nhi-management-menu')?.closest('.menu-group');
+  if (nhiManagementGroup) {
+    const activeSubmenuItem = nhiManagementGroup.querySelector('.submenu-item.active');
+    if (activeSubmenuItem) {
+      nhiManagementGroup.classList.add('expanded');
+    }
+  }
+  
+  // Expand Configurations menu by default if it's the active section
+  const configurationsGroup = document.querySelector('#configurations-menu')?.closest('.menu-group');
+  if (configurationsGroup) {
+    const activeSubmenuItem = configurationsGroup.querySelector('.submenu-item.active');
+    if (activeSubmenuItem) {
+      configurationsGroup.classList.add('expanded');
+    }
+  }
   
   // Load the default section (preparation) on initial load
   const activeItem = document.querySelector('.menu-item.active');
@@ -3047,6 +3318,26 @@ function showExecutionModal(data) {
             ${exec.execution_details?.installed 
               ? `<div>Installed: ${exec.execution_details.installed.repo_name ? `<code>${exec.execution_details.installed.repo_name}</code>/` : ''}<strong>${exec.execution_details.installed.template_name || ''}</strong> v${exec.execution_details.installed.version || ''}</div>`
               : (exec.execution_details?.install_select ? `<div>Installed: ${exec.execution_details.install_select}</div>` : '')}
+            ${exec.execution_details?.ssh_profile 
+              ? `<div style="margin-top: 8px; padding: 8px; background: #f0f9ff; border-left: 3px solid #3b82f6; border-radius: 4px;">
+                  <div style="font-weight: 600; color: #1e40af; margin-bottom: 4px; font-size: 13px;">SSH Profile Execution:</div>
+                  <div style="font-size: 11px; color: #1e40af; margin-left: 8px;">
+                    <div><strong>Profile:</strong> ${exec.execution_details.ssh_profile.profile_name || 'N/A'} (ID: ${exec.execution_details.ssh_profile.profile_id || 'N/A'})</div>
+                    <div><strong>Wait Time:</strong> ${exec.execution_details.ssh_profile.wait_time_seconds || 0} seconds</div>
+                    <div><strong>Commands:</strong> ${exec.execution_details.ssh_profile.commands ? exec.execution_details.ssh_profile.commands.length : 0} command(s)</div>
+                    ${exec.execution_details.ssh_profile.hosts && exec.execution_details.ssh_profile.hosts.length > 0
+                      ? `<div style="margin-top: 4px;"><strong>Host Results:</strong><ul style="margin: 4px 0 0 16px;">${exec.execution_details.ssh_profile.hosts.map(h => {
+                          const statusIcon = h.success ? '✓' : '✗';
+                          const statusColor = h.success ? '#10b981' : '#ef4444';
+                          return `<li style="margin-bottom: 2px;">
+                            <span style="color: ${statusColor}; font-weight: bold;">${statusIcon}</span>
+                            <code>${h.host}</code>: ${h.commands_executed} executed, ${h.commands_failed} failed${h.error ? ` - ${h.error}` : ''}
+                          </li>`;
+                        }).join('')}</ul></div>`
+                      : ''}
+                  </div>
+                </div>`
+              : ''}
           </div>
           
           ${exec.errors && exec.errors.length > 0 ? `
@@ -3129,7 +3420,7 @@ async function loadConfigurations() {
             <input type="checkbox" class="config-checkbox" value="${config.id}" id="config-${config.id}" style="margin: 0;">
             <label for="config-${config.id}" style="margin: 0; font-weight: 600; cursor: pointer; flex: 1;">${config.name}</label>
             <button type="button" class="btn-config-load" data-config-id="${config.id}" style="padding: 4px 12px; font-size: 12px; cursor: pointer; background: #da291c; border-color: #da291c; color: white; border: 1px solid #da291c; border-radius: 0; box-shadow: 0 2px 4px rgba(218, 41, 28, 0.3);">Load</button>
-            <button type="button" class="btn-config-edit" data-config-id="${config.id}" style="padding: 4px 12px; font-size: 12px; background: #da291c; border-color: #da291c; color: white; cursor: pointer; border: 1px solid #da291c; border-radius: 0; box-shadow: 0 2px 4px rgba(218, 41, 28, 0.3);">Edit</button>
+            <button type="button" class="btn-config-edit" data-config-id="${config.id}" style="padding: 4px 12px; font-size: 12px; background: #da291c; border-color: #da291c; color: white; cursor: pointer; border: 1px solid #da291c; border-radius: 0; box-shadow: 0 2px 4px rgba(218, 41, 28, 0.3);">Edit/View</button>
             <button type="button" class="btn-config-delete" data-config-id="${config.id}" style="padding: 4px 12px; font-size: 12px; background: #da291c; border-color: #da291c; color: white; cursor: pointer; border: 1px solid #da291c; border-radius: 0; box-shadow: 0 2px 4px rgba(218, 41, 28, 0.3);">Delete</button>
           </div>
           <div style="font-size: 12px; color: #86868b; margin-left: 24px;">
@@ -3585,6 +3876,41 @@ async function populateConfigEditForm(name, config) {
   
   const expertModeInput = el('editExpertMode');
   if (expertModeInput) expertModeInput.checked = config.expertMode || false;
+  
+  // Load and populate SSH profile fields
+  const editSshProfileSelect = el('editSshProfileSelect');
+  if (editSshProfileSelect) {
+    try {
+      const sshRes = await api('/ssh-command-profiles/list');
+      if (sshRes.ok) {
+        const sshData = await sshRes.json();
+        const profiles = sshData.profiles || [];
+        
+        // Clear existing options except the first one
+        editSshProfileSelect.innerHTML = '<option value="">None (select SSH profile)</option>';
+        
+        // Add SSH profiles to dropdown
+        profiles.forEach(profile => {
+          const option = document.createElement('option');
+          option.value = profile.id;
+          option.textContent = profile.name;
+          editSshProfileSelect.appendChild(option);
+        });
+        
+        // Set selected value from config
+        if (config.sshProfileId !== undefined) {
+          editSshProfileSelect.value = config.sshProfileId || '';
+        }
+      }
+    } catch (err) {
+      console.warn('Could not load SSH profiles for edit form:', err);
+    }
+  }
+  
+  const editSshWaitTimeInput = el('editSshWaitTime');
+  if (editSshWaitTimeInput && config.sshWaitTime !== undefined) {
+    editSshWaitTimeInput.value = config.sshWaitTime || 60;
+  }
   
   // Create template rows and populate install select
   const tplFormList = el('editTplFormList');
@@ -4132,46 +4458,27 @@ function addEditTplRow(prefill) {
 function updateEditInstallSelectFromRows(preserveValue) {
   const select = el('editInstallSelect');
   if (!select) {
-    console.warn('editInstallSelect not found');
     return;
   }
   
   const rows = document.querySelectorAll('#editTplFormList .tpl-row');
-  console.log('updateEditInstallSelectFromRows: Found', rows.length, 'rows');
   
   if (rows.length === 0) {
-    console.log('No rows found, updating with empty list');
     updateEditInstallSelect([], select.value);
     return;
   }
   
   const templates = [];
   
-  rows.forEach((row, idx) => {
-    console.log(`\nProcessing row ${idx + 1}:`);
+  rows.forEach((row) => {
     const selects = row.querySelectorAll('select');
-    console.log(`  Found ${selects.length} select elements in row`);
-    
     const repoSelect = selects[0];
     const templateFiltered = row._templateFiltered;
     const versionSelect = selects.length > 2 ? selects[selects.length - 1] : (selects[1] || null);
     
-    console.log(`  Elements check:`, {
-      repoSelect: !!repoSelect,
-      templateFiltered: !!templateFiltered,
-      versionSelect: !!versionSelect,
-      repoValue: repoSelect?.value || 'empty',
-      versionValue: versionSelect?.value || 'empty'
-    });
-    
     if (!repoSelect || !templateFiltered || !versionSelect) {
-      console.log(`  -> Skipped: Missing required elements`);
-      return;
+      return; // Skip rows that don't have all required elements yet
     }
-    
-    // Get repo value (for logging)
-    const repo_name = (repoSelect.value || '').trim();
-    console.log(`  Repo: "${repo_name}"`);
     
     // Get template name - try multiple methods
     let template_name = '';
@@ -4180,16 +4487,14 @@ function updateEditInstallSelectFromRows(preserveValue) {
     if (templateFiltered.getValue) {
       try {
         template_name = (templateFiltered.getValue() || '').trim();
-        console.log(`  Template (getValue): "${template_name}"`);
       } catch (e) {
-        console.warn(`  getValue() error:`, e);
+        // Ignore errors
       }
     }
     
     // Method 2: Check input field value
     if (!template_name && templateFiltered.input) {
       const inputVal = (templateFiltered.input.value || '').trim();
-      console.log(`  Template (input.value): "${inputVal}"`);
       if (inputVal) {
         // Try to match with datalist options
         if (templateFiltered.datalist) {
@@ -4197,7 +4502,6 @@ function updateEditInstallSelectFromRows(preserveValue) {
           const match = Array.from(datalistOptions).find(opt => opt.value === inputVal);
           if (match) {
             template_name = inputVal;
-            console.log(`  Found match in datalist`);
           }
         } else {
           template_name = inputVal;
@@ -4208,7 +4512,6 @@ function updateEditInstallSelectFromRows(preserveValue) {
     // Method 3: Check hidden select value
     if (!template_name && templateFiltered.select) {
       const selectVal = (templateFiltered.select.value || '').trim();
-      console.log(`  Template (select.value): "${selectVal}"`);
       if (selectVal) template_name = selectVal;
     }
     
@@ -4220,7 +4523,6 @@ function updateEditInstallSelectFromRows(preserveValue) {
         for (const opt of options) {
           if (opt.value.toLowerCase() === inputText.toLowerCase() || opt.value === inputText) {
             template_name = opt.value;
-            console.log(`  Template (matched from datalist): "${template_name}"`);
             break;
           }
         }
@@ -4229,29 +4531,15 @@ function updateEditInstallSelectFromRows(preserveValue) {
     
     // Get version
     const version = (versionSelect.value || '').trim();
-    console.log(`  Version: "${version}"`);
-    
-    console.log(`  Final: template="${template_name}", version="${version}"`);
     
     // Add if both template name and version are present
+    // Silently skip rows without complete data (they're still loading)
     if (template_name && version) {
       templates.push({ template_name, version });
-      console.log(`  ✓ ADDED: ${template_name} (v${version})`);
-    } else {
-      const missing = [];
-      if (!template_name) missing.push('template_name');
-      if (!version) missing.push('version');
-      console.warn(`  ✗ SKIPPED: missing ${missing.join(' and ')}`);
     }
   });
   
-  console.log(`\nTotal templates collected: ${templates.length}`);
-  if (templates.length > 0) {
-    console.log('Templates:', templates);
-  }
-  
   // Update the dropdown
-  // Use preserveValue if provided, otherwise try to preserve current selection
   const valueToPreserve = preserveValue !== undefined ? preserveValue : select.value;
   updateEditInstallSelect(templates, valueToPreserve);
 }
@@ -4259,16 +4547,13 @@ function updateEditInstallSelectFromRows(preserveValue) {
 function updateEditInstallSelect(templates, selectedValue) {
   const select = el('editInstallSelect');
   if (!select) {
-    console.warn('updateEditInstallSelect: editInstallSelect not found');
     return;
   }
   
-  console.log('updateEditInstallSelect: Called with', templates ? templates.length : 0, 'templates');
   const currentValue = select.value;
   select.innerHTML = '';
   
   if (!templates || templates.length === 0) {
-    console.warn('updateEditInstallSelect: No templates provided');
     const opt = document.createElement('option');
     opt.value = '';
     opt.textContent = 'No templates available (add templates in Create Workspace above)';
@@ -4276,8 +4561,6 @@ function updateEditInstallSelect(templates, selectedValue) {
     select.disabled = false;
     return;
   }
-  
-  console.log('updateEditInstallSelect: Processing templates:', templates);
   
   // Create unique template entries and sort
   const uniqueTemplates = new Map();
@@ -4305,7 +4588,6 @@ function updateEditInstallSelect(templates, selectedValue) {
       const selectedTemplate = allOptions[selectedIndex];
       allOptions.splice(selectedIndex, 1);
       allOptions.unshift(selectedTemplate);
-      console.log('  Moved stored selection to first position:', selectedTemplate);
     }
   }
   
@@ -4322,11 +4604,9 @@ function updateEditInstallSelect(templates, selectedValue) {
       opt.value = `${template_name}|||${version}`;
       opt.textContent = `${template_name} (v${version})`;
       select.appendChild(opt);
-      console.log('  Added option:', opt.textContent);
     });
   }
   
-  console.log('updateEditInstallSelect: Total options created:', select.options.length);
   
   // Restore selection if possible
   select.disabled = false;
@@ -4339,20 +4619,16 @@ function updateEditInstallSelect(templates, selectedValue) {
     const match = Array.from(select.options).find(o => o.value === valueToRestore);
     if (match) {
       select.value = valueToRestore;
-      console.log('  ✓ Set selection during population:', valueToRestore);
     } else {
       // If stored value not found, log a warning
-      console.warn('  ⚠ Stored selection not found in options:', valueToRestore);
       // If we have options (no placeholder), select the first one
       if (select.options.length > 0) {
         select.value = select.options[0].value;
-        console.log('  Selected first available option:', select.value);
       }
     }
   } else if (select.options.length > 0) {
     // No stored value - if we have options (no placeholder), select the first one
     select.value = select.options[0].value;
-    console.log('  No stored selection, selected first option:', select.value);
   }
 }
 
@@ -4369,6 +4645,8 @@ function collectConfigFromEditForm() {
     newHostname: el('editNewHostname')?.value || '',
     chgPass: el('editChgPass')?.value || '',
     installSelect: el('editInstallSelect')?.value || '',
+    sshProfileId: el('editSshProfileSelect')?.value || '',
+    sshWaitTime: el('editSshWaitTime') ? (parseInt(el('editSshWaitTime').value) || 60) : 60,
     confirmedHosts: [],
     templates: []
   };
@@ -4504,7 +4782,7 @@ function cancelEditConfig() {
   if (editView) editView.style.display = 'none';
   
   // Clear form
-  const inputs = ['editConfigName', 'editApiBase', 'editFabricHost', 'editNewHostname', 'editChgPass'];
+  const inputs = ['editConfigName', 'editApiBase', 'editFabricHost', 'editNewHostname', 'editChgPass', 'editSshWaitTime'];
   inputs.forEach(id => {
     const input = el(id);
     if (input) input.value = '';
@@ -4513,6 +4791,10 @@ function cancelEditConfig() {
   // Clear NHI credential dropdown
   const nhiCredentialSelect = el('editNhiCredentialSelect');
   if (nhiCredentialSelect) nhiCredentialSelect.value = '';
+  
+  // Clear SSH profile dropdown
+  const editSshProfileSelect = el('editSshProfileSelect');
+  if (editSshProfileSelect) editSshProfileSelect.value = '';
   
   const expertModeInput = el('editExpertMode');
   if (expertModeInput) expertModeInput.checked = false;
@@ -4572,7 +4854,15 @@ document.addEventListener('DOMContentLoaded', () => {
     exp.checked = false;
     exp.addEventListener('change', () => {
       const out = el('out');
-      if (out) out.style.display = exp.checked ? '' : 'none';
+      if (out) {
+        if (exp.checked) {
+          out.style.display = '';
+        } else {
+          out.style.display = 'none';
+          // Clear output when disabling Expert Mode
+          out.textContent = '';
+        }
+      }
     });
   }
   updateCreateEnabled();
@@ -4672,8 +4962,8 @@ async function handleRunButton() {
     const session = await checkSessionStatus();
     if (!session) {
       showStatus('No active session. Please reload NHI credential.');
-      hideRunProgress();
-      return;
+        hideRunProgress();
+        return;
     }
     
     // Build templates list from ALL rows
@@ -4900,10 +5190,10 @@ async function handleRunButton() {
             // 1) get template id
             const { template_id } = await apiJson('/repo/template', {
               params: {
-                fabric_host: host,
-                template_name: t.template_name,
-                repo_name: t.repo_name,
-                version: t.version,
+              fabric_host: host,
+              template_name: t.template_name,
+              repo_name: t.repo_name,
+              version: t.version,
               }
             });
             logMsg(`Template located on ${host}`);
@@ -4991,7 +5281,7 @@ async function handleRunButton() {
                   // Continue anyway - this is not critical
                 }
                 
-                logMsg(`Template '${t.template_name}' v${t.version} created successfully on ${host}`);
+                // showStatus already calls logMsg internally, so don't duplicate
                 showStatus(`Template '${t.template_name}' v${t.version} created successfully on ${host}`);
                 t.status = 'created';
                 t.createProgress = 100;
@@ -5085,8 +5375,59 @@ async function handleRunButton() {
       showStatus('All workspace templates already exist');
     }
     
-    // STEP 2: Install the selected workspace (60-100%)
-    updateRunProgress(62, 'Preparing to install selected workspace...');
+    // STEP 1: Execute SSH Profiles (if selected) BEFORE Install Workspace
+    const sshProfileSelect = el('sshProfileSelect');
+    const sshProfileId = sshProfileSelect ? sshProfileSelect.value : '';
+    const sshWaitTimeInput = el('sshWaitTime');
+    const sshWaitTime = sshWaitTimeInput ? (parseInt(sshWaitTimeInput.value) || 60) : 60;
+    
+    if (sshProfileId) {
+      updateRunProgress(61, 'Executing SSH profiles...');
+      showStatus('Executing SSH profiles on all hosts...');
+      logMsg('Starting SSH profile execution');
+      
+      // Get encryption password from NHI credential input field (no prompt needed)
+      const nhiPasswordInput = el('nhiDecryptPassword');
+      const encryptionPassword = nhiPasswordInput ? nhiPasswordInput.value.trim() : '';
+      
+      if (!encryptionPassword) {
+        showStatus('SSH profile execution requires encryption password. Please load NHI credential first.');
+        logMsg('SSH profile execution cancelled - encryption password not available');
+        hideRunProgress();
+        stopRunTimer();
+        return;
+      }
+      
+      try {
+        const sshResults = await executeSshProfiles(hosts, sshProfileId, encryptionPassword, sshWaitTime);
+        const sshSuccessCount = sshResults.filter(r => r.success).length;
+        
+        if (sshSuccessCount === hosts.length) {
+          updateRunProgress(63, 'SSH profiles executed successfully!');
+          // showStatus already calls logMsg internally, so don't duplicate
+          showStatus(`SSH profiles executed successfully on all ${hosts.length} host(s)`);
+        } else {
+          updateRunProgress(63, `SSH profiles executed on ${sshSuccessCount}/${hosts.length} host(s)`);
+          // showStatus already calls logMsg internally, so don't duplicate
+          showStatus(`SSH profiles executed on ${sshSuccessCount}/${hosts.length} host(s)`);
+          
+          // Report errors but continue with installation
+          const errors = sshResults.filter(r => !r.success).map(r => `${r.host}: ${r.error || 'Unknown error'}`);
+          if (errors.length > 0) {
+            showStatus(`SSH profile errors (continuing with installation):\n${errors.join('\n')}`, { error: true });
+            logMsg(`SSH profile errors: ${errors.join('; ')}`);
+          }
+        }
+      } catch (error) {
+        console.error('Error executing SSH profiles:', error);
+        logMsg(`SSH profile execution error: ${error.message || error}`);
+        showStatus(`Error executing SSH profiles: ${error.message || error}`, { error: true });
+        // Continue with installation even if SSH fails
+      }
+    }
+    
+    // STEP 2: Install the selected workspace (after SSH profiles execute)
+    updateRunProgress(64, 'Preparing to install selected workspace...');
     const opt = el('installSelect').value;
     console.log('Selected template option:', opt);
     
@@ -5166,6 +5507,7 @@ async function handleRunButton() {
     });
     renderTemplates();
     
+    // STEP 2: Install Workspace (after SSH profiles execute)
     updateRunProgress(65, 'Installing workspace...');
     showStatus(`Installing workspace: ${template_name} v${version}...`);
     logMsg(`Starting workspace installation: ${template_name} v${version}`);
@@ -5379,6 +5721,8 @@ function collectConfiguration() {
   const newHostnameInput = el('newHostname');
   const chgPassInput = el('chgPass');
   const installSelectInput = el('installSelect');
+  const sshProfileSelectInput = el('sshProfileSelect');
+  const sshWaitTimeInput = el('sshWaitTime');
   
   // Ensure confirmedHosts is an array to avoid errors
   const hostsArray = Array.isArray(confirmedHosts) ? confirmedHosts : [];
@@ -5394,6 +5738,8 @@ function collectConfiguration() {
     chgPass: chgPassInput ? chgPassInput.value : '',
     confirmedHosts: hostsArray.map(h => ({ host: h.host, port: h.port })),
     installSelect: installSelectInput ? installSelectInput.value : '',
+    sshProfileId: sshProfileSelectInput ? (sshProfileSelectInput.value || '') : '',
+    sshWaitTime: sshWaitTimeInput ? (parseInt(sshWaitTimeInput.value) || 60) : 60,
     templates: []
   };
   
@@ -5507,6 +5853,22 @@ async function restoreConfiguration(config) {
     if (chgPassInput && config.chgPass !== undefined) {
       chgPassInput.value = config.chgPass || '';
       console.log('Restored chgPass');
+    }
+    
+    // Restore SSH profile selection
+    const sshProfileSelect = el('sshProfileSelect');
+    if (sshProfileSelect && config.sshProfileId !== undefined) {
+      // Ensure SSH profiles are loaded first
+      await loadSshProfilesForPreparation();
+      sshProfileSelect.value = config.sshProfileId || '';
+      console.log('Restored sshProfileId:', config.sshProfileId);
+    }
+    
+    // Restore SSH wait time
+    const sshWaitTimeInput = el('sshWaitTime');
+    if (sshWaitTimeInput && config.sshWaitTime !== undefined) {
+      sshWaitTimeInput.value = config.sshWaitTime || 60;
+      console.log('Restored sshWaitTime:', config.sshWaitTime);
     }
     
     // Update expert mode visibility
@@ -5703,15 +6065,18 @@ async function restoreConfiguration(config) {
               }
               
               // Set repo value WITHOUT triggering change event to avoid API calls
-              if (availableRepos.includes(repo_name)) {
+              if (availableRepos.includes(finalRepo)) {
                 // Temporarily remove event listeners to prevent API calls
                 const originalValue = r.value;
-                r.value = repo_name;
-                console.log(`Set repo to ${repo_name} for row ${i + 1} (no API calls)`);
+                r.value = finalRepo;
+                console.log(`Set repo to ${finalRepo} for row ${i + 1} (no API calls)`);
+                
+                // Ensure repo value persists - add a flag to prevent clearing
+                r._restoredFromCache = true;
                 
                 // Populate templates for this repo from cache directly
                 await new Promise(resolve => setTimeout(resolve, 100));
-                const templatesForRepo = cachedTemplates.filter(t => t.repo_name === repo_name);
+                const templatesForRepo = cachedTemplates.filter(t => t.repo_name === finalRepo);
                 const uniqueNames = Array.from(new Set(templatesForRepo.map(t => t.template_name).filter(Boolean))).sort();
                 const templateOptions = uniqueNames.map(name => {
                   const o = document.createElement('option');
@@ -5721,36 +6086,48 @@ async function restoreConfiguration(config) {
                 });
                 templateFiltered.populateOptions(templateOptions);
                 templateFiltered.enable();
-                console.log(`Populated ${uniqueNames.length} templates from cache for repo ${repo_name}`);
+                console.log(`Populated ${uniqueNames.length} templates from cache for repo ${finalRepo}`);
+                
+                // Verify repo value is still set after populateOptions
+                if (r.value !== finalRepo) {
+                  console.warn(`Repo value was cleared! Restoring to ${finalRepo}`);
+                  r.value = finalRepo;
+                }
                 
                 // Set template value
-                if (uniqueNames.includes(template_name)) {
+                if (uniqueNames.includes(finalTemplate)) {
                   await new Promise(resolve => setTimeout(resolve, 100));
                   
                   // Set template value WITHOUT triggering change events that would try to load from API
                   // We're using cache, so we'll populate versions directly from cache
-                  templateFiltered.input.value = template_name;
+                  templateFiltered.input.value = finalTemplate;
                   if (templateFiltered.select) {
-                    templateFiltered.select.value = template_name;
+                    templateFiltered.select.value = finalTemplate;
                   }
                   // Update datalist to show the value
                   if (templateFiltered.datalist) {
                     templateFiltered.updateDatalist();
                   }
-                  console.log(`Set template to ${template_name} for row ${i + 1} (no API calls)`);
+                  console.log(`Set template to ${finalTemplate} for row ${i + 1} (no API calls)`);
+                  
+                  // Verify repo value is still set after setting template
+                  if (r.value !== finalRepo) {
+                    console.warn(`Repo value was cleared after setting template! Restoring to ${finalRepo}`);
+                    r.value = finalRepo;
+                  }
                   
                   // Populate versions for this repo+template from cache
                   await new Promise(resolve => setTimeout(resolve, 100));
                   
                   // Get all matching templates from cache
                   const matchingTemplates = cachedTemplates.filter(t => 
-                    t.repo_name === repo_name && 
-                    t.template_name === template_name && 
+                    t.repo_name === finalRepo && 
+                    t.template_name === finalTemplate && 
                     t.version && 
                     t.version.trim() !== ''
                   );
                   
-                  console.log(`Looking for versions in cache: repo="${repo_name}", template="${template_name}"`);
+                  console.log(`Looking for versions in cache: repo="${finalRepo}", template="${finalTemplate}"`);
                   console.log(`  Found ${matchingTemplates.length} matching templates:`, matchingTemplates.map(t => ({ repo: t.repo_name, template: t.template_name, version: t.version })));
                   
                   const versions = Array.from(new Set(matchingTemplates.map(t => t.version.trim())))
@@ -5775,9 +6152,9 @@ async function restoreConfiguration(config) {
                       console.log(`    Added version option: ${ver}`);
                     });
                     v.disabled = false;
-                    console.log(`✓ Populated ${versions.length} versions from cache for ${repo_name}/${template_name}`);
+                    console.log(`✓ Populated ${versions.length} versions from cache for ${finalRepo}/${finalTemplate}`);
                   } else {
-                    console.warn(`⚠ No versions found in cache for ${repo_name}/${template_name}`);
+                    console.warn(`⚠ No versions found in cache for ${finalRepo}/${finalTemplate}`);
                     v.disabled = true;
                   }
                   
@@ -5789,7 +6166,7 @@ async function restoreConfiguration(config) {
                       v.value = finalVersion;
                       console.log(`✓ Set version to ${finalVersion} for row ${i + 1}`);
                     } else if (finalVersion) {
-                      console.warn(`Version ${finalVersion} not found in cache for ${repo_name}/${template_name}. Available:`, versions);
+                      console.warn(`Version ${finalVersion} not found in cache for ${finalRepo}/${finalTemplate}. Available:`, versions);
                       // Select first version if available
                       if (v.options.length > 1) {
                         v.value = v.options[1].value;
@@ -5814,13 +6191,19 @@ async function restoreConfiguration(config) {
                     
                     console.log(`✓ Final version for row ${i + 1}: ${v.value} (options: ${v.options.length})`);
                   } else {
-                    console.warn(`⚠ Version dropdown has no options for row ${i + 1} (repo: ${repo_name}, template: ${template_name})`);
+                    console.warn(`⚠ Version dropdown has no options for row ${i + 1} (repo: ${finalRepo}, template: ${finalTemplate})`);
+                  }
+                  
+                  // Final verification: ensure repo value is still set
+                  await new Promise(resolve => setTimeout(resolve, 100));
+                  if (r.value !== finalRepo) {
+                    r.value = finalRepo;
                   }
                 } else {
-                  console.warn(`Template ${template_name} not found in cache for repo ${repo_name}`);
+                  console.warn(`Template ${finalTemplate} not found in cache for repo ${finalRepo}`);
                 }
               } else {
-                console.warn(`Repo ${repo_name} not found in cached repositories`);
+                console.warn(`Repo ${finalRepo} not found in cached repositories`);
               }
               
             } else {
@@ -5914,6 +6297,12 @@ async function restoreConfiguration(config) {
               version: v.value || '(empty - this will cause issues!)',
               versionOptions: v.options.length
             });
+            
+            // Ensure repo value is still set before moving to next row
+            if (r.value !== finalRepo && finalRepo) {
+              console.warn(`Repo value lost for row ${i + 1}! Restoring to ${finalRepo}`);
+              r.value = finalRepo;
+            }
             
             // Wait before adding next row
             await new Promise(resolve => setTimeout(resolve, 300));
@@ -6240,7 +6629,8 @@ function setupEventButtons() {
       const name = el('eventName').value.trim();
   const date = el('eventDate').value;
   const time = el('eventTime').value;
-  const configId = parseInt(el('eventConfigSelect').value);
+  const configSelectValue = el('eventConfigSelect').value;
+  const configId = configSelectValue ? parseInt(configSelectValue, 10) : 0;
   const autoRun = el('eventAutoRun').checked;
   
   if (!name) {
@@ -6253,8 +6643,17 @@ function setupEventButtons() {
     return;
   }
   
-  if (!configId) {
+  if (!configId || isNaN(configId)) {
     showStatus('Please select a configuration');
+    return;
+  }
+  
+  // Validate that date/time is not in the past
+  const eventDateTime = new Date(date + (time ? 'T' + time : 'T00:00:00'));
+  const now = new Date();
+  if (eventDateTime < now) {
+    showStatus('Event date and time cannot be in the past', { error: true });
+    updateCreateEventButton(); // Update to show error messages
     return;
   }
   
@@ -6284,7 +6683,9 @@ function setupEventButtons() {
     
     if (!res.ok) {
       const errorText = await res.text();
-      showStatus(`Failed to create event: ${errorText}`);
+      const errorMessage = errorText || `Failed to create event: ${res.status} ${res.statusText}`;
+      showStatus(`Failed to create event: ${errorMessage}`);
+      console.error('Event save error:', errorMessage, 'Request payload:', { name, date, time, configId, autoRun });
       return;
     }
     
@@ -6310,7 +6711,8 @@ function setupEventButtons() {
       const name = el('eventName').value.trim();
       const date = el('eventDate').value;
       const time = el('eventTime').value;
-      const configId = parseInt(el('eventConfigSelect').value);
+      const configSelectValue = el('eventConfigSelect').value;
+      const configId = configSelectValue ? parseInt(configSelectValue, 10) : 0;
       const autoRun = el('eventAutoRun').checked;
       
       if (!editingEventId) {
@@ -6328,8 +6730,17 @@ function setupEventButtons() {
         return;
       }
       
-      if (!configId) {
+      if (!configId || isNaN(configId)) {
         showStatus('Please select a configuration');
+        return;
+      }
+      
+      // Validate that date/time is not in the past
+      const eventDateTime = new Date(date + (time ? 'T' + time : 'T00:00:00'));
+      const now = new Date();
+      if (eventDateTime < now) {
+        showStatus('Event date and time cannot be in the past', { error: true });
+        updateCreateEventButton(); // Update to show error messages
         return;
       }
       
@@ -6360,7 +6771,9 @@ function setupEventButtons() {
         
         if (!res.ok) {
           const errorText = await res.text();
-          showStatus(`Failed to update event: ${errorText}`);
+          const errorMessage = errorText || `Failed to update event: ${res.status} ${res.statusText}`;
+          showStatus(`Failed to update event: ${errorMessage}`);
+          console.error('Event save error:', errorMessage);
           return;
         }
         
@@ -6446,7 +6859,10 @@ function updateCreateEventButton() {
   const updateBtn = el('btnUpdateEvent');
   const nameInput = el('eventName');
   const dateInput = el('eventDate');
+  const timeInput = el('eventTime');
   const configSelect = el('eventConfigSelect');
+  const dateError = el('eventDateError');
+  const timeError = el('eventTimeError');
   
   // Only proceed if elements exist (section is loaded)
   if (!nameInput || !dateInput || !configSelect) {
@@ -6455,10 +6871,53 @@ function updateCreateEventButton() {
   
   const name = nameInput.value.trim();
   const date = dateInput.value;
+  const time = timeInput ? timeInput.value : '';
   const configId = configSelect.value;
   
-  // Buttons are enabled only when all required fields are filled
-  const isValid = !!(name && date && configId);
+  // Validate date/time is not in the past
+  let dateTimeValid = true;
+  let dateErrorMessage = '';
+  let timeErrorMessage = '';
+  
+  if (date) {
+    const eventDateTime = new Date(date + (time ? 'T' + time : 'T00:00:00'));
+    const now = new Date();
+    
+    if (eventDateTime < now) {
+      dateTimeValid = false;
+      if (time) {
+        timeErrorMessage = 'Event date and time cannot be in the past';
+      } else {
+        dateErrorMessage = 'Event date cannot be in the past';
+      }
+    }
+  }
+  
+  // Show/hide error messages
+  if (dateError) {
+    if (dateErrorMessage) {
+      dateError.textContent = dateErrorMessage;
+      dateError.style.display = 'inline';
+      if (dateInput) dateInput.style.borderColor = '#f87171';
+    } else {
+      dateError.style.display = 'none';
+      if (dateInput) dateInput.style.borderColor = '';
+    }
+  }
+  
+  if (timeError) {
+    if (timeErrorMessage) {
+      timeError.textContent = timeErrorMessage;
+      timeError.style.display = 'inline';
+      if (timeInput) timeInput.style.borderColor = '#f87171';
+    } else {
+      timeError.style.display = 'none';
+      if (timeInput) timeInput.style.borderColor = '';
+    }
+  }
+  
+  // Buttons are enabled only when all required fields are filled AND date/time is valid
+  const isValid = !!(name && date && configId && dateTimeValid);
   
   if (createBtn) {
     createBtn.disabled = !isValid;
@@ -6472,16 +6931,61 @@ function updateCreateEventButton() {
 function initEventFormValidation() {
   const nameInput = el('eventName');
   const dateInput = el('eventDate');
+  const timeInput = el('eventTime');
   const configSelect = el('eventConfigSelect');
+  
+  // Set min date to today
+  if (dateInput) {
+    const today = new Date().toISOString().split('T')[0];
+    dateInput.setAttribute('min', today);
+    
+    // Update min date when date changes (to handle time validation)
+    dateInput.addEventListener('change', function() {
+      const selectedDate = dateInput.value;
+      const today = new Date().toISOString().split('T')[0];
+      
+      if (selectedDate === today && timeInput) {
+        // If date is today, set min time to current time
+        const now = new Date();
+        const hours = String(now.getHours()).padStart(2, '0');
+        const minutes = String(now.getMinutes()).padStart(2, '0');
+        timeInput.setAttribute('min', `${hours}:${minutes}`);
+      } else if (timeInput) {
+        // If date is in the future, remove min time restriction
+        timeInput.removeAttribute('min');
+      }
+      
+      updateCreateEventButton();
+    });
+    
+    dateInput.addEventListener('input', updateCreateEventButton);
+  }
+  
+  if (timeInput) {
+    timeInput.addEventListener('change', function() {
+      // Validate when time changes
+      if (dateInput && dateInput.value) {
+        const selectedDate = dateInput.value;
+        const today = new Date().toISOString().split('T')[0];
+        const selectedTime = timeInput.value;
+        
+        if (selectedDate === today && selectedTime) {
+          const eventDateTime = new Date(selectedDate + 'T' + selectedTime);
+          const now = new Date();
+          if (eventDateTime < now) {
+            showStatus('Event time cannot be in the past', { error: true });
+            timeInput.value = '';
+          }
+        }
+      }
+      updateCreateEventButton();
+    });
+    timeInput.addEventListener('input', updateCreateEventButton);
+  }
   
   if (nameInput) {
     nameInput.addEventListener('input', updateCreateEventButton);
     nameInput.addEventListener('change', updateCreateEventButton);
-  }
-  
-  if (dateInput) {
-    dateInput.addEventListener('change', updateCreateEventButton);
-    dateInput.addEventListener('input', updateCreateEventButton);
   }
   
   if (configSelect) {
@@ -7044,8 +7548,8 @@ function setupNhiButtons() {
         console.error('Token retrieval errors:', data.token_errors);
       } else {
         showNhiStatus(data.message || 'NHI credential saved successfully');
-        showStatus(data.message || 'NHI credential saved successfully');
-        logMsg(`NHI credential saved: ${name}`);
+    showStatus(data.message || 'NHI credential saved successfully');
+    logMsg(`NHI credential saved: ${name}`);
       }
     } else {
       showNhiStatus(data.message || 'NHI credential saved successfully');
@@ -7137,8 +7641,8 @@ function setupNhiButtons() {
         console.error('Token retrieval errors:', data.token_errors);
       } else {
         showNhiStatus(data.message || 'NHI credential updated successfully');
-        showStatus(data.message || 'NHI credential updated successfully');
-        logMsg(`NHI credential updated: ${name} (ID: ${editingNhiId})`);
+    showStatus(data.message || 'NHI credential updated successfully');
+    logMsg(`NHI credential updated: ${name} (ID: ${editingNhiId})`);
       }
     } else {
       showNhiStatus(data.message || 'NHI credential updated successfully');
@@ -7220,3 +7724,954 @@ function setupNhiButtons() {
   }
 }
 
+// SSH Keys Management functions
+let editingSshKeyId = null;
+
+function isValidSshKeyName(name) {
+  return /^[a-zA-Z0-9_-]+$/.test(name);
+}
+
+async function loadSshKeys() {
+  const sshKeysList = el('sshKeysList');
+  if (!sshKeysList) return;
+  
+  try {
+    sshKeysList.innerHTML = '<p>Loading SSH keys...</p>';
+    
+    const res = await api('/ssh-keys/list');
+    if (!res.ok) {
+      sshKeysList.innerHTML = `<p style="color: #f87171;">Error loading SSH keys: ${res.statusText}</p>`;
+      return;
+    }
+    
+    const data = await res.json();
+    const keys = data.keys || [];
+    
+    if (keys.length === 0) {
+      sshKeysList.innerHTML = '<p>No SSH keys found. Use the form above to create one.</p>';
+      return;
+    }
+    
+    let html = '<div style="display: flex; flex-direction: column; gap: 12px;">';
+    
+    keys.forEach(key => {
+      const createdDate = new Date(key.created_at).toLocaleString();
+      const updatedDate = new Date(key.updated_at).toLocaleString();
+      // Truncate public key for display (first 50 chars)
+      const publicKeyPreview = key.public_key.length > 50 ? key.public_key.substring(0, 50) + '...' : key.public_key;
+      
+      html += `
+        <div class="config-item" data-ssh-key-id="${key.id}" style="padding: 12px; border: 1px solid #d2d2d7; border-radius: 4px; background: #f5f5f7;">
+          <div style="display: flex; align-items: center; gap: 8px; margin-bottom: 8px;">
+            <label style="margin: 0; font-weight: 600; cursor: pointer; flex: 1;">
+              <span style="font-size: 16px;">${key.name}</span>
+            </label>
+            <button class="btn-config-edit ssh-key-edit-btn" data-ssh-key-id="${key.id}" style="padding: 4px 12px; font-size: 12px;">Edit</button>
+            <button class="btn-config-delete ssh-key-delete-btn" data-ssh-key-id="${key.id}" style="padding: 4px 12px; font-size: 12px;">Delete</button>
+          </div>
+          <div style="font-size: 12px; color: #86868b; margin-left: 0; line-height: 1.6;">
+            <div style="margin-bottom: 4px;"><strong>Public Key:</strong></div>
+            <div style="margin-left: 12px; margin-bottom: 4px; font-family: monospace; font-size: 11px; word-break: break-all;">${publicKeyPreview}</div>
+            <div style="margin-bottom: 4px;"><strong>Created:</strong> ${createdDate}</div>
+            <div><strong>Updated:</strong> ${updatedDate}</div>
+          </div>
+        </div>
+      `;
+    });
+    html += '</div>';
+    sshKeysList.innerHTML = html;
+    
+    // Add event listeners for edit buttons
+    document.querySelectorAll('.ssh-key-edit-btn').forEach(btn => {
+      btn.addEventListener('click', async (e) => {
+        e.stopPropagation();
+        const sshKeyId = parseInt(btn.getAttribute('data-ssh-key-id'));
+        await editSshKey(sshKeyId);
+      });
+    });
+    
+    // Add event listeners for delete buttons
+    document.querySelectorAll('.ssh-key-delete-btn').forEach(btn => {
+      btn.addEventListener('click', async (e) => {
+        e.stopPropagation();
+        const sshKeyId = parseInt(btn.getAttribute('data-ssh-key-id'));
+        if (confirm('Are you sure you want to delete this SSH key?')) {
+          await deleteSshKey(sshKeyId);
+        }
+      });
+    });
+    
+  } catch (error) {
+    sshKeysList.innerHTML = `<p style="color: #f87171;">Error loading SSH keys: ${error.message || error}</p>`;
+    console.error('Error loading SSH keys:', error);
+  }
+}
+
+async function editSshKey(sshKeyId) {
+  try {
+    showStatus(`Loading SSH key for editing...`);
+    
+    // Ask for encryption password
+    const encryptionPassword = await promptForNhiPassword('Edit SSH Key');
+    if (!encryptionPassword) {
+      showStatus('Edit cancelled - password required');
+      return;
+    }
+    
+    const res = await api(`/ssh-keys/get/${sshKeyId}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ encryption_password: encryptionPassword })
+    });
+    
+    if (!res.ok) {
+      const errorText = await res.text().catch(() => 'Unknown error');
+      showStatus(`Failed to load SSH key: ${errorText}`);
+      return;
+    }
+    
+    const sshKeyData = await res.json();
+    
+    // Populate form fields
+    el('sshKeyName').value = sshKeyData.name || '';
+    el('sshKeyPublic').value = sshKeyData.public_key || '';
+    el('sshKeyPrivate').value = ''; // Clear private key field
+    el('sshKeyPrivate').placeholder = 'Hidden (not editable)';
+    el('sshKeyPrivate').disabled = true;
+    el('sshKeyEncryptionPassword').value = encryptionPassword;
+    
+    editingSshKeyId = sshKeyId;
+    
+    // Switch buttons - show Update, hide Create
+    el('btnSaveSshKey').style.display = 'none';
+    el('btnUpdateSshKey').style.display = 'inline-block';
+    el('btnCancelSshKey').style.display = 'inline-block';
+    el('btnUpdateSshKey').disabled = false;
+    
+    // Scroll to form
+    document.querySelector('#ssh-keys-section h3').scrollIntoView({ behavior: 'smooth', block: 'start' });
+    
+    showStatus(`SSH key '${sshKeyData.name}' loaded for editing. Click Update to save changes.`);
+  } catch (error) {
+    showStatus(`Error loading SSH key for editing: ${error.message || error}`);
+  }
+}
+
+function cancelSshKeyEdit() {
+  editingSshKeyId = null;
+  
+  // Clear form fields
+  el('sshKeyName').value = '';
+  el('sshKeyPublic').value = '';
+  el('sshKeyPrivate').value = '';
+  el('sshKeyPrivate').placeholder = 'Enter private key (-----BEGIN OPENSSH PRIVATE KEY-----...)';
+  el('sshKeyPrivate').disabled = false;
+  el('sshKeyEncryptionPassword').value = '';
+  
+  // Hide error messages
+  const nameError = el('sshKeyNameError');
+  if (nameError) nameError.style.display = 'none';
+  
+  // Switch buttons - show Create, hide Update
+  el('btnSaveSshKey').style.display = 'inline-block';
+  el('btnUpdateSshKey').style.display = 'none';
+  el('btnCancelSshKey').style.display = 'none';
+  
+  // Update button states
+  updateSshKeyButtons();
+}
+
+function updateSshKeyButtons() {
+  const saveBtn = el('btnSaveSshKey');
+  const updateBtn = el('btnUpdateSshKey');
+  const nameInput = el('sshKeyName');
+  const publicKeyInput = el('sshKeyPublic');
+  const privateKeyInput = el('sshKeyPrivate');
+  const encryptionPasswordInput = el('sshKeyEncryptionPassword');
+  
+  if (!nameInput || !publicKeyInput || !privateKeyInput || !encryptionPasswordInput) return;
+  
+  const name = nameInput.value.trim();
+  const publicKey = publicKeyInput.value.trim();
+  const privateKey = privateKeyInput.value.trim();
+  const encryptionPassword = encryptionPasswordInput.value.trim();
+  
+  // Validate name format
+  const nameValid = isValidSshKeyName(name);
+  const nameError = el('sshKeyNameError');
+  if (nameError) {
+    if (name && !nameValid) {
+      nameError.textContent = 'Name must contain only alphanumeric characters, dashes, and underscores';
+      nameError.style.display = 'inline';
+    } else {
+      nameError.style.display = 'none';
+    }
+  }
+  
+  // For create: all fields required
+  // For update: name, public key, and encryption password required (private key optional)
+  const isCreate = !editingSshKeyId;
+  const requiredFieldsOk = name && publicKey && encryptionPassword && (isCreate ? privateKey : true);
+  
+  const isValid = nameValid && requiredFieldsOk;
+  
+  if (saveBtn && saveBtn.style.display !== 'none') {
+    saveBtn.disabled = !isValid;
+  }
+  if (updateBtn && updateBtn.style.display !== 'none') {
+    updateBtn.disabled = !isValid;
+  }
+}
+
+function initSshKeyFormValidation() {
+  const nameInput = el('sshKeyName');
+  const publicKeyInput = el('sshKeyPublic');
+  const privateKeyInput = el('sshKeyPrivate');
+  const encryptionPasswordInput = el('sshKeyEncryptionPassword');
+  
+  if (nameInput) {
+    nameInput.addEventListener('input', (e) => {
+      const value = e.target.value;
+      const filtered = value.replace(/[^a-zA-Z0-9_-]/g, '');
+      if (value !== filtered) {
+        e.target.value = filtered;
+      }
+      updateSshKeyButtons();
+    });
+    nameInput.addEventListener('change', updateSshKeyButtons);
+    nameInput.addEventListener('blur', updateSshKeyButtons);
+  }
+  
+  if (publicKeyInput) {
+    publicKeyInput.addEventListener('input', updateSshKeyButtons);
+    publicKeyInput.addEventListener('change', updateSshKeyButtons);
+  }
+  
+  if (privateKeyInput) {
+    privateKeyInput.addEventListener('input', updateSshKeyButtons);
+    privateKeyInput.addEventListener('change', updateSshKeyButtons);
+  }
+  
+  if (encryptionPasswordInput) {
+    encryptionPasswordInput.addEventListener('input', updateSshKeyButtons);
+    encryptionPasswordInput.addEventListener('change', updateSshKeyButtons);
+  }
+  
+  // Initial check
+  updateSshKeyButtons();
+}
+
+function setupSshKeyButtons() {
+  const saveBtn = el('btnSaveSshKey');
+  if (saveBtn && !saveBtn.onclick) {
+    saveBtn.onclick = async () => {
+      const name = el('sshKeyName').value.trim();
+      const publicKey = el('sshKeyPublic').value.trim();
+      const privateKey = el('sshKeyPrivate').value.trim();
+      const encryptionPassword = el('sshKeyEncryptionPassword').value.trim();
+      
+      if (!name || !publicKey || !privateKey || !encryptionPassword) {
+        showStatus('Please fill in all fields including encryption password');
+        return;
+      }
+      
+      // Validate name format
+      if (!isValidSshKeyName(name)) {
+        showStatus('Name must contain only alphanumeric characters, dashes, and underscores');
+        return;
+      }
+      
+      try {
+        const res = await api('/ssh-keys/save', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            name: name,
+            public_key: publicKey,
+            private_key: privateKey,
+            encryption_password: encryptionPassword
+          })
+        });
+        
+        if (!res.ok) {
+          const errorText = await res.text().catch(() => 'Unknown error');
+          showStatus(`Failed to save SSH key: ${errorText}`);
+          return;
+        }
+        
+        const data = await res.json();
+        showStatus(data.message || 'SSH key saved successfully');
+        
+        // Clear form
+        cancelSshKeyEdit();
+        
+        // Reload SSH keys list
+        loadSshKeys();
+      } catch (error) {
+        showStatus(`Error saving SSH key: ${error.message || error}`);
+      }
+    };
+  }
+  
+  const updateBtn = el('btnUpdateSshKey');
+  if (updateBtn && !updateBtn.onclick) {
+    updateBtn.onclick = async () => {
+      const name = el('sshKeyName').value.trim();
+      const publicKey = el('sshKeyPublic').value.trim();
+      const privateKey = el('sshKeyPrivate').value.trim();
+      const encryptionPassword = el('sshKeyEncryptionPassword').value.trim();
+      
+      if (!editingSshKeyId) {
+        showStatus('No SSH key selected for editing');
+        return;
+      }
+      
+      if (!name || !publicKey || !encryptionPassword) {
+        showStatus('Please fill in name, public key, and encryption password');
+        return;
+      }
+      
+      // Validate name format
+      if (!isValidSshKeyName(name)) {
+        showStatus('Name must contain only alphanumeric characters, dashes, and underscores');
+        return;
+      }
+      
+      try {
+        const payload = {
+          id: editingSshKeyId,
+          name: name,
+          public_key: publicKey,
+          encryption_password: encryptionPassword
+        };
+        
+        // Only include private_key if provided (not empty)
+        if (privateKey) {
+          payload.private_key = privateKey;
+        }
+        
+        const res = await api('/ssh-keys/save', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        });
+        
+        if (!res.ok) {
+          const errorText = await res.text().catch(() => 'Unknown error');
+          showStatus(`Failed to update SSH key: ${errorText}`);
+          return;
+        }
+        
+        const data = await res.json();
+        showStatus(data.message || 'SSH key updated successfully');
+        
+        // Clear form
+        cancelSshKeyEdit();
+        
+        // Reload SSH keys list
+        loadSshKeys();
+      } catch (error) {
+        showStatus(`Error updating SSH key: ${error.message || error}`);
+      }
+    };
+  }
+  
+  const cancelBtn = el('btnCancelSshKey');
+  if (cancelBtn && !cancelBtn.onclick) {
+    cancelBtn.onclick = () => {
+      cancelSshKeyEdit();
+    };
+  }
+}
+
+async function deleteSshKey(sshKeyId) {
+  try {
+    const res = await api(`/ssh-keys/delete/${sshKeyId}`, {
+      method: 'DELETE'
+    });
+    
+    if (res.ok) {
+      const data = await res.json();
+      showStatus(data.message || 'SSH key deleted successfully');
+      loadSshKeys();
+    } else {
+      const errorText = await res.text().catch(() => 'Unknown error');
+      showStatus(`Failed to delete SSH key: ${errorText}`);
+    }
+  } catch (error) {
+    showStatus(`Error deleting SSH key: ${error.message || error}`);
+  }
+}
+
+
+// SSH Command Profiles Management functions
+let editingSshProfileId = null;
+
+function isValidSshProfileName(name) {
+  return /^[a-zA-Z0-9_-]+$/.test(name);
+}
+
+async function loadSshCommandProfiles() {
+  const profilesList = el('sshProfilesList');
+  if (!profilesList) return;
+  
+  try {
+    profilesList.innerHTML = '<p>Loading SSH command profiles...</p>';
+    
+    const res = await api('/ssh-command-profiles/list');
+    if (!res.ok) {
+      profilesList.innerHTML = `<p style="color: #f87171;">Error loading SSH command profiles: ${res.statusText}</p>`;
+      return;
+    }
+    
+    const data = await res.json();
+    const profiles = data.profiles || [];
+    
+    if (profiles.length === 0) {
+      profilesList.innerHTML = '<p>No SSH command profiles found. Use the form above to create one.</p>';
+      return;
+    }
+    
+    let html = '<div style="display: flex; flex-direction: column; gap: 12px;">';
+    
+    profiles.forEach(profile => {
+      const createdDate = new Date(profile.created_at).toLocaleString();
+      const updatedDate = new Date(profile.updated_at).toLocaleString();
+      // Count number of commands (lines)
+      const commandCount = profile.commands.split('\n').filter(c => c.trim()).length;
+      // Preview first few commands
+      const commandsPreview = profile.commands.split('\n').slice(0, 3).join('\n');
+      const hasMore = profile.commands.split('\n').length > 3;
+      
+      html += `
+        <div class="config-item" data-ssh-profile-id="${profile.id}" style="padding: 12px; border: 1px solid #d2d2d7; border-radius: 4px; background: #f5f5f7;">
+          <div style="display: flex; align-items: center; gap: 8px; margin-bottom: 8px;">
+            <label style="margin: 0; font-weight: 600; cursor: pointer; flex: 1;">
+              <span style="font-size: 16px;">${profile.name}</span>
+            </label>
+            <button class="btn-config-run ssh-profile-run-btn" data-ssh-profile-id="${profile.id}" style="padding: 4px 12px; font-size: 12px;">Run</button>
+            <button class="btn-config-edit ssh-profile-edit-btn" data-ssh-profile-id="${profile.id}" style="padding: 4px 12px; font-size: 12px;">Edit</button>
+            <button class="btn-config-delete ssh-profile-delete-btn" data-ssh-profile-id="${profile.id}" style="padding: 4px 12px; font-size: 12px;">Delete</button>
+          </div>
+          <div style="font-size: 12px; color: #86868b; margin-left: 0; line-height: 1.6;">
+            ${profile.description ? `<div style="margin-bottom: 4px;"><strong>Description:</strong> ${profile.description}</div>` : ''}
+            ${profile.ssh_key_name ? `<div style="margin-bottom: 4px;"><strong>SSH Key Pair:</strong> ${profile.ssh_key_name}</div>` : ''}
+            <div style="margin-bottom: 4px;"><strong>Commands:</strong> ${commandCount} command(s)</div>
+            <div style="margin-left: 12px; margin-bottom: 4px; font-family: monospace; font-size: 11px; white-space: pre-wrap; background: #1d1d1f; color: #ffffff; padding: 8px; border-radius: 4px; max-height: 100px; overflow-y: auto;">${commandsPreview}${hasMore ? '\n...' : ''}</div>
+            <div style="margin-bottom: 4px;"><strong>Created:</strong> ${createdDate}</div>
+            <div><strong>Updated:</strong> ${updatedDate}</div>
+          </div>
+        </div>
+      `;
+    });
+    html += '</div>';
+    profilesList.innerHTML = html;
+    
+    // Add event listeners for edit buttons
+    document.querySelectorAll('.ssh-profile-edit-btn').forEach(btn => {
+      btn.addEventListener('click', async (e) => {
+        e.stopPropagation();
+        const profileId = parseInt(btn.getAttribute('data-ssh-profile-id'));
+        await editSshCommandProfile(profileId);
+      });
+    });
+    
+    // Add event listeners for delete buttons
+    document.querySelectorAll('.ssh-profile-delete-btn').forEach(btn => {
+      btn.addEventListener('click', async (e) => {
+        e.stopPropagation();
+        const profileId = parseInt(btn.getAttribute('data-ssh-profile-id'));
+        if (confirm('Are you sure you want to delete this SSH command profile?')) {
+          await deleteSshCommandProfile(profileId);
+        }
+      });
+    });
+    
+    // Add event listeners for run buttons
+    document.querySelectorAll('.ssh-profile-run-btn').forEach(btn => {
+      btn.addEventListener('click', async (e) => {
+        e.stopPropagation();
+        const profileId = parseInt(btn.getAttribute('data-ssh-profile-id'));
+        await runSshCommandProfile(profileId);
+      });
+    });
+    
+  } catch (error) {
+    profilesList.innerHTML = `<p style="color: #f87171;">Error loading SSH command profiles: ${error.message || error}</p>`;
+    console.error('Error loading SSH command profiles:', error);
+  }
+}
+
+async function editSshCommandProfile(profileId) {
+  try {
+    showStatus(`Loading SSH command profile for editing...`);
+    
+    const res = await api(`/ssh-command-profiles/get/${profileId}`);
+    
+    if (!res.ok) {
+      const errorText = await res.text().catch(() => 'Unknown error');
+      showStatus(`Failed to load SSH command profile: ${errorText}`);
+      return;
+    }
+    
+    const profileData = await res.json();
+    
+    // Populate form fields
+    el('sshProfileName').value = profileData.name || '';
+    el('sshProfileDescription').value = profileData.description || '';
+    el('sshProfileCommands').value = profileData.commands || '';
+    
+    // Set SSH key selection
+    const sshKeySelect = el('sshProfileSshKeyId');
+    if (sshKeySelect) {
+      sshKeySelect.value = profileData.ssh_key_id || '';
+    }
+    
+    editingSshProfileId = profileId;
+    
+    // Switch buttons - show Update, hide Create
+    el('btnSaveSshProfile').style.display = 'none';
+    el('btnUpdateSshProfile').style.display = 'inline-block';
+    el('btnCancelSshProfile').style.display = 'inline-block';
+    el('btnUpdateSshProfile').disabled = false;
+    
+    // Scroll to form
+    document.querySelector('#ssh-command-profiles-section h3').scrollIntoView({ behavior: 'smooth', block: 'start' });
+    
+    showStatus(`SSH command profile '${profileData.name}' loaded for editing. Click Update to save changes.`);
+  } catch (error) {
+    showStatus(`Error loading SSH command profile for editing: ${error.message || error}`);
+  }
+}
+
+function cancelSshCommandProfileEdit() {
+  editingSshProfileId = null;
+  
+  // Clear form fields
+  el('sshProfileName').value = '';
+  el('sshProfileDescription').value = '';
+  el('sshProfileCommands').value = '';
+  
+  // Clear SSH key selection
+  const sshKeySelect = el('sshProfileSshKeyId');
+  if (sshKeySelect) {
+    sshKeySelect.value = '';
+  }
+  
+  // Hide error messages
+  const nameError = el('sshProfileNameError');
+  if (nameError) nameError.style.display = 'none';
+  
+  // Switch buttons - show Create, hide Update
+  el('btnSaveSshProfile').style.display = 'inline-block';
+  el('btnUpdateSshProfile').style.display = 'none';
+  el('btnCancelSshProfile').style.display = 'none';
+  
+  // Update button states
+  updateSshCommandProfileButtons();
+}
+
+function updateSshCommandProfileButtons() {
+  const saveBtn = el('btnSaveSshProfile');
+  const updateBtn = el('btnUpdateSshProfile');
+  const nameInput = el('sshProfileName');
+  const commandsInput = el('sshProfileCommands');
+  
+  if (!nameInput || !commandsInput) return;
+  
+  const name = nameInput.value.trim();
+  const commands = commandsInput.value.trim();
+  
+  // Validate name format
+  const nameValid = isValidSshProfileName(name);
+  const nameError = el('sshProfileNameError');
+  if (nameError) {
+    if (name && !nameValid) {
+      nameError.textContent = 'Name must contain only alphanumeric characters, dashes, and underscores';
+      nameError.style.display = 'inline';
+    } else {
+      nameError.style.display = 'none';
+    }
+  }
+  
+  // Both name and commands are required
+  const isValid = nameValid && name && commands;
+  
+  if (saveBtn && saveBtn.style.display !== 'none') {
+    saveBtn.disabled = !isValid;
+  }
+  if (updateBtn && updateBtn.style.display !== 'none') {
+    updateBtn.disabled = !isValid;
+  }
+}
+
+function initSshCommandProfileFormValidation() {
+  const nameInput = el('sshProfileName');
+  const commandsInput = el('sshProfileCommands');
+  
+  if (nameInput) {
+    nameInput.addEventListener('input', (e) => {
+      const value = e.target.value;
+      const filtered = value.replace(/[^a-zA-Z0-9_-]/g, '');
+      if (value !== filtered) {
+        e.target.value = filtered;
+      }
+      updateSshCommandProfileButtons();
+    });
+    nameInput.addEventListener('change', updateSshCommandProfileButtons);
+    nameInput.addEventListener('blur', updateSshCommandProfileButtons);
+  }
+  
+  if (commandsInput) {
+    commandsInput.addEventListener('input', updateSshCommandProfileButtons);
+    commandsInput.addEventListener('change', updateSshCommandProfileButtons);
+  }
+  
+  // Load SSH keys for the dropdown
+  loadSshKeysForProfile();
+  
+  // Initial check
+  updateSshCommandProfileButtons();
+}
+
+async function loadSshKeysForProfile() {
+  const sshKeySelect = el('sshProfileSshKeyId');
+  if (!sshKeySelect) return;
+  
+  try {
+    const res = await api('/ssh-keys/list');
+    if (!res.ok) {
+      console.error('Failed to load SSH keys for profile dropdown');
+      return;
+    }
+    
+    const data = await res.json();
+    const keys = data.keys || [];
+    
+    // Clear existing options except the first one
+    sshKeySelect.innerHTML = '<option value="">None (select SSH key pair)</option>';
+    
+    // Add SSH keys to dropdown
+    keys.forEach(key => {
+      const option = document.createElement('option');
+      option.value = key.id;
+      option.textContent = key.name;
+      sshKeySelect.appendChild(option);
+    });
+  } catch (error) {
+    console.error('Error loading SSH keys for profile dropdown:', error);
+  }
+}
+
+function setupSshCommandProfileButtons() {
+  const saveBtn = el('btnSaveSshProfile');
+  if (saveBtn && !saveBtn.onclick) {
+    saveBtn.onclick = async () => {
+      const name = el('sshProfileName').value.trim();
+      const description = el('sshProfileDescription').value.trim();
+      const commands = el('sshProfileCommands').value.trim();
+      const sshKeyId = el('sshProfileSshKeyId').value ? parseInt(el('sshProfileSshKeyId').value) : null;
+      
+      if (!name || !commands) {
+        showStatus('Please fill in name and commands');
+        return;
+      }
+      
+      // Validate name format
+      if (!isValidSshProfileName(name)) {
+        showStatus('Name must contain only alphanumeric characters, dashes, and underscores');
+        return;
+      }
+      
+      try {
+        const res = await api('/ssh-command-profiles/save', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            name: name,
+            description: description || null,
+            commands: commands,
+            ssh_key_id: sshKeyId
+          })
+        });
+        
+        if (!res.ok) {
+          const errorText = await res.text().catch(() => 'Unknown error');
+          showStatus(`Failed to save SSH command profile: ${errorText}`);
+          return;
+        }
+        
+        const data = await res.json();
+        showStatus(data.message || 'SSH command profile saved successfully');
+        
+        // Clear form
+        cancelSshCommandProfileEdit();
+        
+        // Reload profiles list
+        loadSshCommandProfiles();
+      } catch (error) {
+        showStatus(`Error saving SSH command profile: ${error.message || error}`);
+      }
+    };
+  }
+  
+  const updateBtn = el('btnUpdateSshProfile');
+  if (updateBtn && !updateBtn.onclick) {
+    updateBtn.onclick = async () => {
+      const name = el('sshProfileName').value.trim();
+      const description = el('sshProfileDescription').value.trim();
+      const commands = el('sshProfileCommands').value.trim();
+      const sshKeyId = el('sshProfileSshKeyId').value ? parseInt(el('sshProfileSshKeyId').value) : null;
+      
+      if (!editingSshProfileId) {
+        showStatus('No SSH command profile selected for editing');
+        return;
+      }
+      
+      if (!name || !commands) {
+        showStatus('Please fill in name and commands');
+        return;
+      }
+      
+      // Validate name format
+      if (!isValidSshProfileName(name)) {
+        showStatus('Name must contain only alphanumeric characters, dashes, and underscores');
+        return;
+      }
+      
+      try {
+        const res = await api('/ssh-command-profiles/save', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            id: editingSshProfileId,
+            name: name,
+            description: description || null,
+            commands: commands,
+            ssh_key_id: sshKeyId
+          })
+        });
+        
+        if (!res.ok) {
+          const errorText = await res.text().catch(() => 'Unknown error');
+          showStatus(`Failed to update SSH command profile: ${errorText}`);
+          return;
+        }
+        
+        const data = await res.json();
+        showStatus(data.message || 'SSH command profile updated successfully');
+        
+        // Clear form
+        cancelSshCommandProfileEdit();
+        
+        // Reload profiles list
+        loadSshCommandProfiles();
+      } catch (error) {
+        showStatus(`Error updating SSH command profile: ${error.message || error}`);
+      }
+    };
+  }
+  
+  const cancelBtn = el('btnCancelSshProfile');
+  if (cancelBtn && !cancelBtn.onclick) {
+    cancelBtn.onclick = () => {
+      cancelSshCommandProfileEdit();
+    };
+  }
+}
+
+async function deleteSshCommandProfile(profileId) {
+  try {
+    const res = await api(`/ssh-command-profiles/delete/${profileId}`, {
+      method: 'DELETE'
+    });
+    
+    if (res.ok) {
+      const data = await res.json();
+      showStatus(data.message || 'SSH command profile deleted successfully');
+      loadSshCommandProfiles();
+    } else {
+      const errorText = await res.text().catch(() => 'Unknown error');
+      showStatus(`Failed to delete SSH command profile: ${errorText}`);
+    }
+  } catch (error) {
+    showStatus(`Error deleting SSH command profile: ${error.message || error}`);
+  }
+}
+
+// Run SSH command profile manually
+async function runSshCommandProfile(profileId) {
+  try {
+    // Get profile details first
+    const res = await api('/ssh-command-profiles/list');
+    if (!res.ok) {
+      showStatus('Failed to load SSH command profile details', { error: true });
+      return;
+    }
+    
+    const data = await res.json();
+    const profiles = data.profiles || [];
+    const profile = profiles.find(p => p.id === profileId);
+    
+    if (!profile) {
+      showStatus('SSH command profile not found', { error: true });
+      return;
+    }
+    
+    if (!profile.ssh_key_id) {
+      showStatus('This SSH command profile does not have an SSH key pair assigned', { error: true });
+      return;
+    }
+    
+    // Prompt for hostname/IP
+    const hostname = await promptStyled(
+      `Execute SSH Profile: ${profile.name}`,
+      `Enter hostname or IP address:\n\nCommands: ${profile.commands.split('\n').filter(c => c.trim()).length} command(s)`,
+      'text'
+    );
+    if (!hostname || !hostname.trim()) {
+      return;
+    }
+    
+    // Prompt for encryption password
+    const encryptionPassword = await promptStyled(
+      'SSH Key Decryption',
+      'Enter encryption password for SSH key decryption:',
+      'password'
+    );
+    if (!encryptionPassword) {
+      return;
+    }
+    
+    // Execute SSH profile
+    showStatus(`Executing SSH profile '${profile.name}' on ${hostname}...`);
+    
+    const executeRes = await api('/ssh-profiles/execute', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        fabric_host: hostname.trim(),
+        ssh_profile_id: profileId,
+        ssh_port: 22,
+        encryption_password: encryptionPassword,
+        wait_time_seconds: 0  // No wait time for manual execution
+      })
+    });
+    
+    if (!executeRes.ok) {
+      const errorText = await executeRes.text().catch(() => 'Unknown error');
+      showStatus(`SSH execution failed: ${errorText}`, { error: true });
+      return;
+    }
+    
+    const executeData = await executeRes.json();
+    
+    // Display results
+    if (executeData.success) {
+      let message = `✓ SSH profile '${profile.name}' executed successfully on ${hostname}`;
+      if (executeData.output) {
+        message += `\n\nOutput:\n${executeData.output}`;
+      }
+      if (executeData.error) {
+        message += `\n\nWarnings:\n${executeData.error}`;
+      }
+      
+      // Show detailed results in a styled modal
+      await alertStyled('SSH Execution Success', message, false);
+      showStatus(`SSH profile '${profile.name}' executed successfully on ${hostname}`);
+    } else {
+      let errorMessage = `✗ SSH profile '${profile.name}' execution failed on ${hostname}`;
+      if (executeData.error) {
+        errorMessage += `\n\nErrors:\n${executeData.error}`;
+      }
+      if (executeData.output) {
+        errorMessage += `\n\nOutput:\n${executeData.output}`;
+      }
+      
+      await alertStyled('SSH Execution Failed', errorMessage, true);
+      showStatus(`SSH profile '${profile.name}' execution failed on ${hostname}`, { error: true });
+    }
+  } catch (error) {
+    showStatus(`Error running SSH command profile: ${error.message || error}`, { error: true });
+  }
+}
+
+// Load SSH profiles for preparation section dropdown
+async function loadSshProfilesForPreparation() {
+  const sshProfileSelect = el('sshProfileSelect');
+  if (!sshProfileSelect) return;
+  
+  try {
+    const res = await api('/ssh-command-profiles/list');
+    if (!res.ok) {
+      console.error('Failed to load SSH profiles for preparation dropdown');
+      return;
+    }
+    
+    const data = await res.json();
+    const profiles = data.profiles || [];
+    
+    // Clear existing options except the first one
+    sshProfileSelect.innerHTML = '<option value="">None (select SSH profile)</option>';
+    
+    // Add SSH profiles to dropdown
+    profiles.forEach(profile => {
+      const option = document.createElement('option');
+      option.value = profile.id;
+      option.textContent = profile.name;
+      sshProfileSelect.appendChild(option);
+    });
+  } catch (error) {
+    console.error('Error loading SSH profiles for preparation dropdown:', error);
+  }
+}
+
+// Execute SSH profiles on all hosts
+async function executeSshProfiles(hosts, sshProfileId, encryptionPassword, waitTimeSeconds = 60) {
+  const results = [];
+  
+  for (const {host, port} of hosts) {
+    try {
+      logMsg(`Executing SSH profile on ${host}`);
+      
+      const res = await api('/ssh-profiles/execute', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          fabric_host: host,
+          ssh_profile_id: parseInt(sshProfileId),
+          ssh_port: port || 22,
+          encryption_password: encryptionPassword,
+          wait_time_seconds: waitTimeSeconds || 0
+        })
+      });
+      
+      if (!res.ok) {
+        const errorText = await res.text().catch(() => 'Unknown error');
+        logMsg(`SSH profile execution failed on ${host}: ${errorText}`);
+        results.push({ host, success: false, error: errorText });
+        continue;
+      }
+      
+      const data = await res.json();
+      if (data.success) {
+        logMsg(`SSH profile executed successfully on ${host}`);
+        if (data.output) {
+          logMsg(`SSH output for ${host}:\n${data.output}`);
+        }
+        results.push({ host, success: true, output: data.output });
+      } else {
+        logMsg(`SSH profile execution failed on ${host}: ${data.error || 'Unknown error'}`);
+        if (data.output) {
+          logMsg(`SSH output for ${host}:\n${data.output}`);
+        }
+        results.push({ host, success: false, error: data.error || 'Unknown error', output: data.output });
+      }
+    } catch (error) {
+      logMsg(`Error executing SSH profile on ${host}: ${error.message || error}`);
+      results.push({ host, success: false, error: error.message || error });
+    }
+  }
+  
+  return results;
+}
