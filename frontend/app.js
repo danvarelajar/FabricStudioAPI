@@ -575,11 +575,9 @@ async function renderFabricHostList() {
   const items = parseFabricHosts();
   confirmedHosts = items; // Store confirmed hosts
   
-  // Check session status if sessionExpiresAt is not set
-  if (!sessionExpiresAt) {
-    const session = await checkSessionStatus();
-    // sessionExpiresAt is updated by checkSessionStatus()
-  }
+  // Always check session status to ensure it's current
+  const session = await checkSessionStatus();
+  // sessionExpiresAt is updated by checkSessionStatus()
   
   items.forEach(({host, port}, i) => {
     const li = document.createElement('li');
