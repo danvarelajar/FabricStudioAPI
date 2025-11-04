@@ -30,7 +30,7 @@ def check_tasks(fabric_host, access_token, display_progress=False):
         return None
     start = time.time()
     logger.info("Task polling started")
-    max_wait_time = 10 * 60  # 10 minutes in seconds
+    max_wait_time = 15 * 60  # 15 minutes in seconds
     waited = 0
     previous_count = data.get("page", {}).get("count", 0)
     last_progress_log = 0
@@ -65,13 +65,19 @@ def check_tasks(fabric_host, access_token, display_progress=False):
             ))
             sys.stdout.flush()
     if waited >= max_wait_time and data.get("page", {}).get("count", 0) != 0:
-        logger.error("Timed out waiting for tasks to finish after 10 minutes")
+        logger.error("Timed out waiting for tasks to finish after 15 minutes")
+        if display_progress:
+            sys.stdout.write("\n")
+        end = time.time()
+        difference = (end - start)/60
+        logger.info("Task polling completed in %.2f minutes", difference)
+        return (difference, False)  # Return (elapsed_time, success)
     if display_progress:
         sys.stdout.write("\n")
     end = time.time()
     difference = (end - start)/60
     logger.info("Task polling completed in %.2f minutes", difference)
-    return difference
+    return (difference, True)  # Return (elapsed_time, success)
 
 
 def get_running_task_count(fabric_host, access_token):
@@ -95,6 +101,65 @@ def get_running_task_count(fabric_host, access_token):
         logger.error("Task status JSON parse error")
         return None
     return data.get("page", {}).get("count", 0)
+
+
+def get_recent_task_errors(fabric_host, access_token, limit=50):
+    """
+    Query recent completed/failed tasks and extract error information.
+    Returns a list of error dictionaries with task details.
+    """
+    logger.info("Checking for recent task errors on host %s", fabric_host)
+    # Query recent tasks (completed and failed)
+    # Use status filter if available, otherwise query all recent tasks
+    url = f"https://{fabric_host}/api/v1/task"
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Cache-Control": "no-cache"
+    }
+    params = {
+        "per_page": limit,
+        "page": 1
+    }
+    
+    try:
+        response = requests.get(url, headers=headers, params=params, verify=False, timeout=30)
+    except requests.RequestException as exc:
+        logger.error("Error querying recent tasks: %s", exc)
+        return []
+    
+    if response.status_code != 200:
+        logger.error("Error querying recent tasks: %s - %s", response.status_code, response.text)
+        return []
+    
+    try:
+        data = response.json()
+    except ValueError:
+        logger.error("Error parsing recent tasks response as JSON")
+        return []
+    
+    errors = []
+    tasks = data.get("object", [])
+    
+    # Filter for failed or error tasks
+    for task in tasks:
+        status = task.get("status", "").lower()
+        task_id = task.get("id")
+        task_name = task.get("name", "Unknown Task")
+        
+        # Check for failed status or error messages
+        if status in ["failed", "error", "exception"]:
+            error_msg = task.get("error", "") or task.get("message", "") or task.get("description", "")
+            if error_msg:
+                errors.append({
+                    "task_id": task_id,
+                    "task_name": task_name,
+                    "status": status,
+                    "error": error_msg,
+                    "timestamp": task.get("created_at") or task.get("updated_at")
+                })
+                logger.warning("Found failed task: %s (id: %s) - %s", task_name, task_id, error_msg)
+    
+    return errors
 
 
 def query_hostname(fabric_host, access_token):
@@ -480,14 +545,30 @@ def create_fabric(fabric_host, access_token, template_id, template, version):
         response = requests.post(url, headers=headers, json=data, verify=False, timeout=30)
     except requests.RequestException as exc:
         logger.error("Error creating template %s: %s", template_id, exc)
-        return None
+        return (False, [f"Request error: {str(exc)}"])
     if response.status_code == 200:
-        check_tasks(fabric_host,access_token)
+        result = check_tasks(fabric_host, access_token)
+        if result is None:
+            logger.error("Error checking tasks after fabric creation")
+            return (False, ["Error checking task status after fabric creation"])
+        elapsed_time, success = result if isinstance(result, tuple) else (result, True)
+        if not success:
+            logger.error("Timed out waiting for tasks to finish after fabric creation")
+            return (False, ["Timed out waiting for tasks to finish after 15 minutes"])
+        
+        # Check for task errors after tasks complete
+        task_errors = get_recent_task_errors(fabric_host, access_token, limit=20)
+        if task_errors:
+            error_messages = [f"Task '{err['task_name']}': {err['error']}" for err in task_errors]
+            logger.warning("Found %d task errors after fabric creation", len(task_errors))
+            return (False, error_messages)
+        
         logger.info("Fabric created from template_id %s", template_id)
-        return None
+        return (True, [])
     else:
-        logger.error("Error creating template %s: %s - %s", template_id, response.status_code, response.text)
-        return None
+        error_msg = f"Error creating template {template_id}: {response.status_code} - {response.text}"
+        logger.error(error_msg)
+        return (False, [error_msg])
 
 
 def install_fabric(fabric_host, access_token, template,version):
@@ -501,15 +582,17 @@ def install_fabric(fabric_host, access_token, template,version):
         response = requests.get(url_fabric_id, headers=headers, verify=False, timeout=30)
     except requests.RequestException as exc:
         logger.error("Error finding fabric by name: %s", exc)
-        return None
+        return (False, [f"Request error finding fabric: {str(exc)}"])
     if response.status_code != 200:
-        logger.error("Error finding fabric by name: %s - %s", response.status_code, response.text)
-        return None
+        error_msg = f"Error finding fabric by name: {response.status_code} - {response.text}"
+        logger.error(error_msg)
+        return (False, [error_msg])
     try:
         data = response.json()
     except ValueError:
-        logger.error("Error parsing fabric list response as JSON")
-        return None
+        error_msg = "Error parsing fabric list response as JSON"
+        logger.error(error_msg)
+        return (False, [error_msg])
     objects = data.get('object', [])
     fabric_id = next((item.get('id') for item in objects if item.get('version') == version), None)
     if fabric_id:
@@ -519,17 +602,34 @@ def install_fabric(fabric_host, access_token, template,version):
             response = requests.post(url_install, headers=headers, verify=False, timeout=30)
         except requests.RequestException as exc:
             logger.error("Error installing Fabric %s: %s", fabric_id, exc)
-            return None
+            return (False, [f"Request error installing fabric: {str(exc)}"])
         if response.status_code == 200:
-            check_tasks(fabric_host, access_token)
+            result = check_tasks(fabric_host, access_token)
+            if result is None:
+                logger.error("Error checking tasks after installation")
+                return (False, ["Error checking task status after installation"])
+            elapsed_time, success = result if isinstance(result, tuple) else (result, True)
+            if not success:
+                logger.error("Timed out waiting for tasks to finish after installation")
+                return (False, ["Timed out waiting for tasks to finish after 15 minutes"])
+            
+            # Check for task errors after tasks complete
+            task_errors = get_recent_task_errors(fabric_host, access_token, limit=20)
+            if task_errors:
+                error_messages = [f"Task '{err['task_name']}': {err['error']}" for err in task_errors]
+                logger.warning("Found %d task errors after fabric installation", len(task_errors))
+                return (False, error_messages)
+            
             logger.info("Fabric %s installed successfully", fabric_id)
-            return None
+            return (True, [])
         else:
-            logger.error("Error installing Fabric %s: %s - %s", fabric_id, response.status_code, response.text)
-            return None
+            error_msg = f"Error installing Fabric {fabric_id}: {response.status_code} - {response.text}"
+            logger.error(error_msg)
+            return (False, [error_msg])
     else:
-        logger.info("No valid fabric_id found for installation. Version mismatch or fabric missing")
-        return None
+        error_msg = "No valid fabric_id found for installation. Version mismatch or fabric missing"
+        logger.info(error_msg)
+        return (False, [error_msg])
 
 
 

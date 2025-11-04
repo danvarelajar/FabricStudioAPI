@@ -1,8 +1,9 @@
-from fastapi import FastAPI, HTTPException, BackgroundTasks
-from fastapi.responses import FileResponse
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Request, Header
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.types import ASGIApp
 from fastapi.middleware.cors import CORSMiddleware
+from typing import Optional
 from pydantic import BaseModel
 import sqlite3
 import json
@@ -17,6 +18,8 @@ from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 from cryptography.hazmat.backends import default_backend
 import base64
 import os
+import secrets
+import hashlib
 
 # Configure logging
 logging.basicConfig(
@@ -31,6 +34,7 @@ from fabricstudio.fabricstudio_api import (
     query_hostname, change_hostname, get_userId, change_password,
     reset_fabric, batch_delete, refresh_repositories,
     get_template, create_fabric, install_fabric, check_tasks, get_running_task_count,
+    get_recent_task_errors,
     list_all_templates, list_templates_for_repo, get_repositoryId, list_repositories
 )
 import sqlite3
@@ -43,6 +47,66 @@ import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = FastAPI()
+
+# Helper function to extract access_token from Authorization header or session
+def get_access_token_from_request(request: Request, fabric_host: str = None) -> Optional[str]:
+    """
+    Extract access_token from session (preferred) or Authorization header (fallback).
+    Returns the token string or None if not found.
+    """
+    # First try session (if fabric_host provided)
+    if fabric_host:
+        session = get_session_from_request(request)
+        if session:
+            session_key = get_session_key_temp(session['session_id'])
+            if session_key:
+                try:
+                    tokens = decrypt_tokens_from_session(session['tokens_encrypted'], session_key)
+                    token_info = tokens.get(fabric_host)
+                    
+                    if token_info:
+                        # Check if token expired or expiring soon - refresh if needed
+                        needs_refresh = False
+                        if not is_token_valid(token_info):
+                            # Token expired - try to refresh
+                            logger.info(f"Token expired for {fabric_host}, attempting refresh...")
+                            needs_refresh = True
+                        elif is_token_expiring_soon(token_info, minutes=1):
+                            # Token expiring soon - refresh proactively
+                            logger.info(f"Token expiring soon for {fabric_host}, refreshing proactively...")
+                            needs_refresh = True
+                        
+                        if needs_refresh:
+                            if refresh_token_for_host(session['session_id'], fabric_host):
+                                # Re-read session to get updated tokens
+                                updated_session = get_session(session['session_id'])
+                                if updated_session:
+                                    tokens = decrypt_tokens_from_session(updated_session['tokens_encrypted'], session_key)
+                                    token_info = tokens.get(fabric_host)
+                                    if token_info and is_token_valid(token_info):
+                                        update_session_activity(session['session_id'])
+                                        return token_info.get('token')
+                                    else:
+                                        logger.error(f"Token refresh failed for {fabric_host} - refreshed token still invalid")
+                                        return None
+                                else:
+                                    logger.error(f"Failed to retrieve updated session after refresh")
+                                    return None
+                            else:
+                                logger.error(f"Failed to refresh token for {fabric_host}")
+                                return None
+                        
+                        update_session_activity(session['session_id'])
+                        return token_info.get('token')
+                except Exception as e:
+                    logger.error(f"Error getting token from session: {e}")
+    
+    # Fallback to Authorization header (backward compatibility)
+    auth_header = request.headers.get("Authorization", "")
+    if auth_header.startswith("Bearer "):
+        return auth_header.replace("Bearer ", "", 1).strip()
+    
+    return None
 
 # Database setup - use environment variable or default to current directory
 DB_PATH = os.environ.get("DB_PATH", "fabricstudio_ui.db")
@@ -240,6 +304,23 @@ def init_db():
             FOREIGN KEY (event_id) REFERENCES event_schedules(id) ON DELETE CASCADE
         )
     ''')
+    
+    # Create sessions table for session-based token management
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS sessions (
+            session_id TEXT PRIMARY KEY,
+            nhi_credential_id INTEGER NOT NULL,
+            tokens_encrypted TEXT NOT NULL,
+            session_key_hash TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            last_used TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            expires_at TIMESTAMP NOT NULL,
+            FOREIGN KEY (nhi_credential_id) REFERENCES nhi_credentials(id) ON DELETE CASCADE
+        )
+    ''')
+    c.execute('CREATE INDEX IF NOT EXISTS idx_sessions_expires_at ON sessions(expires_at)')
+    c.execute('CREATE INDEX IF NOT EXISTS idx_sessions_nhi_credential_id ON sessions(nhi_credential_id)')
+    
     conn.commit()
     conn.close()
 
@@ -297,6 +378,298 @@ def decrypt_with_server_secret(ciphertext_b64: str) -> str:
     enc_bytes = base64.urlsafe_b64decode(ciphertext_b64.encode())
     dec = f.decrypt(enc_bytes)
     return dec.decode()
+
+# Session Management Functions
+def generate_session_id() -> str:
+    """Generate a secure random session ID"""
+    return secrets.token_urlsafe(32)
+
+def derive_session_key(encryption_password: str, session_id: str) -> bytes:
+    """Derive encryption key for session from password and session ID"""
+    kdf = PBKDF2HMAC(
+        algorithm=hashes.SHA256(),
+        length=32,
+        salt=session_id.encode(),
+        iterations=100000,
+        backend=default_backend()
+    )
+    return base64.urlsafe_b64encode(kdf.derive(encryption_password.encode()))
+
+def hash_session_key(session_key: bytes) -> str:
+    """Hash session key for storage (one-way hash)"""
+    return hashlib.sha256(session_key).hexdigest()
+
+def encrypt_tokens_for_session(tokens: dict, session_key: bytes) -> str:
+    """Encrypt tokens dictionary for storage in session"""
+    tokens_json = json.dumps(tokens)
+    fernet = Fernet(session_key)
+    encrypted = fernet.encrypt(tokens_json.encode())
+    return base64.urlsafe_b64encode(encrypted).decode()
+
+def decrypt_tokens_from_session(encrypted_tokens: str, session_key: bytes) -> dict:
+    """Decrypt tokens dictionary from session storage"""
+    try:
+        encrypted_bytes = base64.urlsafe_b64decode(encrypted_tokens.encode())
+        fernet = Fernet(session_key)
+        decrypted = fernet.decrypt(encrypted_bytes)
+        return json.loads(decrypted.decode())
+    except Exception as e:
+        logger.error(f"Error decrypting session tokens: {e}")
+        raise ValueError(f"Failed to decrypt session tokens: {e}")
+
+def create_token_info(token_data: dict) -> dict:
+    """Create token info dictionary with expiration times"""
+    expires_at = datetime.now() + timedelta(seconds=token_data.get('expires_in', 3600))
+    refresh_at = expires_at - timedelta(minutes=5)  # Refresh 5 minutes before expiration
+    
+    return {
+        "token": token_data.get('access_token'),
+        "expires_at": expires_at.isoformat(),
+        "refresh_at": refresh_at.isoformat(),
+        "created_at": datetime.now().isoformat()
+    }
+
+def is_token_valid(token_info: dict) -> bool:
+    """Check if token is still valid"""
+    if not token_info:
+        return False
+    try:
+        expires_at = datetime.fromisoformat(token_info.get('expires_at', ''))
+        return datetime.now() < expires_at
+    except:
+        return False
+
+def is_token_expiring_soon(token_info: dict, minutes: int = 5) -> bool:
+    """Check if token should be refreshed soon"""
+    if not token_info:
+        return False
+    try:
+        refresh_at = datetime.fromisoformat(token_info.get('refresh_at', ''))
+        return datetime.now() >= refresh_at
+    except:
+        return False
+
+def refresh_token_for_host(session_id: str, fabric_host: str) -> bool:
+    """Refresh an expired or expiring token for a specific host"""
+    try:
+        session = get_session(session_id)
+        if not session:
+            logger.warning(f"Session {session_id} not found for token refresh")
+            return False
+        
+        session_key = get_session_key_temp(session_id)
+        if not session_key:
+            logger.warning(f"Session key not found for session {session_id}")
+            return False
+        
+        # Decrypt tokens to get credentials
+        tokens = decrypt_tokens_from_session(session['tokens_encrypted'], session_key)
+        credentials = tokens.get('_credentials')
+        
+        if not credentials:
+            logger.warning(f"No credentials stored in session {session_id} for token refresh")
+            return False
+        
+        client_id = credentials.get('client_id')
+        client_secret = credentials.get('client_secret')
+        
+        if not client_id or not client_secret:
+            logger.warning(f"Missing client_id or client_secret in session {session_id}")
+            return False
+        
+        # Get new token from FabricStudio API
+        token_data = get_access_token(client_id, client_secret, fabric_host)
+        if not token_data or not isinstance(token_data, dict) or not token_data.get("access_token"):
+            logger.error(f"Failed to get new token for {fabric_host} in session {session_id}")
+            return False
+        
+        # Update token in session
+        tokens[fabric_host] = create_token_info(token_data)
+        
+        # Re-encrypt and save
+        tokens_encrypted = encrypt_tokens_for_session(tokens, session_key)
+        
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        try:
+            c.execute('''
+                UPDATE sessions 
+                SET tokens_encrypted = ?, last_used = CURRENT_TIMESTAMP
+                WHERE session_id = ?
+            ''', (tokens_encrypted, session_id))
+            conn.commit()
+            logger.info(f"Successfully refreshed token for {fabric_host} in session {session_id}")
+            return True
+        finally:
+            conn.close()
+            
+    except Exception as e:
+        logger.error(f"Error refreshing token for {fabric_host} in session {session_id}: {e}", exc_info=True)
+        return False
+
+def calculate_expires_in(expires_at_str: str) -> int:
+    """Calculate expires_in seconds from expires_at ISO string"""
+    try:
+        expires_at = datetime.fromisoformat(expires_at_str)
+        delta = expires_at - datetime.now()
+        return max(0, int(delta.total_seconds()))
+    except:
+        return 3600  # Default 1 hour
+
+def create_session(nhi_credential_id: int, encryption_password: str, tokens_by_host: dict = None, client_id: str = None, client_secret: str = None) -> tuple:
+    """Create a new session and return (session_id, session_key, expires_at)"""
+    session_id = generate_session_id()
+    session_key = derive_session_key(encryption_password, session_id)
+    session_key_hash = hash_session_key(session_key)
+    
+    # Encrypt tokens if provided
+    tokens_to_store = {}
+    if tokens_by_host:
+        for host, token_info in tokens_by_host.items():
+            if isinstance(token_info, dict) and token_info.get('token'):
+                expires_in = calculate_expires_in(token_info.get('expires_at', '')) if token_info.get('expires_at') else 3600
+                tokens_to_store[host] = create_token_info({
+                    'access_token': token_info['token'],
+                    'expires_in': expires_in
+                })
+    
+    # Store client credentials for token refresh (encrypted with session_key)
+    if client_id and client_secret:
+        tokens_to_store['_credentials'] = {
+            'client_id': client_id,
+            'client_secret': client_secret  # Will be encrypted when stored
+        }
+    
+    tokens_encrypted = encrypt_tokens_for_session(tokens_to_store, session_key)
+    
+    # Session expires after 1 hour of inactivity
+    expires_at = datetime.now() + timedelta(hours=1)
+    
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    try:
+        c.execute('''
+            INSERT INTO sessions 
+            (session_id, nhi_credential_id, tokens_encrypted, session_key_hash, expires_at)
+            VALUES (?, ?, ?, ?, ?)
+        ''', (session_id, nhi_credential_id, tokens_encrypted, session_key_hash, expires_at.isoformat()))
+        conn.commit()
+    finally:
+        conn.close()
+    
+    # Store session key temporarily (in production, use better approach)
+    store_session_key_temp(session_id, session_key)
+    
+    return session_id, session_key, expires_at
+
+def get_session(session_id: str) -> Optional[dict]:
+    """Get session data from database"""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    try:
+        c.execute('''
+            SELECT session_id, nhi_credential_id, tokens_encrypted, session_key_hash, 
+                   created_at, last_used, expires_at
+            FROM sessions
+            WHERE session_id = ?
+        ''', (session_id,))
+        row = c.fetchone()
+        if not row:
+            return None
+        
+        expires_at = datetime.fromisoformat(row[6])
+        if datetime.now() >= expires_at:
+            # Session expired, delete it
+            delete_session(session_id)
+            return None
+        
+        return {
+            "session_id": row[0],
+            "nhi_credential_id": row[1],
+            "tokens_encrypted": row[2],
+            "session_key_hash": row[3],
+            "created_at": row[4],
+            "last_used": row[5],
+            "expires_at": row[6]
+        }
+    finally:
+        conn.close()
+
+def update_session_activity(session_id: str):
+    """Update last_used timestamp for session"""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    try:
+        c.execute('''
+            UPDATE sessions 
+            SET last_used = CURRENT_TIMESTAMP
+            WHERE session_id = ?
+        ''', (session_id,))
+        conn.commit()
+    finally:
+        conn.close()
+
+def update_session_tokens(session_id: str, tokens_encrypted: str):
+    """Update tokens in session"""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    try:
+        c.execute('''
+            UPDATE sessions 
+            SET tokens_encrypted = ?, last_used = CURRENT_TIMESTAMP
+            WHERE session_id = ?
+        ''', (tokens_encrypted, session_id))
+        conn.commit()
+    finally:
+        conn.close()
+
+def refresh_session(session_id: str) -> Optional[datetime]:
+    """Refresh session expiration time"""
+    expires_at = datetime.now() + timedelta(hours=1)
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    try:
+        c.execute('''
+            UPDATE sessions 
+            SET expires_at = ?, last_used = CURRENT_TIMESTAMP
+            WHERE session_id = ?
+        ''', (expires_at.isoformat(), session_id))
+        conn.commit()
+        return expires_at
+    finally:
+        conn.close()
+
+def delete_session(session_id: str):
+    """Delete session from database"""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    try:
+        c.execute('DELETE FROM sessions WHERE session_id = ?', (session_id,))
+        conn.commit()
+        # Remove from temp storage
+        if session_id in _session_keys:
+            del _session_keys[session_id]
+    finally:
+        conn.close()
+
+def get_session_from_request(request: Request) -> Optional[dict]:
+    """Get session from request cookie"""
+    session_id = request.cookies.get("fabricstudio_session")
+    if not session_id:
+        return None
+    return get_session(session_id)
+
+# Store session keys temporarily in memory (will be replaced with better approach)
+# In production, consider using Redis or storing encrypted session key
+_session_keys: dict[str, bytes] = {}
+
+def store_session_key_temp(session_id: str, session_key: bytes):
+    """Temporarily store session key in memory (for testing)"""
+    _session_keys[session_id] = session_key
+
+def get_session_key_temp(session_id: str) -> Optional[bytes]:
+    """Get temporarily stored session key"""
+    return _session_keys.get(session_id)
 
 # Initialize database on startup
 init_db()
@@ -389,13 +762,11 @@ class TokenReq(BaseModel):
 
 class HostnameReq(BaseModel):
     fabric_host: str
-    access_token: str
     hostname: str
 
 
 class UserPassReq(BaseModel):
     fabric_host: str
-    access_token: str
     username: str
     new_password: str
 
@@ -410,7 +781,6 @@ class TemplateReq(BaseModel):
 
 class CreateFabricReq(BaseModel):
     fabric_host: str
-    access_token: str
     template_id: int
     template_name: str
     version: str
@@ -418,7 +788,6 @@ class CreateFabricReq(BaseModel):
 
 class InstallFabricReq(BaseModel):
     fabric_host: str
-    access_token: str
     template_name: str
     version: str
 
@@ -435,82 +804,149 @@ def auth_token(req: TokenReq):
 
 
 @app.get("/system/hostname")
-def get_hostname(fabric_host: str, access_token: str):
-    value = query_hostname(fabric_host, access_token)
+def get_hostname(request: Request, fabric_host: str):
+    token = get_access_token_from_request(request, fabric_host)
+    if not token:
+        raise HTTPException(401, "Missing access_token in session or Authorization header")
+    value = query_hostname(fabric_host, token)
     if value is None:
         raise HTTPException(400, "Failed to query hostname")
     return {"hostname": value}
 
 
 @app.post("/system/hostname")
-def set_hostname(req: HostnameReq):
-    change_hostname(req.fabric_host, req.access_token, req.hostname)
+def set_hostname(request: Request, req: HostnameReq):
+    token = get_access_token_from_request(request, req.fabric_host)
+    if not token:
+        raise HTTPException(401, "Missing access_token in session or Authorization header")
+    change_hostname(req.fabric_host, token, req.hostname)
     return {"status": "ok"}
 
 
 @app.post("/user/password")
-def set_password(req: UserPassReq):
-    user_id = get_userId(req.fabric_host, req.access_token, req.username)
+def set_password(request: Request, req: UserPassReq):
+    token = get_access_token_from_request(request, req.fabric_host)
+    if not token:
+        raise HTTPException(401, "Missing access_token in session or Authorization header")
+    user_id = get_userId(req.fabric_host, token, req.username)
     if not user_id:
         raise HTTPException(404, "User not found")
-    change_password(req.fabric_host, req.access_token, user_id, req.new_password)
+    change_password(req.fabric_host, token, user_id, req.new_password)
     return {"status": "ok"}
 
 
 @app.post("/runtime/reset")
-def runtime_reset(fabric_host: str, access_token: str):
-    reset_fabric(fabric_host, access_token)
+def runtime_reset(request: Request, fabric_host: str):
+    token = get_access_token_from_request(request, fabric_host)
+    if not token:
+        raise HTTPException(401, "Missing access_token in session or Authorization header")
+    reset_fabric(fabric_host, token)
     return {"status": "ok"}
 
 
 @app.delete("/model/fabric/batch")
-def model_batch_delete(fabric_host: str, access_token: str):
-    batch_delete(fabric_host, access_token)
+def model_batch_delete(request: Request, fabric_host: str):
+    token = get_access_token_from_request(request, fabric_host)
+    if not token:
+        raise HTTPException(401, "Missing access_token in session or Authorization header")
+    batch_delete(fabric_host, token)
     return {"status": "ok"}
 
 
 @app.post("/repo/refresh")
-def repo_refresh(fabric_host: str, access_token: str):
-    refresh_repositories(fabric_host, access_token)
+def repo_refresh(request: Request, fabric_host: str):
+    token = get_access_token_from_request(request, fabric_host)
+    if not token:
+        raise HTTPException(401, "Missing access_token in session or Authorization header")
+    refresh_repositories(fabric_host, token)
     return {"status": "ok"}
 
 
 @app.get("/repo/template")
-def repo_template(fabric_host: str, access_token: str, template_name: str, repo_name: str, version: str):
-    tid = get_template(fabric_host, access_token, template_name, repo_name, version)
+def repo_template(request: Request, fabric_host: str, template_name: str, repo_name: str, version: str):
+    token = get_access_token_from_request(request, fabric_host)
+    if not token:
+        raise HTTPException(401, "Missing access_token in session or Authorization header")
+    tid = get_template(fabric_host, token, template_name, repo_name, version)
     if tid is None:
         raise HTTPException(404, "Template not found")
     return {"template_id": tid}
 
 
 @app.post("/model/fabric")
-def model_fabric_create(req: CreateFabricReq):
-    result = create_fabric(req.fabric_host, req.access_token, req.template_id, req.template_name, req.version)
-    if result is None:
-        # create_fabric returns None on error, but doesn't raise - check logs for details
-        # We'll still return 200 but log the error - the frontend checks tasks status
-        return {"status": "ok", "message": "Fabric creation request submitted"}
-    return {"status": "ok"}
+def model_fabric_create(request: Request, req: CreateFabricReq):
+    token = get_access_token_from_request(request, req.fabric_host)
+    if not token:
+        raise HTTPException(401, "Missing access_token in session or Authorization header")
+    result = create_fabric(req.fabric_host, token, req.template_id, req.template_name, req.version)
+    if isinstance(result, tuple):
+        success, errors = result
+    else:
+        # Backward compatibility with old return format
+        success = result
+        errors = []
+    
+    if not success:
+        error_msg = "Failed to create fabric"
+        if errors:
+            error_msg += ": " + "; ".join(errors)
+        else:
+            error_msg += ": creation timed out or encountered an error"
+        raise HTTPException(500, error_msg)
+    return {"status": "ok", "message": "Fabric created successfully"}
 
 
 @app.post("/runtime/fabric/install")
-def model_fabric_install(req: InstallFabricReq):
-    install_fabric(req.fabric_host, req.access_token, req.template_name, req.version)
-    return {"status": "ok"}
+def model_fabric_install(request: Request, req: InstallFabricReq):
+    token = get_access_token_from_request(request, req.fabric_host)
+    if not token:
+        raise HTTPException(401, "Missing access_token in session or Authorization header")
+    result = install_fabric(req.fabric_host, token, req.template_name, req.version)
+    if isinstance(result, tuple):
+        success, errors = result
+    else:
+        # Backward compatibility with old return format
+        success = result
+        errors = []
+    
+    if not success:
+        error_msg = "Failed to install fabric"
+        if errors:
+            error_msg += ": " + "; ".join(errors)
+        else:
+            error_msg += ": installation timed out or encountered an error"
+        raise HTTPException(500, error_msg)
+    return {"status": "ok", "message": "Fabric installed successfully"}
 
 
 @app.get("/tasks/progress")
-def tasks_progress(fabric_host: str, access_token: str):
-    mins = check_tasks(fabric_host, access_token, display_progress=False)
+def tasks_progress(request: Request, fabric_host: str):
+    token = get_access_token_from_request(request, fabric_host)
+    if not token:
+        raise HTTPException(401, "Missing access_token in session or Authorization header")
+    mins = check_tasks(fabric_host, token, display_progress=False)
     return {"elapsed_minutes": mins}
 
 
 @app.get("/tasks/status")
-def tasks_status(fabric_host: str, access_token: str):
-    count = get_running_task_count(fabric_host, access_token)
+def tasks_status(request: Request, fabric_host: str):
+    token = get_access_token_from_request(request, fabric_host)
+    if not token:
+        raise HTTPException(401, "Missing access_token in session or Authorization header")
+    count = get_running_task_count(fabric_host, token)
     if count is None:
         raise HTTPException(400, "Failed to get task status")
     return {"running_count": count}
+
+
+@app.get("/tasks/errors")
+def tasks_errors(request: Request, fabric_host: str, limit: int = 20):
+    """Get recent task errors from the FabricStudio host"""
+    token = get_access_token_from_request(request, fabric_host)
+    if not token:
+        raise HTTPException(401, "Missing access_token in session or Authorization header")
+    errors = get_recent_task_errors(fabric_host, token, limit=limit)
+    return {"errors": errors, "count": len(errors)}
 
 
 def _init_db():
@@ -541,17 +977,20 @@ def _init_db():
 
 
 @app.post("/preparation/confirm")
-def preparation_confirm(fabric_host: str, access_token: str):
+def preparation_confirm(request: Request, fabric_host: str):
+    token = get_access_token_from_request(request, fabric_host)
+    if not token:
+        raise HTTPException(401, "Missing access_token in session or Authorization header")
     # 1) refresh repos (async on host)
-    refresh_repositories(fabric_host, access_token)
+    refresh_repositories(fabric_host, token)
     # Wait for background repo refresh tasks to complete to ensure templates are up to date
     try:
-        check_tasks(fabric_host, access_token, display_progress=False)
+        check_tasks(fabric_host, token, display_progress=False)
     except Exception:
         # Best-effort wait; continue even if polling fails
         pass
     # 2) fetch all templates across repos
-    templates = list_all_templates(fabric_host, access_token)
+    templates = list_all_templates(fabric_host, token)
     # 3) store/refresh cache
     conn = _init_db()
     cur = conn.cursor()
@@ -619,11 +1058,14 @@ def cache_templates_post(req: CacheTemplatesReq):
 
 
 @app.get("/repo/templates/list")
-def repo_templates_list(fabric_host: str, access_token: str, repo_name: str):
-    repo_id = get_repositoryId(fabric_host, access_token, repo_name)
+def repo_templates_list(request: Request, fabric_host: str, repo_name: str):
+    token = get_access_token_from_request(request, fabric_host)
+    if not token:
+        raise HTTPException(401, "Missing access_token in session or Authorization header")
+    repo_id = get_repositoryId(fabric_host, token, repo_name)
     if not repo_id:
         # Fallback: list repos and try case-insensitive/alt-field match
-        repos = list_repositories(fabric_host, access_token)
+        repos = list_repositories(fabric_host, token)
         target = None
         for r in repos:
             name = (r.get("name") or "").strip()
@@ -635,7 +1077,7 @@ def repo_templates_list(fabric_host: str, access_token: str, repo_name: str):
             repo_id = target.get("id")
         if not repo_id:
             raise HTTPException(404, "Repository not found")
-    templates = list_templates_for_repo(fabric_host, access_token, repo_id)
+    templates = list_templates_for_repo(fabric_host, token, repo_id)
     # Normalize response to include name, version, id
     out = [
         {"id": t.get("id"), "name": t.get("name"), "version": t.get("version")}
@@ -645,8 +1087,11 @@ def repo_templates_list(fabric_host: str, access_token: str, repo_name: str):
 
 
 @app.get("/repo/remotes")
-def repo_remotes(fabric_host: str, access_token: str):
-    repos = list_repositories(fabric_host, access_token)
+def repo_remotes(request: Request, fabric_host: str):
+    token = get_access_token_from_request(request, fabric_host)
+    if not token:
+        raise HTTPException(401, "Missing access_token in session or Authorization header")
+    repos = list_repositories(fabric_host, token)
     out = [
         {"id": r.get("id"), "name": r.get("name")}
         for r in repos
@@ -656,10 +1101,13 @@ def repo_remotes(fabric_host: str, access_token: str):
 
 # Compatibility endpoint used by preparation flow to resolve a single template_id
 @app.get("/repo/template")
-def repo_template_single(fabric_host: str, access_token: str, template_name: str, repo_name: str, version: str):
+def repo_template_single(request: Request, fabric_host: str, template_name: str, repo_name: str, version: str):
+    token = get_access_token_from_request(request, fabric_host)
+    if not token:
+        raise HTTPException(401, "Missing access_token in session or Authorization header")
     logger.info("/repo/template called with host=%s repo=%s template=%s version=%s", fabric_host, repo_name, template_name, version)
     # Strict: resolve repository by name/code (case-insensitive), but DO NOT search other repos for the template
-    repos = list_repositories(fabric_host, access_token)
+    repos = list_repositories(fabric_host, token)
     logger.info("Fetched %d repositories from host %s", len(repos), fabric_host)
     repo_input = (repo_name or "").strip()
     match = None
@@ -675,7 +1123,7 @@ def repo_template_single(fabric_host: str, access_token: str, template_name: str
 
     rid = match.get("id")
     logger.info("Matched repository id=%s name=%s", rid, match.get("name"))
-    templates = list_templates_for_repo(fabric_host, access_token, rid)
+    templates = list_templates_for_repo(fabric_host, token, rid)
     logger.info("Retrieved %d templates from repo id=%s", len(templates), rid)
     tname_norm = (template_name or "").strip().lower()
     ver_norm = (version or "").strip()
@@ -692,10 +1140,13 @@ def repo_template_single(fabric_host: str, access_token: str, template_name: str
 
 # New lightweight proxy endpoints for repository/template metadata
 @app.get("/repo/remotes")
-def repo_remotes(fabric_host: str, access_token: str):
+def repo_remotes_proxy(request: Request, fabric_host: str):
+    token = get_access_token_from_request(request, fabric_host)
+    if not token:
+        raise HTTPException(401, "Missing access_token in session or Authorization header")
     url = f"https://{fabric_host}/api/v1/system/repository/remote"
     headers = {
-        "Authorization": f"Bearer {access_token}",
+        "Authorization": f"Bearer {token}",
         "Cache-Control": "no-cache",
     }
     try:
@@ -714,10 +1165,13 @@ def repo_remotes(fabric_host: str, access_token: str):
 
 
 @app.get("/repo/templates/list")
-def repo_templates_list(fabric_host: str, access_token: str, repo_name: str):
+def repo_templates_list(request: Request, fabric_host: str, repo_name: str):
+    token = get_access_token_from_request(request, fabric_host)
+    if not token:
+        raise HTTPException(401, "Missing access_token in session or Authorization header")
     # Resolve repo id first
     url_repo = f"https://{fabric_host}/api/v1/system/repository/remote"
-    headers = {"Authorization": f"Bearer {access_token}", "Cache-Control": "no-cache"}
+    headers = {"Authorization": f"Bearer {token}", "Cache-Control": "no-cache"}
     try:
         r = requests.get(url_repo, headers=headers, verify=False, timeout=30)
     except requests.RequestException as exc:
@@ -753,11 +1207,30 @@ def repo_templates_list(fabric_host: str, access_token: str, repo_name: str):
 
 
 @app.get("/repo/versions")
-def repo_versions(fabric_host: str, access_token: str, repo_name: str, template_name: str):
-    # Reuse templates/list and filter versions
-    data = repo_templates_list(fabric_host, access_token, repo_name)
-    versions = sorted({o["version"] for o in data.get("templates", []) if o.get("name") == template_name and o.get("version") is not None})
-    return {"versions": versions}
+def repo_versions(request: Request, fabric_host: str, repo_name: str, template_name: str):
+    token = get_access_token_from_request(request, fabric_host)
+    if not token:
+        raise HTTPException(401, "Missing access_token in session or Authorization header")
+    # Reuse templates/list and filter versions - need to call with request and token
+    # Create a temporary request-like object or call the function directly
+    # For now, call the underlying function directly
+    repo_id = get_repositoryId(fabric_host, token, repo_name)
+    if not repo_id:
+        repos = list_repositories(fabric_host, token)
+        target = None
+        for r in repos:
+            name = (r.get("name") or "").strip()
+            code = (r.get("code") or "").strip()
+            if name.lower() == repo_name.strip().lower() or code.lower() == repo_name.strip().lower():
+                target = r
+                break
+        if target:
+            repo_id = target.get("id")
+        if not repo_id:
+            raise HTTPException(404, "Repository not found")
+    templates = list_templates_for_repo(fabric_host, token, repo_id)
+    versions = sorted({t.get("version") for t in templates if t.get("name") == template_name and t.get("version")})
+    return {"versions": list(versions)}
 
 
 # Template caching endpoints
@@ -1612,8 +2085,24 @@ def run_configuration(config_data: dict, event_name: str, event_id: Optional[int
                         template_id = get_template(host, host_tokens[host], template_name, repo_name, version)
                         if template_id:
                             # Create fabric (pass template name and version per API signature)
-                            create_fabric(host, host_tokens[host], template_id, template_name, version)
-                            logger.info(f"Event '{event_name}': Template '{template_name}' v{version} created on host {host}")
+                            result = create_fabric(host, host_tokens[host], template_id, template_name, version)
+                            if isinstance(result, tuple):
+                                success, task_errors = result
+                            else:
+                                success = result
+                                task_errors = []
+                            
+                            if success:
+                                logger.info(f"Event '{event_name}': Template '{template_name}' v{version} created on host {host}")
+                            else:
+                                if task_errors:
+                                    msg = f"Failed to create template '{template_name}' v{version} on host {host}: " + "; ".join(task_errors)
+                                else:
+                                    msg = f"Failed to create template '{template_name}' v{version} on host {host}: creation timed out or encountered an error"
+                                logger.error(f"Event '{event_name}': {msg}")
+                                errors.append(msg)
+                                if task_errors:
+                                    errors.extend(task_errors)
                         else:
                             msg = f"Template '{template_name}' v{version} not found on host {host}"
                             logger.error(f"Event '{event_name}': {msg}")
@@ -1626,7 +2115,13 @@ def run_configuration(config_data: dict, event_name: str, event_id: Optional[int
                 # Wait for tasks to complete after each template
                 for host in host_tokens.keys():
                     try:
-                        check_tasks(host, host_tokens[host], display_progress=False)
+                        result = check_tasks(host, host_tokens[host], display_progress=False)
+                        if result is not None:
+                            elapsed_time, success = result if isinstance(result, tuple) else (result, True)
+                            if not success:
+                                msg = f"Timed out waiting for tasks on host {host} after template creation"
+                                logger.warning(f"Event '{event_name}': {msg}")
+                                errors.append(msg)
                     except Exception as e:
                         msg = f"Error waiting for tasks on host {host}: {e}"
                         logger.warning(f"Event '{event_name}': {msg}")
@@ -1649,8 +2144,24 @@ def run_configuration(config_data: dict, event_name: str, event_id: Optional[int
                         template_id = get_template(host, host_tokens[host], template_name, repo_name, version)
                         if template_id:
                             # install_fabric expects template name and version, not id
-                            install_fabric(host, host_tokens[host], template_name, version)
-                            logger.info(f"Event '{event_name}': Workspace '{template_name}' v{version} installed on host {host}")
+                            result = install_fabric(host, host_tokens[host], template_name, version)
+                            if isinstance(result, tuple):
+                                success, task_errors = result
+                            else:
+                                success = result
+                                task_errors = []
+                            
+                            if success:
+                                logger.info(f"Event '{event_name}': Workspace '{template_name}' v{version} installed on host {host}")
+                            else:
+                                if task_errors:
+                                    msg = f"Failed to install workspace '{template_name}' v{version} on host {host}: " + "; ".join(task_errors)
+                                else:
+                                    msg = f"Failed to install workspace '{template_name}' v{version} on host {host}: installation timed out or encountered an error"
+                                logger.error(f"Event '{event_name}': {msg}")
+                                errors.append(msg)
+                                if task_errors:
+                                    errors.extend(task_errors)
                         else:
                             msg = f"Template '{template_name}' v{version} not found on host {host} for installation"
                             logger.error(f"Event '{event_name}': {msg}")
@@ -1767,7 +2278,8 @@ def run_configuration(config_data: dict, event_name: str, event_id: Optional[int
 class SaveNhiReq(BaseModel):
     name: str
     client_id: str
-    client_secret: str
+    # For create this is required; for update it's optional and, if omitted, the existing secret is kept
+    client_secret: Optional[str] = None
     encryption_password: str
     fabric_hosts: str = None  # Optional space-separated list of fabric hosts for getting tokens
     id: int = None  # Optional ID for updating existing credential
@@ -1809,8 +2321,6 @@ def save_nhi(req: SaveNhiReq):
     
     if not req.client_id or not req.client_id.strip():
         raise HTTPException(400, "Client ID is required")
-    if not req.client_secret or not req.client_secret.strip():
-        raise HTTPException(400, "Client Secret is required")
     if not req.encryption_password or not req.encryption_password.strip():
         raise HTTPException(400, "Encryption password is required")
     
@@ -1818,8 +2328,14 @@ def save_nhi(req: SaveNhiReq):
     c = conn.cursor()
     
     try:
-        # Encrypt the client secret
-        encrypted_secret = encrypt_client_secret(req.client_secret, req.encryption_password)
+        # Determine operation mode (create vs update) and handle client secret accordingly
+        encrypted_secret = None
+        provided_client_secret = (req.client_secret or '').strip()
+        if req.id is None:
+            # Create requires a client secret
+            if not provided_client_secret:
+                raise HTTPException(400, "Client Secret is required for creating a new credential")
+            encrypted_secret = encrypt_client_secret(provided_client_secret, req.encryption_password)
         
         # Get tokens for all fabric_hosts if provided
         # Parse hosts (space-separated)
@@ -1829,7 +2345,7 @@ def save_nhi(req: SaveNhiReq):
         
         if req.id is not None:
             # Update existing credential
-            c.execute('SELECT id FROM nhi_credentials WHERE id = ?', (req.id,))
+            c.execute('SELECT id, client_secret_encrypted FROM nhi_credentials WHERE id = ?', (req.id,))
             existing = c.fetchone()
             
             if not existing:
@@ -1840,11 +2356,20 @@ def save_nhi(req: SaveNhiReq):
             if c.fetchone():
                 raise HTTPException(400, f"Name '{name_stripped}' is already in use")
             
-            c.execute('''
-                UPDATE nhi_credentials 
-                SET name = ?, client_id = ?, client_secret_encrypted = ?, updated_at = CURRENT_TIMESTAMP
-                WHERE id = ?
-            ''', (name_stripped, req.client_id.strip(), encrypted_secret, req.id))
+            # If a new client_secret is provided, update it; otherwise keep existing encrypted secret
+            if provided_client_secret:
+                encrypted_secret = encrypt_client_secret(provided_client_secret, req.encryption_password)
+                c.execute('''
+                    UPDATE nhi_credentials 
+                    SET name = ?, client_id = ?, client_secret_encrypted = ?, updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                ''', (name_stripped, req.client_id.strip(), encrypted_secret, req.id))
+            else:
+                c.execute('''
+                    UPDATE nhi_credentials 
+                    SET name = ?, client_id = ?, updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                ''', (name_stripped, req.client_id.strip(), req.id))
             action = "updated"
             nhi_id = req.id
             
@@ -1867,9 +2392,26 @@ def save_nhi(req: SaveNhiReq):
         tokens_stored = 0
         token_errors = []
         if nhi_id and hosts_to_process:
+            # Determine the client secret to use for token retrieval
+            client_secret_to_use = provided_client_secret
+            if not client_secret_to_use:
+                # Need to decrypt existing stored secret
+                # Fetch encrypted secret if not already available
+                if encrypted_secret is None:
+                    c.execute('SELECT client_secret_encrypted FROM nhi_credentials WHERE id = ?', (nhi_id,))
+                    row_secret = c.fetchone()
+                    if not row_secret:
+                        raise HTTPException(404, f"NHI credential with id {nhi_id} not found")
+                    encrypted_secret_db = row_secret[0]
+                else:
+                    encrypted_secret_db = encrypted_secret
+                try:
+                    client_secret_to_use = decrypt_client_secret(encrypted_secret_db, req.encryption_password)
+                except ValueError as e:
+                    raise HTTPException(400, str(e))
             for fabric_host in hosts_to_process:
                 try:
-                    token_data = get_access_token(req.client_id.strip(), req.client_secret.strip(), fabric_host)
+                    token_data = get_access_token(req.client_id.strip(), client_secret_to_use, fabric_host)
                     if token_data and isinstance(token_data, dict) and token_data.get("access_token"):
                         # Encrypt the token using the same encryption password
                         token_encrypted = encrypt_client_secret(token_data.get("access_token"), req.encryption_password)
@@ -2004,7 +2546,7 @@ def list_nhi():
 
 @app.post("/nhi/get/{nhi_id}")
 def get_nhi(nhi_id: int, req: GetNhiReq):
-    """Retrieve an NHI credential by ID and decrypt the secret"""
+    """Retrieve an NHI credential by ID without returning the client secret"""
     encryption_password = req.encryption_password
     if not encryption_password or not encryption_password.strip():
         raise HTTPException(400, "Encryption password is required")
@@ -2023,11 +2565,14 @@ def get_nhi(nhi_id: int, req: GetNhiReq):
         if not row:
             raise HTTPException(404, f"NHI credential with id {nhi_id} not found")
         
-        # Decrypt the client secret
+        # Decrypt client_secret for storing in session (needed for token refresh)
+        # We don't return it to the frontend, but store it encrypted in the session
         try:
-            decrypted_secret = decrypt_client_secret(row[2], encryption_password)
+            decrypted_client_secret = decrypt_client_secret(row[2], encryption_password)
         except ValueError as e:
             raise HTTPException(400, str(e))
+        
+        client_id = row[1]
         
         # Get all tokens for this credential (decrypted)
         c.execute('''
@@ -2064,13 +2609,32 @@ def get_nhi(nhi_id: int, req: GetNhiReq):
             "id": nhi_id,
             "name": row[0],
             "client_id": row[1],
-            "client_secret": decrypted_secret,
             "tokens_by_host": tokens_by_host,
             "created_at": row[3],
             "updated_at": row[4]
         }
         
-        return result
+        # Create session with tokens and credentials (for automatic token refresh)
+        session_id, session_key, expires_at = create_session(
+            nhi_id, 
+            encryption_password, 
+            tokens_by_host,
+            client_id=client_id,
+            client_secret=decrypted_client_secret
+        )
+        
+        # Create response with cookie
+        response = JSONResponse(result)
+        response.set_cookie(
+            key="fabricstudio_session",
+            value=session_id,
+            httponly=True,
+            secure=False,  # Set to True in production with HTTPS
+            samesite="lax",
+            max_age=3600  # 1 hour
+        )
+        
+        return response
     except HTTPException:
         raise
     except sqlite3.Error as e:
@@ -2080,14 +2644,27 @@ def get_nhi(nhi_id: int, req: GetNhiReq):
 
 
 @app.post("/nhi/update-token/{nhi_id}")
-def update_nhi_token(nhi_id: int, fabric_host: str, token: str, expires_in: int, encryption_password: str):
+async def update_nhi_token(request: Request, nhi_id: int):
     """Update or add a token for a specific host in an NHI credential"""
+    # Get data from request body only
+    try:
+        body = await request.json()
+    except:
+        raise HTTPException(400, "Invalid request body")
+    
+    fabric_host = body.get("fabric_host")
+    token = body.get("token")
+    expires_in = body.get("expires_in")
+    encryption_password = body.get("encryption_password")
+    
     if not encryption_password:
         raise HTTPException(400, "Encryption password is required")
     if not fabric_host or not fabric_host.strip():
         raise HTTPException(400, "Fabric host is required")
     if not token:
         raise HTTPException(400, "Token is required")
+    if expires_in is None:
+        raise HTTPException(400, "expires_in is required")
     
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
@@ -2137,6 +2714,10 @@ def delete_nhi(nhi_id: int):
         if c.rowcount == 0:
             raise HTTPException(404, f"NHI credential with id {nhi_id} not found")
         
+        # Also delete any sessions for this NHI credential
+        c.execute('DELETE FROM sessions WHERE nhi_credential_id = ?', (nhi_id,))
+        conn.commit()
+        
         return {"status": "ok", "message": f"NHI credential {nhi_id} deleted successfully"}
     except sqlite3.Error as e:
         conn.rollback()
@@ -2144,6 +2725,244 @@ def delete_nhi(nhi_id: int):
     finally:
         conn.close()
 
+
+@app.delete("/nhi/delete/{nhi_id}")
+def delete_nhi(nhi_id: int):
+    """Delete an NHI credential by ID"""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    
+    try:
+        c.execute('DELETE FROM nhi_credentials WHERE id = ?', (nhi_id,))
+        conn.commit()
+        
+        if c.rowcount == 0:
+            raise HTTPException(404, f"NHI credential with id {nhi_id} not found")
+        
+        # Also delete any sessions for this NHI credential
+        c.execute('DELETE FROM sessions WHERE nhi_credential_id = ?', (nhi_id,))
+        conn.commit()
+        
+        return {"status": "ok", "message": f"NHI credential {nhi_id} deleted successfully"}
+    except HTTPException:
+        raise
+    except sqlite3.Error as e:
+        conn.rollback()
+        logger.error(f"Error deleting NHI credential: {e}")
+        raise HTTPException(500, f"Database error: {str(e)}")
+    finally:
+        conn.close()
+
+
+# Session Management Endpoints
+class CreateSessionReq(BaseModel):
+    nhi_credential_id: int
+    encryption_password: str
+
+@app.post("/auth/session/create")
+def create_session_endpoint(req: CreateSessionReq):
+    """Create a new session for an NHI credential"""
+    if not req.encryption_password or not req.encryption_password.strip():
+        raise HTTPException(400, "Encryption password is required")
+    
+    # Verify NHI credential exists
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    try:
+        c.execute('SELECT id FROM nhi_credentials WHERE id = ?', (req.nhi_credential_id,))
+        if not c.fetchone():
+            raise HTTPException(404, f"NHI credential with id {req.nhi_credential_id} not found")
+        
+        # Get client_id and client_secret for storing in session (needed for token refresh)
+        c.execute('SELECT client_id, client_secret_encrypted FROM nhi_credentials WHERE id = ?', (req.nhi_credential_id,))
+        cred_row = c.fetchone()
+        if not cred_row:
+            raise HTTPException(404, f"NHI credential with id {req.nhi_credential_id} not found")
+        
+        client_id = cred_row[0]
+        try:
+            decrypted_client_secret = decrypt_client_secret(cred_row[1], req.encryption_password)
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+        
+        # Get tokens for this NHI credential
+        tokens_by_host = {}
+        c.execute('''
+            SELECT fabric_host, token_encrypted, token_expires_at
+            FROM nhi_tokens
+            WHERE nhi_credential_id = ?
+        ''', (req.nhi_credential_id,))
+        
+        token_rows = c.fetchall()
+        now = datetime.now()
+        
+        for token_row in token_rows:
+            fabric_host = token_row[0]
+            token_encrypted = token_row[1]
+            token_expires_at = token_row[2]
+            
+            if token_expires_at:
+                try:
+                    expires_at = datetime.fromisoformat(token_expires_at)
+                    if expires_at > now:
+                        # Token is still valid, decrypt it
+                        try:
+                            token = decrypt_client_secret(token_encrypted, req.encryption_password)
+                            tokens_by_host[fabric_host] = {
+                                "token": token,
+                                "expires_at": token_expires_at
+                            }
+                        except ValueError:
+                            # Decryption failed, skip this token
+                            pass
+                except (ValueError, TypeError):
+                    # Invalid date format, skip this token
+                    pass
+    finally:
+        conn.close()
+    
+    # Create session with tokens and credentials (for automatic token refresh)
+    session_id, session_key, expires_at = create_session(
+        req.nhi_credential_id, 
+        req.encryption_password, 
+        tokens_by_host,
+        client_id=client_id,
+        client_secret=decrypted_client_secret
+    )
+    
+    # Create response with cookie
+    response = JSONResponse({
+        "session_id": session_id,
+        "expires_at": expires_at.isoformat()
+    })
+    response.set_cookie(
+        key="fabricstudio_session",
+        value=session_id,
+        httponly=True,
+        secure=False,  # Set to True in production with HTTPS
+        samesite="lax",
+        max_age=3600  # 1 hour
+    )
+    
+    return response
+
+@app.get("/auth/session/status")
+def get_session_status(request: Request):
+    """Get current session status"""
+    session = get_session_from_request(request)
+    if not session:
+        raise HTTPException(401, "No active session")
+    
+    return {
+        "session_id": session['session_id'],
+        "nhi_credential_id": session['nhi_credential_id'],
+        "created_at": session['created_at'],
+        "last_used": session['last_used'],
+        "expires_at": session['expires_at']
+    }
+
+@app.post("/auth/session/refresh")
+def refresh_session_endpoint(request: Request):
+    """Refresh session expiration time"""
+    session = get_session_from_request(request)
+    if not session:
+        raise HTTPException(401, "No active session")
+    
+    expires_at = refresh_session(session['session_id'])
+    if not expires_at:
+        raise HTTPException(500, "Failed to refresh session")
+    
+    # Update cookie
+    response = JSONResponse({
+        "session_id": session['session_id'],
+        "expires_at": expires_at.isoformat()
+    })
+    response.set_cookie(
+        key="fabricstudio_session",
+        value=session['session_id'],
+        httponly=True,
+        secure=False,
+        samesite="lax",
+        max_age=3600
+    )
+    
+    return response
+
+@app.post("/auth/session/revoke")
+def revoke_session_endpoint(request: Request):
+    """Revoke current session"""
+    session = get_session_from_request(request)
+    if not session:
+        return JSONResponse({"status": "ok", "message": "No active session"})
+    
+    delete_session(session['session_id'])
+    
+    response = JSONResponse({"status": "ok", "message": "Session revoked"})
+    response.delete_cookie("fabricstudio_session")
+    
+    return response
+
+# Background task to refresh expiring tokens proactively
+def refresh_expiring_tokens():
+    """Background task to refresh tokens that are expiring soon"""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        try:
+            # Get all active sessions
+            now = datetime.now()
+            c.execute('''
+                SELECT session_id, nhi_credential_id, tokens_encrypted, expires_at
+                FROM sessions
+                WHERE expires_at > ?
+            ''', (now.isoformat(),))
+            sessions = c.fetchall()
+            
+            refreshed_count = 0
+            for session_row in sessions:
+                session_id = session_row[0]
+                tokens_encrypted = session_row[2]
+                
+                # Get session key
+                session_key = get_session_key_temp(session_id)
+                if not session_key:
+                    continue  # Skip if session key not available
+                
+                try:
+                    # Decrypt tokens
+                    tokens = decrypt_tokens_from_session(tokens_encrypted, session_key)
+                    
+                    # Check each token for expiration
+                    for host, token_info in tokens.items():
+                        if host == '_credentials':
+                            continue  # Skip credentials entry
+                        
+                        if token_info and is_token_expiring_soon(token_info, minutes=5):
+                            # Refresh this token
+                            if refresh_token_for_host(session_id, host):
+                                refreshed_count += 1
+                                logger.info(f"Proactively refreshed token for {host} in session {session_id}")
+                except Exception as e:
+                    logger.warning(f"Error processing session {session_id} for token refresh: {e}")
+                    continue
+                    
+            if refreshed_count > 0:
+                logger.info(f"Proactive token refresh: refreshed {refreshed_count} token(s)")
+        finally:
+            conn.close()
+    except Exception as e:
+        logger.error(f"Error in proactive token refresh task: {e}", exc_info=True)
+
+def check_and_run_token_refresh():
+    """Background thread to periodically refresh expiring tokens"""
+    logger.info("Background token refresh scheduler started")
+    while True:
+        try:
+            time.sleep(120)  # Check every 2 minutes
+            refresh_expiring_tokens()
+        except Exception as e:
+            logger.error(f"Error in token refresh scheduler: {e}", exc_info=True)
+            time.sleep(60)  # Wait 1 minute before retrying on error
 
 # Track events that have been executed to prevent duplicates
 executed_events = set()
@@ -2360,11 +3179,12 @@ def execute_event_internal(event_id: int, event_name: str = None):
 
 # Start scheduler in background thread on startup
 scheduler_thread = None
+token_refresh_thread = None
 
 @app.on_event("startup")
 def start_scheduler():
     """Start the background scheduler on application startup"""
-    global scheduler_thread
+    global scheduler_thread, token_refresh_thread
     if scheduler_thread is None or not scheduler_thread.is_alive():
         scheduler_thread = threading.Thread(target=check_and_run_events)
         scheduler_thread.daemon = True  # Allow main process to exit
@@ -2372,5 +3192,14 @@ def start_scheduler():
         logger.info("Background event scheduler thread started")
     else:
         logger.info("Background event scheduler already running")
+    
+    # Start token refresh background task
+    if token_refresh_thread is None or not token_refresh_thread.is_alive():
+        token_refresh_thread = threading.Thread(target=check_and_run_token_refresh)
+        token_refresh_thread.daemon = True
+        token_refresh_thread.start()
+        logger.info("Background token refresh scheduler thread started")
+    else:
+        logger.info("Background token refresh scheduler already running")
 
 

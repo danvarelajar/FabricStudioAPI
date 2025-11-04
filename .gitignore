@@ -41,3 +41,6 @@ dist/
 build/
 *.egg-info/
 
+# OpenAPI JSON files
+FS_2.0.4_OpenAPI.json
+

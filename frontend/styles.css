@@ -107,6 +107,12 @@ body {
   border-right: 1px solid #292e33;
   padding: 16px 0;
   flex-shrink: 0;
+  position: fixed;
+  top: 0;
+  left: 0;
+  height: 100vh;
+  overflow-y: auto;
+  z-index: 1000;
 }
 
 .sidebar-title {
@@ -164,6 +170,7 @@ body {
   padding: 16px 20px 24px;
   overflow-y: auto;
   position: relative;
+  margin-left: 250px; /* Account for fixed sidebar width */
 }
 
 #configNameDisplay {

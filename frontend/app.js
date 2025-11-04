@@ -1,4 +1,4 @@
-const accessTokens = new Map(); // Map<host, token>
+// Session-based token management - tokens are stored server-side in sessions
 let confirmedHosts = []; // Array of {host, port}
 let templates = []; // Array of template objects
 let editingConfigId = null; // Track if we're editing an existing configuration
@@ -6,8 +6,8 @@ let editingEventId = null; // Track if we're editing an existing event
 // Store decrypted NHI credentials in memory (not in DOM)
 let decryptedClientId = '';
 let decryptedClientSecret = '';
-let storedNhiTokens = new Map(); // Store tokens from NHI credential by host: {token, expires_at}
 let currentNhiId = null; // Track which NHI credential is currently loaded
+let sessionExpiresAt = null; // Track session expiration time
 
 const el = (id) => document.getElementById(id);
 // Password modal prompt used for NHI password (hidden while typing)
@@ -441,14 +441,132 @@ function getFabricHostPrimary() {
   return '';
 }
 
+function validateGuestPassword(password) {
+  if (!password || password.trim().length === 0) {
+    return { valid: true, errors: [] }; // Empty password is allowed (optional field)
+  }
+  
+  const errors = [];
+  
+  // At least 7 characters
+  if (password.length < 7) {
+    errors.push('at least 7 characters');
+  }
+  
+  // At least 1 uppercase letter
+  if (!/[A-Z]/.test(password)) {
+    errors.push('1 uppercase letter');
+  }
+  
+  // At least 1 number
+  if (!/[0-9]/.test(password)) {
+    errors.push('1 number');
+  }
+  
+  // At least 1 special character
+  if (!/[^a-zA-Z0-9]/.test(password)) {
+    errors.push('1 special character');
+  }
+  
+  return {
+    valid: errors.length === 0,
+    errors: errors
+  };
+}
+
+function showPasswordError(inputId, errorId, validation) {
+  const errorSpan = el(errorId);
+  if (!errorSpan) return;
+  
+  if (!validation.valid && validation.errors.length > 0) {
+    errorSpan.textContent = `Missing: ${validation.errors.join(', ')}`;
+    errorSpan.style.display = 'inline';
+  } else {
+    errorSpan.style.display = 'none';
+  }
+}
+
+function validateGuestPasswordField(inputId, errorId) {
+  const input = el(inputId);
+  if (!input) return true; // Field doesn't exist, consider valid
+  
+  const password = input.value.trim();
+  const validation = validateGuestPassword(password);
+  showPasswordError(inputId, errorId, validation);
+  return validation.valid;
+}
+
 function getAllConfirmedHosts() {
   return confirmedHosts.length > 0 ? confirmedHosts : parseFabricHosts();
 }
 
-function mergeAuth(host, obj) {
-  const token = accessTokens.get(host);
-  return token ? { ...obj, access_token: token } : obj;
+function initGuestPasswordValidation() {
+  // Add validation listeners to password fields when they exist
+  const setupPasswordValidation = (inputId, errorId) => {
+    const input = el(inputId);
+    if (input) {
+      input.addEventListener('input', () => {
+        validateGuestPasswordField(inputId, errorId);
+      });
+      input.addEventListener('blur', () => {
+        validateGuestPasswordField(inputId, errorId);
+      });
+    }
+  };
+  
+  // Set up validation for preparation section password field
+  setupPasswordValidation('chgPass', 'chgPassError');
+  
+  // Set up validation for configurations section password field
+  setupPasswordValidation('editChgPass', 'editChgPassError');
+  
+  // Also set up when sections are loaded dynamically
+  const observer = new MutationObserver(() => {
+    setupPasswordValidation('chgPass', 'chgPassError');
+    setupPasswordValidation('editChgPass', 'editChgPassError');
+  });
+  
+  const contentContainer = document.getElementById('content-container');
+  if (contentContainer) {
+    observer.observe(contentContainer, { childList: true, subtree: true });
+  }
 }
+
+// Session status check - tokens are stored server-side
+async function checkSessionStatus() {
+  try {
+    const res = await api('/auth/session/status', {
+      credentials: 'include' // Include cookies
+    });
+    if (res.ok) {
+      const data = await res.json();
+      sessionExpiresAt = data.expires_at ? new Date(data.expires_at) : null;
+      return data;
+    } else if (res.status === 401) {
+      // Session expired
+      sessionExpiresAt = null;
+      return null;
+    }
+    return null;
+  } catch (error) {
+    console.error('Error checking session status:', error);
+    return null;
+  }
+}
+
+function handleSessionExpired() {
+  // Clear any cached data
+  decryptedClientId = '';
+  // Session-based: client_secret is no longer used
+  currentNhiId = null;
+  sessionExpiresAt = null;
+  // Show message to user
+  showStatus('Session expired. Please reload NHI credential.');
+  // Update UI
+  renderFabricHostList();
+}
+
+// Removed mergeAuth - tokens are now managed server-side via session cookies
 
 function renderFabricHostList() {
   const listEl = el('fabricHostList');
@@ -458,7 +576,8 @@ function renderFabricHostList() {
   confirmedHosts = items; // Store confirmed hosts
   items.forEach(({host, port}, i) => {
     const li = document.createElement('li');
-    const tokenStatus = accessTokens.has(host) ? ' [Token OK]' : ' [No Token]';
+    // Session-based: tokens are managed server-side
+    const tokenStatus = sessionExpiresAt && sessionExpiresAt > new Date() ? ' [Session OK]' : ' [No Session]';
     li.textContent = host + (port ? (':' + port) : '') + tokenStatus;
     listEl.appendChild(li);
   });
@@ -468,8 +587,17 @@ async function checkRunningTasks(host, timeoutMs = 60000) {
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
     try {
-      const res = await api('/tasks/status', { params: mergeAuth(host, { fabric_host: host }) });
-      if (!res.ok) return {running: false, error: true};
+      // Cookies are sent automatically - no need for Authorization header
+      const res = await api('/tasks/status', { 
+        params: { fabric_host: host },
+        credentials: 'include'
+      });
+      if (!res.ok) {
+        if (res.status === 401) {
+          handleSessionExpired();
+        }
+        return {running: false, error: true};
+      }
       const data = await res.json();
       const runningCount = data.running_count ?? 0;
       if (runningCount === 0) return {running: false, error: false};
@@ -484,8 +612,12 @@ async function checkRunningTasks(host, timeoutMs = 60000) {
 
 async function waitForNoRunningTasks(hosts, actionName) {
   const checks = hosts.map(async ({host}) => {
-    const token = accessTokens.get(host);
-    if (!token) return {host, success: true}; // Skip if no token
+    // Check session status first
+    const session = await checkSessionStatus();
+    if (!session) {
+      handleSessionExpired();
+      return {host, success: false, error: 'No active session'};
+    }
     logMsg(`Checking for running tasks on ${host} before ${actionName}...`);
     const checkResult = await checkRunningTasks(host, 1000); // Quick check first
     if (!checkResult.running) {
@@ -493,7 +625,7 @@ async function waitForNoRunningTasks(hosts, actionName) {
       return {host, success: true};
     } else {
       logMsg(`Waiting for running tasks to complete on ${host}...`);
-      const completed = await checkRunningTasks(host, 600000); // 10 minute wait
+      const completed = await checkRunningTasks(host, 900000); // 15 minute wait
       if (!completed.running) {
         logMsg(`All tasks completed on ${host}`);
         return {host, success: true};
@@ -526,13 +658,14 @@ async function executeOnAllHosts(actionName, actionFn, options = {}) {
   
   const results = [];
   const promises = hosts.map(async ({host}) => {
-    const token = accessTokens.get(host);
-    if (!token) {
-      showStatus(`Skipping ${host}: No token available`);
-      return {host, success: false, error: 'No token'};
+    // Check session status - tokens are managed server-side
+    const session = await checkSessionStatus();
+    if (!session) {
+      handleSessionExpired();
+      return {host, success: false, error: 'No active session'};
     }
     try {
-      await actionFn(host, token);
+      await actionFn(host, null); // Token is retrieved server-side
       return {host, success: true};
     } catch (error) {
       showStatus(`${actionName} failed on ${host}: ${error.message || error}`);
@@ -649,9 +782,10 @@ async function loadSelectedNhiCredential() {
       }
       
       decryptedClientId = '';
-      decryptedClientSecret = '';
+      // Session-based: client_secret is no longer used
       currentNhiId = null;
-      storedNhiTokens.clear();
+      sessionExpiresAt = null;
+      // Session-based: tokens are managed server-side
       
       // Disable the NHI credential input and radio button on error
       const fabricHostFromNhiInput = el('fabricHostFromNhi');
@@ -699,19 +833,22 @@ async function loadSelectedNhiCredential() {
       return;
     }
     decryptedClientId = nhiData.client_id || '';
-    decryptedClientSecret = nhiData.client_secret || '';
+    // Session-based: client_secret is no longer returned, tokens are managed server-side
+    // decryptedClientSecret is not needed anymore - session handles tokens
     currentNhiId = parseInt(nhiId);
     
-    // Store tokens by host from NHI credential (will be reused in acquireTokens)
-    storedNhiTokens.clear();
+    // Session-based: tokens are managed server-side
+    // Session is created automatically by backend when NHI credential is loaded
+    // Check session status to get expiration time
+    const session = await checkSessionStatus();
+    if (session && session.expires_at) {
+      sessionExpiresAt = new Date(session.expires_at);
+    }
+    
     const nhiHosts = [];
     if (nhiData.tokens_by_host && Object.keys(nhiData.tokens_by_host).length > 0) {
-      // Store tokens per host and collect host list
+      // Collect host list from tokens_by_host (session is created automatically)
       for (const [host, tokenInfo] of Object.entries(nhiData.tokens_by_host)) {
-        storedNhiTokens.set(host, {
-          token: tokenInfo.token,
-          expires_at: tokenInfo.expires_at
-        });
         nhiHosts.push(host);
       }
       console.log(`NHI credential contains ${nhiHosts.length} stored token(s) for host(s): ${nhiHosts.join(', ')}`);
@@ -780,11 +917,12 @@ async function loadSelectedNhiCredential() {
       statusSpan.textContent = 'Error';
       statusSpan.style.color = '#f87171';
     }
-    showStatus(`Error loading NHI credential: ${error.message || error}`);
-    decryptedClientId = '';
-    decryptedClientSecret = '';
-    currentNhiId = null;
-    storedNhiTokens.clear();
+      showStatus(`Error loading NHI credential: ${error.message || error}`);
+      decryptedClientId = '';
+      // Session-based: client_secret is no longer used
+      currentNhiId = null;
+      sessionExpiresAt = null;
+      // Session-based: tokens are managed server-side
     
     // Disable the NHI credential input and radio button on error
     const fabricHostFromNhiInput = el('fabricHostFromNhi');
@@ -828,7 +966,10 @@ if (!window.validatedNhiHosts) window.validatedNhiHosts = [];
 function logMsg(msg) {
   const out = el('out');
   if (out) {
-    out.textContent += msg + "\n";
+    // Add timestamp to each log message
+    const now = new Date();
+    const timestamp = now.toISOString().replace('T', ' ').substring(0, 19); // Format: YYYY-MM-DD HH:MM:SS
+    out.textContent += `[${timestamp}] ${msg}\n`;
   }
 }
 
@@ -904,52 +1045,75 @@ function setActionsEnabled(enabled) {
   }
 }
 
-// Generic API wrapper with optional params
+// Generic API wrapper with optional params - cookies are included automatically
 async function api(path, options = {}) {
   const baseInput = el('apiBase');
   const base = baseInput ? baseInput.value.trim() : '';
+  
+  // Separate params from headers - headers should never be in params
+  const params = options.params || {};
+  const headers = new Headers(options.headers || {});
+  
+  // Always include credentials for cookie-based sessions
+  const fetchOptions = {
+    ...options,
+    headers,
+    credentials: 'include' // Always include cookies for session management
+  };
   
   // Handle empty or invalid base URL
   if (!base) {
     // Try to use current origin as fallback
     const baseUrl = window.location.origin;
     const url = path.startsWith('http') ? new URL(path) : new URL(path, baseUrl);
-    if (options.params && typeof options.params === 'object') {
-      Object.entries(options.params).forEach(([k, v]) => url.searchParams.set(k, v));
+    if (params && typeof params === 'object') {
+      Object.entries(params).forEach(([k, v]) => {
+        // Skip headers key if it somehow got into params
+        if (k !== 'headers' && v !== null && v !== undefined) {
+          url.searchParams.set(k, v);
+        }
+      });
     }
     // Add cache-busting and disable browser cache
     if ((options.method || 'GET').toUpperCase() === 'GET') {
       url.searchParams.set('_ts', Date.now());
     }
-    const headers = new Headers(options.headers || {});
     headers.set('Cache-Control', 'no-cache');
-    return fetch(url.toString(), { ...options, headers, cache: 'no-store' });
+    return fetch(url.toString(), { ...fetchOptions, cache: 'no-store' });
   }
   
   try {
     const baseUrl = new URL(base);
     const url = path.startsWith('http') ? new URL(path) : new URL(path, baseUrl);
-    if (options.params && typeof options.params === 'object') {
-      Object.entries(options.params).forEach(([k, v]) => url.searchParams.set(k, v));
+    if (params && typeof params === 'object') {
+      Object.entries(params).forEach(([k, v]) => {
+        // Skip headers key if it somehow got into params
+        if (k !== 'headers' && v !== null && v !== undefined) {
+          url.searchParams.set(k, v);
+        }
+      });
     }
     // Add cache-busting and disable browser cache
     if ((options.method || 'GET').toUpperCase() === 'GET') {
       url.searchParams.set('_ts', Date.now());
     }
-    const headers = new Headers(options.headers || {});
     headers.set('Cache-Control', 'no-cache');
-    return fetch(url.toString(), { ...options, headers, cache: 'no-store' });
+    return fetch(url.toString(), { ...fetchOptions, cache: 'no-store' });
   } catch (error) {
     // If base URL is invalid, try using current origin as fallback
     const baseUrl = window.location.origin;
     const url = path.startsWith('http') ? new URL(path) : new URL(path, baseUrl);
-    if (options.params && typeof options.params === 'object') {
-      Object.entries(options.params).forEach(([k, v]) => url.searchParams.set(k, v));
+    if (params && typeof params === 'object') {
+      Object.entries(params).forEach(([k, v]) => {
+        // Skip headers key if it somehow got into params
+        if (k !== 'headers' && v !== null && v !== undefined) {
+          url.searchParams.set(k, v);
+        }
+      });
     }
     if ((options.method || 'GET').toUpperCase() === 'GET') {
       url.searchParams.set('_ts', Date.now());
     }
-    const headers = new Headers(options.headers || {});
     headers.set('Cache-Control', 'no-cache');
     return fetch(url.toString(), { ...options, headers, cache: 'no-store' });
   }
@@ -994,10 +1158,10 @@ function resetPreparationForNewRun() {
 
     // Clear any decrypted/stored credentials and tokens
     if (typeof decryptedClientId !== 'undefined') decryptedClientId = '';
-    if (typeof decryptedClientSecret !== 'undefined') decryptedClientSecret = '';
+    // Session-based: client_secret is no longer used
     if (typeof currentNhiId !== 'undefined') currentNhiId = null;
-    if (typeof storedNhiTokens?.clear === 'function') storedNhiTokens.clear();
-    if (typeof accessTokens?.clear === 'function') accessTokens.clear();
+    if (typeof showStatus === 'function') showStatus('Preparation reset');
+    // Session-based: tokens are managed server-side, no need to clear local tokens
 
     // Clear templates array/state
     if (Array.isArray(templates)) templates.length = 0;
@@ -1095,201 +1259,47 @@ async function acquireTokens() {
     showStatus('Please confirm hosts first');
     return false;
   }
-  // Ensure decrypted credentials using the Encryption Password field in Preparation
+  
+  // Session-based: Check if NHI credential is loaded and session exists
+  // If not, try to load it from the UI
   try {
-    if ((!decryptedClientId || !decryptedClientSecret)) {
+    if (!currentNhiId || !decryptedClientId) {
       const nhiSelect = el('nhiCredentialSelect');
       const pwdInput = el('nhiDecryptPassword');
       const selectedId = nhiSelect ? (nhiSelect.value || '') : '';
       const encPwd = pwdInput ? (pwdInput.value || '').trim() : '';
       if (selectedId && encPwd) {
-        const res = await api(`/nhi/get/${selectedId}`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ encryption_password: encPwd })
-        });
-        if (res.ok) {
-          const data = await res.json();
-          decryptedClientId = data.client_id || '';
-          decryptedClientSecret = data.client_secret || '';
-          currentNhiId = parseInt(selectedId);
-          // preload tokens per host if any
-          storedNhiTokens.clear();
-          if (data.tokens_by_host) {
-            for (const [host, tokenInfo] of Object.entries(data.tokens_by_host)) {
-              storedNhiTokens.set(host, { token: tokenInfo.token, expires_at: tokenInfo.expires_at });
-            }
-          }
-          showStatus('NHI credential decrypted using Encryption Password');
-        } else {
-          const errText = await res.text().catch(() => 'Invalid Encryption Password');
-          showStatus(`Failed to decrypt NHI credential: ${errText}`);
+        // Load NHI credential which will create a session
+        await loadSelectedNhiCredential();
+        // After loading, check if session was created
+        const session = await checkSessionStatus();
+        if (!session) {
+          showStatus('Failed to create session. Please check encryption password.');
           return false;
         }
+      } else {
+        showStatus('Please select NHI credential and enter encryption password to acquire tokens');
+        return false;
       }
     }
   } catch (e) {
-    console.error('Error ensuring decrypted credentials:', e);
-    showStatus('Error decrypting NHI credential with Encryption Password');
-    return false;
-  }
-  // Use decrypted credentials from NHI Management
-  const clientId = decryptedClientId;
-  const clientSecret = decryptedClientSecret;
-  if (!clientId || !clientSecret) {
-    showStatus('Enter Encryption Password and load NHI credential to acquire tokens');
+    console.error('Error loading NHI credential:', e);
+    showStatus('Error loading NHI credential. Please check encryption password.');
     return false;
   }
   
-  // Try to reuse stored tokens from NHI credential if available
-  let reusedTokens = 0;
-  let fetchedTokens = 0;
-  const failures = [];
-  const tokenLifetimes = []; // Store token lifetimes for display
-  
-  // First, try to reuse stored tokens from NHI credential per host
-  for (const {host} of confirmedHosts) {
-    const storedTokenInfo = storedNhiTokens.get(host);
-    if (storedTokenInfo && storedTokenInfo.token && storedTokenInfo.expires_at) {
-      try {
-        // Check if token is still valid
-        const expiresAt = new Date(storedTokenInfo.expires_at);
-        const now = new Date();
-        if (expiresAt > now) {
-          // Token is valid, reuse it for this host
-          const delta = expiresAt - now;
-          const totalSeconds = Math.floor(delta / 1000);
-          const hours = Math.floor(totalSeconds / 3600);
-          const minutes = Math.floor((totalSeconds % 3600) / 60);
-          
-          accessTokens.set(host, storedTokenInfo.token);
-          reusedTokens++;
-          tokenLifetimes.push(`${host}: ${hours}h ${minutes}m (reused)`);
-          logMsg(`Reusing stored token from NHI credential for ${host} (expires in ${hours}h ${minutes}m)`);
-        } else {
-          logMsg(`Stored token from NHI credential for ${host} has expired, will fetch new token`);
-          storedNhiTokens.delete(host); // Remove expired token info
-        }
-      } catch (error) {
-        logMsg(`Error checking stored token for ${host}: ${error.message || error}, will fetch new token`);
-        storedNhiTokens.delete(host);
-      }
-    }
+  // Check session status - tokens are managed server-side
+  const session = await checkSessionStatus();
+  if (!session) {
+    showStatus('No active session. Please reload NHI credential.');
+    return false;
   }
   
-  // If we reused tokens for all hosts, return early
-  if (reusedTokens === confirmedHosts.length) {
-    renderFabricHostList();
-    let statusText = `Token OK (${reusedTokens}/${confirmedHosts.length} reused)`;
-    if (tokenLifetimes.length > 0) {
-      statusText += ` - Lifetime: ${tokenLifetimes.join(', ')}`;
-    }
-    el('tokenStatus').textContent = statusText;
-    showStatus(`Reused stored tokens from NHI credential for all hosts`);
-    return true;
-  }
-  
-  // Fetch new tokens for hosts that don't have tokens yet
-  for (const {host} of confirmedHosts) {
-    // Skip if we already have a token for this host (from reuse above)
-    if (accessTokens.has(host)) {
-      continue;
-    }
-    
-    try {
-      const res = await api('/auth/token', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          client_id: clientId,
-          client_secret: clientSecret,
-          fabric_host: host,
-        }),
-      });
-      if (!res.ok) {
-        const errText = await res.text().catch(() => 'Unknown error');
-        logMsg(`Failed to get token for ${host}: ${res.status} ${errText}`);
-        failures.push({ host, status: res.status, error: errText });
-        continue;
-      }
-      const data = await res.json();
-      accessTokens.set(host, data.access_token);
-      fetchedTokens++;
-      
-      // Save the newly fetched token to the database if we have an NHI credential loaded
-      if (currentNhiId && data.access_token && data.expires_in) {
-        try {
-          const passwordInput = el('nhiDecryptPassword');
-          const password = passwordInput ? passwordInput.value.trim() : '';
-          if (password) {
-            // Update token in database
-            const updateRes = await api(`/nhi/update-token/${currentNhiId}?fabric_host=${encodeURIComponent(host)}&token=${encodeURIComponent(data.access_token)}&expires_in=${data.expires_in}&encryption_password=${encodeURIComponent(password)}`, {
-              method: 'POST'
-            });
-            if (updateRes.ok) {
-              // Update stored token info in memory
-              storedNhiTokens.set(host, {
-                token: data.access_token,
-                expires_at: new Date(Date.now() + data.expires_in * 1000).toISOString()
-              });
-              logMsg(`Token saved to NHI credential database for ${host}`);
-            } else {
-              logMsg(`Warning: Failed to save token to database for ${host}`);
-            }
-          }
-        } catch (error) {
-          // Don't fail the token acquisition if database save fails
-          logMsg(`Warning: Error saving token to database for ${host}: ${error.message || error}`);
-        }
-      }
-      
-      // Format token lifetime for display
-      if (data.expires_in) {
-        const expiresIn = data.expires_in; // seconds
-        const hours = Math.floor(expiresIn / 3600);
-        const minutes = Math.floor((expiresIn % 3600) / 60);
-        const seconds = expiresIn % 60;
-        let lifetimeText = '';
-        if (hours > 0) {
-          lifetimeText = `${hours}h ${minutes}m`;
-        } else if (minutes > 0) {
-          lifetimeText = `${minutes}m ${seconds}s`;
-        } else {
-          lifetimeText = `${seconds}s`;
-        }
-        tokenLifetimes.push(`${host}: ${lifetimeText}`);
-      }
-      
-      logMsg(`Token acquired for ${host}${data.expires_in ? ` (expires in ${Math.floor(data.expires_in / 3600)}h ${Math.floor((data.expires_in % 3600) / 60)}m)` : ''}`);
-    } catch (error) {
-      logMsg(`Error getting token for ${host}: ${error.message || error}`);
-    }
-  }
-  
+  // Session is active - tokens are stored server-side
   renderFabricHostList();
-  const successCount = reusedTokens + fetchedTokens;
-  if (successCount > 0) {
-    let statusText = `Token OK (${successCount}/${confirmedHosts.length})`;
-    if (reusedTokens > 0 && fetchedTokens === 0) {
-      statusText += ' [reused]';
-    } else if (reusedTokens > 0) {
-      statusText += ` [${reusedTokens} reused, ${fetchedTokens} fetched]`;
-    }
-    if (tokenLifetimes.length > 0) {
-      // Display token lifetimes
-      statusText += ` - Lifetime: ${tokenLifetimes.join(', ')}`;
-    }
-    el('tokenStatus').textContent = statusText;
-    return true;
-  }
-  // No tokens acquired – show detailed reasons
-  if (failures.length > 0) {
-    const details = failures.map(f => `${f.host}: ${f.status} ${f.error}`).join(' | ');
-    showStatus(`Token acquisition failed for all hosts: ${details}`);
-  } else {
-    showStatus('Token acquisition failed for all hosts (no details).');
-  }
-  return false;
+  el('tokenStatus').textContent = 'Session OK - Tokens managed server-side';
+  showStatus('Session active - tokens are managed server-side');
+  return true;
 }
 
 // Cache all templates from all repositories for all confirmed hosts
@@ -1310,17 +1320,21 @@ async function cacheAllTemplates() {
     
     // For each confirmed host, get all repositories and their templates
     for (const {host} of confirmedHosts) {
-      const token = accessTokens.get(host);
-      if (!token) {
-        console.warn(`No token available for host ${host}, skipping`);
+      // Check session status first
+      const session = await checkSessionStatus();
+      if (!session) {
+        console.warn(`No active session for host ${host}, skipping`);
         errorCount++;
         continue;
       }
       
       try {
-        // Get all repositories for this host
-        const reposRes = await api('/repo/remotes', { params: mergeAuth(host, { fabric_host: host }) });
+        // Get all repositories for this host - cookies sent automatically
+        const reposRes = await api('/repo/remotes', { params: { fabric_host: host } });
         if (!reposRes.ok) {
+          if (reposRes.status === 401) {
+            handleSessionExpired();
+          }
           console.error(`Failed to get repositories for ${host}:`, await reposRes.text().catch(() => 'Unknown error'));
           errorCount++;
           continue;
@@ -1341,7 +1355,7 @@ async function cacheAllTemplates() {
           
           try {
             const templatesData = await apiJson('/repo/templates/list', { 
-              params: mergeAuth(host, { fabric_host: host, repo_name: repoName }) 
+              params: { fabric_host: host, repo_name: repoName }
             });
             const templates = templatesData.templates || [];
             console.log(`Found ${templates.length} templates in repo ${repoName} on ${host}`);
@@ -1918,16 +1932,16 @@ function addTplRow(prefill) {
     const host = getFabricHostPrimary();
     if (!host) return false;
     
-    // Check if we have a token before making API call
-    const token = accessTokens.get(host);
-    if (!token) {
-      // No token available yet - return false to indicate we should try again later
+    // Check session status - tokens are managed server-side
+    const session = await checkSessionStatus();
+    if (!session) {
+      // No session available yet - return false to indicate we should try again later
       return false;
     }
     
     try {
-      // Load repositories
-      const resRepos = await api('/repo/remotes', { params: mergeAuth(host, { fabric_host: host }) });
+      // Load repositories - cookies sent automatically
+      const resRepos = await api('/repo/remotes', { params: { fabric_host: host } });
       if (resRepos.ok) {
         const data = await resRepos.json();
         const repos = (data.repositories || []).map(x => x.name).filter(Boolean);
@@ -1972,16 +1986,16 @@ function addTplRow(prefill) {
     const host = getFabricHostPrimary();
     if (!host || !repo_name) return;
     
-    // Fallback to API only if we have a token
-    const token = accessTokens.get(host);
-    if (!token) {
-      console.log(`No token available and no cache for repo ${repo_name}, skipping API call`);
+    // Check session status - tokens are managed server-side
+    const session = await checkSessionStatus();
+    if (!session) {
+      console.log(`No active session for repo ${repo_name}, skipping API call`);
       return;
     }
     
     try {
       try {
-        const data = await apiJson('/repo/templates/list', { params: mergeAuth(host, { fabric_host: host, repo_name }) });
+        const data = await apiJson('/repo/templates/list', { params: { fabric_host: host, repo_name } });
         const uniqueNames = Array.from(new Set((data.templates || []).map(x => x.name).filter(Boolean)));
         const templateOptions = uniqueNames.map(name => {
           const o = document.createElement('option');
@@ -2025,7 +2039,7 @@ function addTplRow(prefill) {
     
     // LIVE API only (no cache)
     try {
-      const resVer = await api('/repo/versions', { params: mergeAuth(host, { fabric_host: host, repo_name, template_name }) });
+      const resVer = await api('/repo/versions', { params: { fabric_host: host, repo_name, template_name } });
       if (resVer.ok) {
         const data = await resVer.json();
         console.log('Versions loaded:', data.versions);
@@ -2694,10 +2708,9 @@ function resetPreparationSection() {
   confirmedHosts = [];
   validatedHosts = [];
   if (window.validatedNhiHosts) window.validatedNhiHosts = [];
-  accessTokens.clear();
-  storedNhiTokens.clear();
+  // Session-based: tokens are managed server-side, no need to clear local tokens
   decryptedClientId = '';
-  decryptedClientSecret = '';
+  // Session-based: client_secret is no longer used
   currentNhiId = null;
   
   // Clear fabric host list
@@ -4400,6 +4413,17 @@ async function handleSaveEditConfig() {
       return;
     }
     
+    // Validate guest password if provided
+    const editChgPassInput = el('editChgPass');
+    if (editChgPassInput && editChgPassInput.value.trim()) {
+      const passwordValidation = validateGuestPassword(editChgPassInput.value.trim());
+      if (!passwordValidation.valid) {
+        showStatus(`Password policy violation: Missing ${passwordValidation.errors.join(', ')}`);
+        validateGuestPasswordField('editChgPass', 'editChgPassError');
+        return;
+      }
+    }
+    
     const name = nameInput.value.trim();
     
     // Get the original config for fallback data
@@ -4528,6 +4552,7 @@ async function deleteConfiguration(configId) {
 document.addEventListener('DOMContentLoaded', () => {
   initMenu();
   // initEventFormValidation() and initNhiFormValidation() are called when sections load
+  initGuestPasswordValidation();
   // Disable actions until token is acquired
   setActionsEnabled(true);
   // Ensure install controls start disabled before any user action
@@ -4634,15 +4659,14 @@ async function handleRunButton() {
     console.log('Run operation started');
     // STEP 1: Install Workspace (if not already installed)
     // Check if tokens are available, if not try to acquire them
-    const hostsWithoutTokens = hosts.filter(({host}) => !accessTokens.has(host));
-    if (hostsWithoutTokens.length > 0) {
-      updateRunProgress(2, 'Acquiring tokens...');
-      showStatus('Acquiring tokens for missing hosts...');
-      if (!await acquireTokens()) {
-        showStatus('Failed to acquire tokens. Please check credentials and confirm hosts again.');
-        hideRunProgress();
-        return;
-      }
+    const hosts = parseFabricHosts();
+    
+    // Check session status - tokens are managed server-side
+    const session = await checkSessionStatus();
+    if (!session) {
+      showStatus('No active session. Please reload NHI credential.');
+      hideRunProgress();
+      return;
     }
     
     // Build templates list from ALL rows
@@ -4706,7 +4730,7 @@ async function handleRunButton() {
       updateRunProgress(9, 'Refreshing repositories...');
       logMsg('Refreshing repositories...');
       await executeOnAllHosts('Refresh Repositories', async (fabric_host) => {
-        const res = await api('/repo/refresh', { method: 'POST', params: mergeAuth(fabric_host, { fabric_host }) });
+        const res = await api('/repo/refresh', { method: 'POST', params: { fabric_host } });
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
       });
       
@@ -4714,7 +4738,7 @@ async function handleRunButton() {
       updateRunProgress(11, 'Uninstalling workspaces...');
       logMsg('Uninstalling workspaces...');
       await executeOnAllHosts('Uninstall Workspaces', async (fabric_host) => {
-        const res = await api('/runtime/reset', { method: 'POST', params: mergeAuth(fabric_host, { fabric_host }) });
+        const res = await api('/runtime/reset', { method: 'POST', params: { fabric_host } });
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
       });
       
@@ -4722,7 +4746,7 @@ async function handleRunButton() {
       updateRunProgress(13, 'Removing workspaces...');
       logMsg('Removing workspaces...');
       await executeOnAllHosts('Remove Workspaces', async (fabric_host) => {
-        const res = await api('/model/fabric/batch', { method: 'DELETE', params: mergeAuth(fabric_host, { fabric_host }) });
+        const res = await api('/model/fabric/batch', { method: 'DELETE', params: { fabric_host } });
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
       });
       
@@ -4739,7 +4763,7 @@ async function handleRunButton() {
             const res = await api('/system/hostname', {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify(mergeAuth(host, { fabric_host: host, hostname }))
+              body: JSON.stringify({ fabric_host: host, hostname })
             });
             if (!res.ok) throw new Error(`HTTP ${res.status}`);
             logMsg(`Hostname changed to ${hostname} for ${host}`);
@@ -4759,7 +4783,7 @@ async function handleRunButton() {
           const res = await api('/user/password', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(mergeAuth(fabric_host, { fabric_host, username, new_password }))
+            body: JSON.stringify({ fabric_host, username, new_password })
           });
           if (!res.ok) throw new Error(`HTTP ${res.status}`);
         });
@@ -4867,28 +4891,29 @@ async function handleRunButton() {
           
           try {
             // 1) get template id
-            const { template_id } = await apiJson('/repo/template', { params: mergeAuth(host, {
-              fabric_host: host,
-              template_name: t.template_name,
-              repo_name: t.repo_name,
-              version: t.version,
-            })});
+            const { template_id } = await apiJson('/repo/template', {
+              params: {
+                fabric_host: host,
+                template_name: t.template_name,
+                repo_name: t.repo_name,
+                version: t.version,
+              }
+            });
             logMsg(`Template located on ${host}`);
 
             // 2) create fabric
-            const createPayload = mergeAuth(host, {
-              fabric_host: host,
-              template_id,
-              template_name: t.template_name,
-              version: t.version,
-            });
             console.log(`  Creating fabric on ${host} for ${t.template_name} v${t.version} with template_id ${template_id}`);
             logMsg(`Creating fabric ${t.template_name} v${t.version} on ${host} (template_id: ${template_id})`);
             
             res = await api('/model/fabric', {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify(createPayload),
+              body: JSON.stringify({
+                fabric_host: host,
+                template_id,
+                template_name: t.template_name,
+                version: t.version,
+              }),
             });
             
             console.log(`  Fabric creation response from ${host}:`, res.status, res.statusText);
@@ -4910,7 +4935,7 @@ async function handleRunButton() {
 
             // 3) live poll running task count until zero or timeout for creation
             const createStart = Date.now();
-            const timeoutMs = 10 * 60 * 1000; // 10 minutes
+            const timeoutMs = 15 * 60 * 1000; // 15 minutes
             t.createProgress = 5; // Start with 5% to show immediate feedback
             renderTemplates();
             
@@ -4924,7 +4949,7 @@ async function handleRunButton() {
             }, 500); // Update every 500ms for smoother animation
 
             while (Date.now() - createStart < timeoutMs) {
-              const sres = await api('/tasks/status', { params: mergeAuth(host, { fabric_host: host }) });
+              const sres = await api('/tasks/status', { params: { fabric_host: host } });
               if (!sres.ok) { clearInterval(progressInterval); break; }
               const sdata = await sres.json();
               const cnt = sdata.running_count ?? 0;
@@ -4934,10 +4959,31 @@ async function handleRunButton() {
             clearInterval(progressInterval);
 
             // mark status
-            const done = await api('/tasks/status', { params: mergeAuth(host, { fabric_host: host }) });
+            const done = await api('/tasks/status', { params: { fabric_host: host } });
             if (done.ok) {
               const d = await done.json();
               if ((d.running_count ?? 0) === 0) {
+                // Check for task errors after tasks complete
+                try {
+                  const errorsRes = await api('/tasks/errors', { params: { fabric_host: host, limit: 20 } });
+                  if (errorsRes.ok) {
+                    const errorsData = await errorsRes.json();
+                    if (errorsData.errors && errorsData.errors.length > 0) {
+                      const errorMessages = errorsData.errors.map(err => `Task '${err.task_name}': ${err.error}`).join('; ');
+                      const errorMsg = `Template '${t.template_name}' v${t.version} creation completed on ${host} but with errors: ${errorMessages}`;
+                      logMsg(errorMsg);
+                      showStatus(errorMsg);
+                      t.status = 'err';
+                      t.createProgress = 0;
+                      renderTemplates();
+                      return {host, success: false, error: errorMessages};
+                    }
+                  }
+                } catch (error) {
+                  console.warn(`Failed to check task errors on ${host}:`, error);
+                  // Continue anyway - this is not critical
+                }
+                
                 logMsg(`Template '${t.template_name}' v${t.version} created successfully on ${host}`);
                 showStatus(`Template '${t.template_name}' v${t.version} created successfully on ${host}`);
                 t.status = 'created';
@@ -5129,12 +5175,13 @@ async function handleRunButton() {
       return;
     }
     
-    // Verify we have tokens for all hosts
-    const hostsMissingTokens = hosts.filter(({host}) => !accessTokens.has(host));
-    if (hostsMissingTokens.length > 0) {
-      showStatus(`Error: Missing tokens for hosts: ${hostsMissingTokens.map(h => h.host).join(', ')}`);
-      logMsg(`Error: Missing tokens for ${hostsMissingTokens.length} host(s)`);
-      console.error('Hosts missing tokens:', hostsMissingTokens);
+    // Session was already checked at the start of the function
+    // Re-check session status to ensure it's still valid
+    const sessionStatus = await checkSessionStatus();
+    if (!sessionStatus) {
+      showStatus(`Error: No active session. Please reload NHI credential.`);
+      logMsg(`Error: No active session`);
+      console.error('No active session');
       hideRunProgress();
       stopRunTimer();
       return;
@@ -5151,30 +5198,17 @@ async function handleRunButton() {
     const installPromises = installTargets.map(async ({target, host}, hostIdx) => {
       try {
         const installStart = Date.now();
-        const token = accessTokens.get(host);
-        if (!token) {
-          logMsg(`Skipping ${host}: No token available`);
-          console.warn(`No token for host ${host}`);
-          hostProgressMap.set(host, 100);
-          target.status = 'err';
-          target.installProgress = 0;
-          renderTemplates();
-          return {host, success: false, error: 'No token'};
-        }
-        
-        const installPayload = {
-          fabric_host: host,
-          access_token: token,
-          template_name,
-          version,
-        };
-        console.log(`Installing workspace on ${host}:`, { fabric_host: host, template_name, version, has_token: !!token });
+        console.log(`Installing workspace on ${host}:`, { fabric_host: host, template_name, version });
         logMsg(`Sending install request to ${host} for ${template_name} v${version}`);
         
         const res = await api('/runtime/fabric/install', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(installPayload),
+          body: JSON.stringify({
+            fabric_host: host,
+            template_name,
+            version,
+          }),
         });
         
         console.log(`Install response from ${host}:`, res.status, res.statusText);
@@ -5190,8 +5224,8 @@ async function handleRunButton() {
         }
         logMsg(`Workspace installation requested successfully on ${host}`);
         
-        // Progress tracking with 10 minutes assumption
-        const timeoutMs = 10 * 60 * 1000; // 10 minutes
+        // Progress tracking with 15 minutes assumption
+        const timeoutMs = 15 * 60 * 1000; // 15 minutes
         target.installProgress = 5; // Start with 5% to show immediate feedback
         renderTemplates();
         
@@ -5214,7 +5248,7 @@ async function handleRunButton() {
         // poll until running tasks are zero
         const start = Date.now();
         while (Date.now() - start < timeoutMs) {
-          const sres = await api('/tasks/status', { params: mergeAuth(host, { fabric_host: host }) });
+          const sres = await api('/tasks/status', { params: { fabric_host: host } });
           if (!sres.ok) { clearInterval(progressInterval); break; }
           const sdata = await sres.json();
           const cnt = sdata.running_count ?? 0;
@@ -5223,11 +5257,34 @@ async function handleRunButton() {
         }
         clearInterval(progressInterval);
         
-        const done = await api('/tasks/status', { params: mergeAuth(host, { fabric_host: host }) });
+        const done = await api('/tasks/status', { params: { fabric_host: host } });
         hostProgressMap.set(host, 100); // Mark as completed
         if (done.ok) {
           const d = await done.json();
           if ((d.running_count ?? 0) === 0) {
+            // Check for task errors after tasks complete
+            try {
+              const errorsRes = await api('/tasks/errors', { params: { fabric_host: host, limit: 20 } });
+              if (errorsRes.ok) {
+                const errorsData = await errorsRes.json();
+                if (errorsData.errors && errorsData.errors.length > 0) {
+                  const errorMessages = errorsData.errors.map(err => `Task '${err.task_name}': ${err.error}`).join('; ');
+                  const errorMsg = `Workspace '${template_name}' v${version} installation completed on ${host} but with errors: ${errorMessages}`;
+                  logMsg(errorMsg);
+                  showStatus(errorMsg);
+                  target.status = 'err';
+                  target.installProgress = 0;
+                  renderTemplates();
+                  const completedCount = Array.from(hostProgressMap.values()).filter(p => p === 100).length;
+                  updateRunProgress(70 + (completedCount / totalHosts) * 25, `Completed on ${completedCount}/${totalHosts} host(s)`);
+                  return {host, success: false, error: errorMessages};
+                }
+              }
+            } catch (error) {
+              console.warn(`Failed to check task errors on ${host}:`, error);
+              // Continue anyway - this is not critical
+            }
+            
             logMsg(`Installed successfully on ${host}`);
             target.status = 'installed';
             target.installProgress = 100;
@@ -5408,13 +5465,13 @@ async function restoreConfiguration(config) {
             if (res.ok) {
               const nhiData = await res.json();
               decryptedClientId = nhiData.client_id || '';
-              decryptedClientSecret = nhiData.client_secret || '';
+              // Session-based: client_secret is no longer returned, tokens are managed server-side
               currentNhiId = parseInt(config.nhiCredentialId);
-              storedNhiTokens.clear();
-              if (nhiData.tokens_by_host) {
-                for (const [host, tokenInfo] of Object.entries(nhiData.tokens_by_host)) {
-                  storedNhiTokens.set(host, { token: tokenInfo.token, expires_at: tokenInfo.expires_at });
-                }
+              // Session-based: tokens are managed server-side
+              // Check session status to get expiration time
+              const session = await checkSessionStatus();
+              if (session && session.expires_at) {
+                sessionExpiresAt = new Date(session.expires_at);
               }
               // Enable confirm button now that credentials are loaded
               const confirmBtn = el('btnConfirmHosts');
@@ -5551,17 +5608,18 @@ async function restoreConfiguration(config) {
       
       // First, try to populate repositories from cache or API
       const host = getFabricHostPrimary();
-      const token = host ? accessTokens.get(host) : null;
+      // Check session status - tokens are managed server-side
+      const session = await checkSessionStatus();
       let availableRepos = [];
       
       if (cachedTemplates.length > 0) {
         // Get unique repos from cache
         availableRepos = Array.from(new Set(cachedTemplates.map(t => t.repo_name).filter(Boolean))).sort();
         console.log('Using', availableRepos.length, 'repositories from cache');
-      } else if (host && token) {
-        // Try to load from API
+      } else if (host && session) {
+        // Try to load from API - cookies sent automatically
         try {
-          const reposRes = await api('/repo/remotes', { params: mergeAuth(host, { fabric_host: host }) });
+          const reposRes = await api('/repo/remotes', { params: { fabric_host: host } });
           if (reposRes.ok) {
             const reposData = await reposRes.json();
             availableRepos = (reposData.repositories || []).map(r => r.name).filter(Boolean);
@@ -6440,6 +6498,18 @@ function attachRunButtonHandler() {
 // Handler function for save config button
 async function handleSaveConfigButton() {
   clearConfigName();
+  
+  // Validate guest password if provided
+  const chgPassInput = el('chgPass');
+  if (chgPassInput && chgPassInput.value.trim()) {
+    const passwordValidation = validateGuestPassword(chgPassInput.value.trim());
+    if (!passwordValidation.valid) {
+      showStatus(`Password policy violation: Missing ${passwordValidation.errors.join(', ')}`);
+      validateGuestPasswordField('chgPass', 'chgPassError');
+      return;
+    }
+  }
+  
   // Get name - if editing, use existing name, otherwise prompt
   let name;
   if (editingConfigId) {
@@ -6712,7 +6782,13 @@ async function editNhi(nhiId) {
     // Populate form with NHI data
     el('nhiName').value = nhiData.name || '';
     el('nhiClientId').value = nhiData.client_id || '';
-    el('nhiClientSecret').value = nhiData.client_secret || '';
+  // Do not display client_secret when editing; disable editing of the field
+  const clientSecretInput = el('nhiClientSecret');
+  if (clientSecretInput) {
+    clientSecretInput.value = '';
+    clientSecretInput.disabled = true;
+    clientSecretInput.placeholder = 'Hidden (not editable)';
+  }
     el('nhiEncryptionPassword').value = encryptionPassword; // Keep password for update
     el('nhiConfirmPassword').value = encryptionPassword; // Pre-fill confirm with same password
     
@@ -6749,7 +6825,12 @@ function cancelNhiEdit() {
   editingNhiId = null;
   el('nhiName').value = '';
   el('nhiClientId').value = '';
-  el('nhiClientSecret').value = '';
+  const clientSecretInput = el('nhiClientSecret');
+  if (clientSecretInput) {
+    clientSecretInput.disabled = false;
+    clientSecretInput.placeholder = 'Enter client secret';
+    clientSecretInput.value = '';
+  }
   el('nhiEncryptionPassword').value = '';
   el('nhiConfirmPassword').value = '';
   const fabricHostsInput = el('nhiFabricHosts');
@@ -6828,7 +6909,12 @@ function updateNhiButtons() {
     }
   }
   
-  const isValid = nameValid && passwordsMatch && !!(name && clientId && clientSecret && encryptionPassword && confirmPassword);
+  // For create we require clientSecret; for update we do not
+  const creating = !editingNhiId;
+  const requiredFieldsOk = creating
+    ? !!(name && clientId && clientSecret && encryptionPassword && confirmPassword)
+    : !!(name && clientId && encryptionPassword && confirmPassword);
+  const isValid = nameValid && passwordsMatch && requiredFieldsOk;
   
   if (saveBtn && saveBtn.style.display !== 'none') {
     saveBtn.disabled = !isValid;
@@ -6980,7 +7066,6 @@ function setupNhiButtons() {
     updateBtn.onclick = async () => {
       const name = el('nhiName').value.trim();
   const clientId = el('nhiClientId').value.trim();
-  const clientSecret = el('nhiClientSecret').value.trim();
   const encryptionPassword = el('nhiEncryptionPassword').value.trim();
   const confirmPassword = el('nhiConfirmPassword').value.trim();
   
@@ -6989,7 +7074,8 @@ function setupNhiButtons() {
     return;
   }
   
-  if (!name || !clientId || !clientSecret || !encryptionPassword || !confirmPassword) {
+  // For update, clientSecret is not required and not editable
+  if (!name || !clientId || !encryptionPassword || !confirmPassword) {
     showStatus('Please fill in all fields including encryption password and confirmation');
     return;
   }
@@ -7018,7 +7104,6 @@ function setupNhiButtons() {
         id: editingNhiId,
         name: name,
         client_id: clientId,
-        client_secret: clientSecret,
         encryption_password: encryptionPassword,
         fabric_hosts: fabricHosts  // Optional - space-separated list of hosts for token retrieval
       })
