@@ -497,10 +497,26 @@ def decrypt_with_server_secret(ciphertext_b64: str) -> str:
 
 # Audit logging helper function
 def log_audit(action: str, user: str = None, details: str = None, ip_address: str = None):
-    """Log an audit event to the database"""
+    """Log an audit event to the database, with deduplication for fabric creation"""
     try:
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
+        
+        # Check for duplicate entries within the last 5 seconds for fabric_created action
+        if action == "fabric_created" and details:
+            # Extract host, template, and version from details string
+            # Format: "host=X template=Y version=Z" or "host=X template=Y version=Z event=W"
+            c.execute('''
+                SELECT id FROM audit_logs
+                WHERE action = ? AND details = ?
+                AND created_at > datetime('now', '-5 seconds')
+                LIMIT 1
+            ''', (action, details))
+            if c.fetchone():
+                # Duplicate found within 5 seconds, skip logging
+                conn.close()
+                return
+        
         c.execute('''
             INSERT INTO audit_logs (action, user, details, ip_address, created_at)
             VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
@@ -2310,7 +2326,11 @@ def run_configuration(config_data: dict, event_name: str, event_id: Optional[int
                                 task_errors = []
                             
                             if success:
-                                pass
+                                # Log audit event for fabric creation in scheduled event
+                                try:
+                                    log_audit("fabric_created", details=f"host={host} template={template_name} version={version} event={event_name}", ip_address=None)
+                                except Exception:
+                                    pass
                             else:
                                 if task_errors:
                                     msg = f"Failed to create template '{template_name}' v{version} on host {host}: " + "; ".join(task_errors)
