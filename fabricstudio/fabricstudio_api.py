@@ -104,10 +104,15 @@ def get_running_task_count(fabric_host, access_token):
     return data.get("page", {}).get("count", 0)
 
 
-def get_recent_task_errors(fabric_host, access_token, limit=50):
+def get_recent_task_errors(fabric_host, access_token, limit=50, since_timestamp=None, fabric_name=None):
     """
     Query recent completed/failed tasks and extract error information.
     Returns a list of error dictionaries with task details.
+    
+    Args:
+        limit: Maximum number of tasks to check
+        since_timestamp: Only include tasks created after this timestamp (ISO format string or datetime)
+        fabric_name: If provided, only include tasks related to this fabric name
     """
     logger.info("Checking for recent task errors on host %s", fabric_host)
     # Query recent tasks (completed and failed)
@@ -141,11 +146,32 @@ def get_recent_task_errors(fabric_host, access_token, limit=50):
     errors = []
     tasks = data.get("object", [])
     
+    # Parse since_timestamp if provided
+    since_datetime = None
+    if since_timestamp:
+        try:
+            if isinstance(since_timestamp, str):
+                from datetime import datetime
+                # Try parsing ISO format
+                since_datetime = datetime.fromisoformat(since_timestamp.replace('Z', '+00:00'))
+            elif hasattr(since_timestamp, 'isoformat'):
+                since_datetime = since_timestamp
+        except Exception as e:
+            logger.warning("Could not parse since_timestamp %s: %s", since_timestamp, e)
+    
     def extract_error_from_task(task):
         """Extract error message from task, checking multiple possible locations."""
         error_msg = None
         
-        # Check result field for nested error structures first (most detailed)
+        # First check returncode in task object (most reliable indicator)
+        # The task object might be nested under 'object' key or directly accessible
+        task_obj = task.get("object", task)
+        returncode = task_obj.get("returncode")
+        if returncode is not None and returncode != 0:
+            task_name = task_obj.get("name", task.get("name", "Unknown Task"))
+            error_msg = f"Task '{task_name}' failed with returncode: {returncode}"
+        
+        # Check result field for nested error structures
         result = task.get("result")
         if result:
             # If result is a dict, check for error indicators
@@ -170,7 +196,11 @@ def get_recent_task_errors(fabric_host, access_token, limit=50):
                                 else:
                                     error_parts.append(f"{key}: {value}")
                         if error_parts:
-                            error_msg = "; ".join(error_parts)
+                            # Prepend returncode info if we have it
+                            if error_msg:
+                                error_msg = f"{error_msg}; " + "; ".join(error_parts)
+                            else:
+                                error_msg = "; ".join(error_parts)
                     # Fallback to result message or error field
                     if not error_msg:
                         error_msg = result.get("message", "") or result.get("error", "")
@@ -196,52 +226,155 @@ def get_recent_task_errors(fabric_host, access_token, limit=50):
                                 else:
                                     error_parts.append(f"{key}: {value}")
                         if error_parts:
-                            error_msg = "; ".join(error_parts)
+                            # Prepend returncode info if we have it
+                            if error_msg:
+                                error_msg = f"{error_msg}; " + "; ".join(error_parts)
+                            else:
+                                error_msg = "; ".join(error_parts)
         
-        # If no error found in result, check top-level error fields
+        # If no error found yet, check top-level error fields
         if not error_msg:
             error_msg = task.get("error", "") or task.get("message", "") or task.get("description", "")
         
-        # Check rcode at task level
+        # Check rcode at task level (but returncode takes precedence)
         rcode = task.get("rcode")
-        if rcode and str(rcode) != "0":
-            if error_msg:
-                error_msg = f"{error_msg} (rcode: {rcode})"
-            else:
-                error_msg = f"Error rcode: {rcode}"
+        if rcode and str(rcode) != "0" and not error_msg:
+            error_msg = f"Error rcode: {rcode}"
         
         return error_msg
     
     # Filter for failed or error tasks
     for task in tasks:
-        status = task.get("status", "").lower()
-        task_id = task.get("id")
-        task_name = task.get("name", "Unknown Task")
+        # Handle both cases: task might be the object directly, or nested under 'object' key
+        task_obj = task.get("object", task)
+        task_id = task_obj.get("id") or task.get("id")
+        task_name = task_obj.get("name") or task.get("name", "Unknown Task")
         
-        # Check for failed status or error messages
+        # Filter by timestamp if provided
+        if since_datetime:
+            task_timestamp_str = task.get("created_at") or task.get("updated_at") or task_obj.get("created_date") or task_obj.get("returned_date")
+            if task_timestamp_str:
+                try:
+                    from datetime import datetime
+                    task_datetime = datetime.fromisoformat(task_timestamp_str.replace('Z', '+00:00'))
+                    if task_datetime < since_datetime:
+                        # Skip tasks created before the timestamp
+                        continue
+                except Exception:
+                    # If we can't parse timestamp, include the task to be safe
+                    pass
+        
+        # Filter by fabric name if provided
+        if fabric_name:
+            # Check if task name contains fabric name or if fabric is mentioned in task
+            # Fabric-related tasks often have the fabric name in the task name
+            task_name_lower = task_name.lower()
+            fabric_name_lower = fabric_name.lower()
+            
+            # Check fabric field if available
+            task_fabric = task_obj.get("fabric") or task.get("fabric")
+            fabric_match = False
+            
+            if task_fabric:
+                if isinstance(task_fabric, dict):
+                    fabric_obj_name = task_fabric.get("name")
+                    if fabric_obj_name and fabric_obj_name.lower() == fabric_name_lower:
+                        fabric_match = True
+                elif isinstance(task_fabric, (int, str)):
+                    # Fabric ID reference, we can't filter by this easily without additional API call
+                    # Skip tasks with fabric ID references if we can't verify they match
+                    # This is safer than including potentially wrong tasks
+                    pass
+            
+            # Check if fabric name appears in task name (e.g., "Install Fabric 'FortiAppSec Cloud WAF'")
+            if fabric_name_lower in task_name_lower:
+                fabric_match = True
+            
+            # If fabric name is provided, only include tasks that explicitly match
+            # Skip all tasks that don't match our fabric
+            if not fabric_match:
+                # If task mentions another fabric explicitly, definitely skip it
+                if "fabric" in task_name_lower:
+                    # Extract fabric names from task name (look for patterns like "Fabric 'XXX'")
+                    import re
+                    fabric_pattern = r"fabric\s+['\"]([^'\"]+)['\"]"
+                    matches = re.findall(fabric_pattern, task_name_lower)
+                    if matches:
+                        # If any mentioned fabric doesn't match ours, skip this task
+                        found_matching_fabric = False
+                        for mentioned_fabric in matches:
+                            if mentioned_fabric.lower() == fabric_name_lower:
+                                found_matching_fabric = True
+                                break
+                        # If no matching fabric found, skip this task
+                        if not found_matching_fabric:
+                            continue
+                    else:
+                        # Task mentions "fabric" but doesn't explicitly name one, check if our fabric name appears anywhere
+                        if fabric_name_lower not in task_name_lower:
+                            # Task mentions fabric but not our fabric name, skip it
+                            continue
+                
+                # For device/install tasks without fabric context, be very conservative
+                # Only include if they were created very recently (within last 30 seconds)
+                # This handles the case where device tasks are part of fabric creation
+                if "device" in task_name_lower or ("install" in task_name_lower and "fabric" not in task_name_lower):
+                    # Check if task was created very recently (within 30 seconds of operation start)
+                    if since_datetime:
+                        task_timestamp_str = task.get("created_at") or task.get("updated_at") or task_obj.get("created_date") or task_obj.get("returned_date")
+                        if task_timestamp_str:
+                            try:
+                                from datetime import datetime, timedelta
+                                task_datetime = datetime.fromisoformat(task_timestamp_str.replace('Z', '+00:00'))
+                                time_diff = (task_datetime - since_datetime).total_seconds()
+                                # Only include if created within 30 seconds of operation start
+                                if time_diff > 30:
+                                    continue
+                            except Exception:
+                                # If we can't parse timestamp, exclude to be safe
+                                continue
+                    else:
+                        # No timestamp filter, exclude device tasks that don't match fabric
+                        continue
+                else:
+                    # Not a fabric task and not a device task, skip if doesn't match
+                    continue
+        
+        # Get status from top level or task object
+        status = task.get("status", "").lower() or task_obj.get("status", "").lower()
+        
+        # Check returncode in task object (most reliable indicator of failure)
+        returncode = task_obj.get("returncode")
+        
+        # Check for failed status, error messages, or non-zero returncode
+        has_error = False
         if status in ["failed", "error", "exception"]:
+            has_error = True
+        elif returncode is not None and returncode != 0:
+            # Task completed but with non-zero returncode indicates failure
+            # Even if status is "done" or "completed", non-zero returncode means failure
+            has_error = True
+        elif status in ["completed", "done"]:
+            # Check if there are errors in result field
             error_msg = extract_error_from_task(task)
+            if error_msg:
+                has_error = True
+        
+        if has_error:
+            error_msg = extract_error_from_task(task)
+            if not error_msg and returncode is not None and returncode != 0:
+                # If no error message but returncode is non-zero, create one
+                error_msg = f"Task '{task_name}' failed with returncode: {returncode}"
+            
             if error_msg:
                 errors.append({
                     "task_id": task_id,
                     "task_name": task_name,
                     "status": status,
                     "error": error_msg,
-                    "timestamp": task.get("created_at") or task.get("updated_at")
+                    "timestamp": task.get("created_at") or task.get("updated_at") or task_obj.get("created_date") or task_obj.get("returned_date")
                 })
-                logger.warning("Found failed task: %s (id: %s) - %s", task_name, task_id, error_msg)
-        # Also check completed tasks for errors in result field
-        elif status == "completed":
-            error_msg = extract_error_from_task(task)
-            if error_msg:
-                errors.append({
-                    "task_id": task_id,
-                    "task_name": task_name,
-                    "status": status,
-                    "error": error_msg,
-                    "timestamp": task.get("created_at") or task.get("updated_at")
-                })
-                logger.warning("Found completed task with errors: %s (id: %s) - %s", task_name, task_id, error_msg)
+                logger.warning("Found failed task: %s (id: %s) - returncode: %s - %s", task_name, task_id, returncode if returncode is not None else "N/A", error_msg)
     
     return errors
 
@@ -631,6 +764,10 @@ def create_fabric(fabric_host, access_token, template_id, template, version):
         logger.error("Error creating template %s: %s", template_id, exc)
         return (False, [f"Request error: {str(exc)}"])
     if response.status_code == 200:
+        # Capture timestamp before checking tasks to filter errors
+        from datetime import datetime, timezone
+        creation_start_time = datetime.now(timezone.utc)
+        
         result = check_tasks(fabric_host, access_token)
         if result is None:
             logger.error("Error checking tasks after fabric creation")
@@ -640,11 +777,11 @@ def create_fabric(fabric_host, access_token, template_id, template, version):
             logger.error("Timed out waiting for tasks to finish after fabric creation")
             return (False, ["Timed out waiting for tasks to finish after 15 minutes"])
         
-        # Check for task errors after tasks complete
-        task_errors = get_recent_task_errors(fabric_host, access_token, limit=20)
+        # Check for task errors after tasks complete, filtering by fabric name and timestamp
+        task_errors = get_recent_task_errors(fabric_host, access_token, limit=20, since_timestamp=creation_start_time, fabric_name=template)
         if task_errors:
             error_messages = [f"Task '{err['task_name']}': {err['error']}" for err in task_errors]
-            logger.warning("Found %d task errors after fabric creation", len(task_errors))
+            logger.warning("Found %d task errors after fabric creation for '%s'", len(task_errors), template)
             return (False, error_messages)
         
         logger.info("Fabric created from template_id %s", template_id)
@@ -655,7 +792,7 @@ def create_fabric(fabric_host, access_token, template_id, template, version):
         return (False, [error_msg])
 
 
-def install_fabric(fabric_host, access_token, template,version):
+def install_fabric(fabric_host, access_token, template, version):
     logger.info("Installing fabric '%s' version %s on host %s", template, version, fabric_host)
     url_fabric_id = (f"https://{fabric_host}/api/v1/model/fabric?select=name={template}")
     headers = {
@@ -678,41 +815,96 @@ def install_fabric(fabric_host, access_token, template,version):
         logger.error(error_msg)
         return (False, [error_msg])
     objects = data.get('object', [])
-    fabric_id = next((item.get('id') for item in objects if item.get('version') == version), None)
-    if fabric_id:
-        logger.info("Resolved fabric id %s for installation", fabric_id)
-        url_install = (f"https://{fabric_host}/api/v1/runtime/fabric/{fabric_id}")
-        try:
-            response = requests.post(url_install, headers=headers, verify=False, timeout=30)
-        except requests.RequestException as exc:
-            logger.error("Error installing Fabric %s: %s", fabric_id, exc)
-            return (False, [f"Request error installing fabric: {str(exc)}"])
-        if response.status_code == 200:
-            result = check_tasks(fabric_host, access_token)
-            if result is None:
-                logger.error("Error checking tasks after installation")
-                return (False, ["Error checking task status after installation"])
-            elapsed_time, success = result if isinstance(result, tuple) else (result, True)
-            if not success:
-                logger.error("Timed out waiting for tasks to finish after installation")
-                return (False, ["Timed out waiting for tasks to finish after 15 minutes"])
-            
-            # Check for task errors after tasks complete
-            task_errors = get_recent_task_errors(fabric_host, access_token, limit=20)
-            if task_errors:
-                error_messages = [f"Task '{err['task_name']}': {err['error']}" for err in task_errors]
-                logger.warning("Found %d task errors after fabric installation", len(task_errors))
-                return (False, error_messages)
-            
-            logger.info("Fabric %s installed successfully", fabric_id)
-            return (True, [])
+    
+    # Filter fabrics by name and version more carefully
+    matching_fabrics = [item for item in objects if item.get('version') == version]
+    
+    if not matching_fabrics:
+        # No fabric found with matching version
+        available_versions = [item.get('version') for item in objects if item.get('name') == template]
+        if available_versions:
+            error_msg = f"Fabric '{template}' found but version '{version}' not found. Available versions: {', '.join(str(v) for v in available_versions)}"
         else:
-            error_msg = f"Error installing Fabric {fabric_id}: {response.status_code} - {response.text}"
+            error_msg = f"Fabric '{template}' not found"
+        logger.error(error_msg)
+        return (False, [error_msg])
+    
+    # If multiple fabrics match, prefer the most recently created one
+    # Sort by ID descending (assuming higher IDs are newer)
+    matching_fabrics.sort(key=lambda x: x.get('id', 0), reverse=True)
+    fabric_id = matching_fabrics[0].get('id')
+    
+    if not fabric_id:
+        error_msg = f"Fabric '{template}' v{version} found but has no ID"
+        logger.error(error_msg)
+        return (False, [error_msg])
+    
+    logger.info("Resolved fabric id %s for installation", fabric_id)
+    
+    # Verify fabric still exists before attempting installation
+    url_verify = f"https://{fabric_host}/api/v1/model/fabric/{fabric_id}"
+    try:
+        verify_response = requests.get(url_verify, headers=headers, verify=False, timeout=30)
+        if verify_response.status_code != 200:
+            error_msg = f"Fabric ID {fabric_id} no longer exists (may have been deleted). Status: {verify_response.status_code}"
             logger.error(error_msg)
             return (False, [error_msg])
+    except requests.RequestException as exc:
+        logger.warning("Could not verify fabric exists before installation: %s", exc)
+        # Continue anyway - the installation request will fail if fabric doesn't exist
+    
+    url_install = (f"https://{fabric_host}/api/v1/runtime/fabric/{fabric_id}")
+    try:
+        response = requests.post(url_install, headers=headers, verify=False, timeout=30)
+    except requests.RequestException as exc:
+        logger.error("Error installing Fabric %s: %s", fabric_id, exc)
+        return (False, [f"Request error installing fabric: {str(exc)}"])
+    
+    if response.status_code == 200:
+        # Capture timestamp before checking tasks to filter errors
+        from datetime import datetime, timezone
+        install_start_time = datetime.now(timezone.utc)
+        
+        result = check_tasks(fabric_host, access_token)
+        if result is None:
+            logger.error("Error checking tasks after installation")
+            return (False, ["Error checking task status after installation"])
+        elapsed_time, success = result if isinstance(result, tuple) else (result, True)
+        if not success:
+            logger.error("Timed out waiting for tasks to finish after installation")
+            return (False, ["Timed out waiting for tasks to finish after 15 minutes"])
+        
+        # Check for task errors after tasks complete, filtering by fabric name and timestamp
+        task_errors = get_recent_task_errors(fabric_host, access_token, limit=20, since_timestamp=install_start_time, fabric_name=template)
+        if task_errors:
+            error_messages = [f"Task '{err['task_name']}': {err['error']}" for err in task_errors]
+            logger.warning("Found %d task errors after fabric installation for '%s'", len(task_errors), template)
+            return (False, error_messages)
+        
+        logger.info("Fabric %s installed successfully", fabric_id)
+        return (True, [])
     else:
-        error_msg = "No valid fabric_id found for installation. Version mismatch or fabric missing"
-        logger.info(error_msg)
+        # Parse error response to provide better error message
+        error_detail = response.text
+        try:
+            error_json = response.json()
+            if 'detail' in error_json:
+                error_detail = error_json['detail']
+            elif 'errors' in error_json:
+                # Check for cast errors
+                errors = error_json.get('errors', {})
+                if 'fabric' in errors:
+                    fabric_errors = errors['fabric']
+                    if isinstance(fabric_errors, list):
+                        for fabric_error in fabric_errors:
+                            if isinstance(fabric_error, dict) and 'cast' in fabric_error:
+                                error_detail = f"Fabric ID {fabric_id} no longer exists: {fabric_error['cast']}"
+                                break
+        except (ValueError, KeyError):
+            pass
+        
+        error_msg = f"Error installing Fabric {fabric_id}: {response.status_code} - {error_detail}"
+        logger.error(error_msg)
         return (False, [error_msg])
 
 

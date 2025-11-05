@@ -389,7 +389,6 @@ function populateHostsFromInput(hostsString, targetInputId = 'fabricHost', targe
       updateNhiHostMismatches();
     }
   } catch (error) {
-    console.error(`Error in populateHostsFromInput for ${targetInputId}:`, error);
   }
 }
 
@@ -723,7 +722,6 @@ async function checkSessionStatus() {
     }
     return null;
   } catch (error) {
-    console.error('Error checking session status:', error);
     return null;
   }
 }
@@ -890,7 +888,6 @@ async function loadNhiCredentialsForAuth() {
     }
   } catch (error) {
     select.innerHTML = '<option value="">Error loading credentials</option>';
-    console.error('Error loading NHI credentials:', error);
   }
 }
 
@@ -976,7 +973,6 @@ async function loadSelectedNhiCredential() {
         try {
           populateHostsFromInput('', 'fabricHostFromNhi', 'fabricHostFromNhiChips', 'fabricHostFromNhiStatus');
         } catch (e) {
-          console.error('Error clearing NHI hosts:', e);
         }
       }
       const hostSourceNhi = el('hostSourceNhi');
@@ -1002,7 +998,6 @@ async function loadSelectedNhiCredential() {
     } catch (jsonError) {
       if (statusSpan) statusSpan.textContent = 'Invalid response';
       showStatus(`Failed to parse response from server: ${jsonError.message || jsonError}`);
-      console.error('JSON parse error:', jsonError);
       return;
     }
     
@@ -1030,7 +1025,6 @@ async function loadSelectedNhiCredential() {
       // Collect host list from hosts_with_tokens array
       nhiHosts.push(...nhiData.hosts_with_tokens);
       // NHI credential contains stored tokens
-      // console.log(`NHI credential contains ${nhiHosts.length} stored token(s) for host(s): ${nhiHosts.join(', ')}`);
     }
     
     // Handle Fabric Host population from NHI credential
@@ -1116,7 +1110,6 @@ async function loadSelectedNhiCredential() {
       try {
         populateHostsFromInput('', 'fabricHostFromNhi', 'fabricHostFromNhiChips', 'fabricHostFromNhiStatus');
       } catch (e) {
-        console.error('Error clearing NHI hosts on error:', e);
       }
     }
     const hostSourceNhi = el('hostSourceNhi');
@@ -1189,7 +1182,6 @@ function showStatus(msg, opts = {}) {
 function showNhiStatus(msg, opts = {}) {
   const box = el('nhiStatus');
   if (!box) {
-    console.warn('nhiStatus element not found');
     return;
   }
   // Replace newlines with <br> tags for HTML display
@@ -1211,7 +1203,6 @@ function showNhiStatus(msg, opts = {}) {
     box.style.margin = '12px 0';
     box.style.borderRadius = '4px';
   }
-  // console.log('NHI Status:', msg);
   if (opts.hideAfterMs) {
     const ms = opts.hideAfterMs;
     setTimeout(() => { if (box.innerHTML === msg.replace(/\n/g, '<br>')) box.style.display = 'none'; }, ms);
@@ -1416,7 +1407,6 @@ function resetPreparationForNewRun() {
     if (actionStatus) actionStatus.style.display = 'none';
   } catch (e) {
     // Non-fatal; log only
-    console.warn('resetPreparationForNewRun error:', e);
   }
 }
 
@@ -1472,7 +1462,6 @@ async function acquireTokens() {
       }
     }
   } catch (e) {
-    console.error('Error loading NHI credential:', e);
     showStatus('Error loading NHI credential. Please check encryption password.');
     return false;
   }
@@ -1495,7 +1484,6 @@ async function acquireTokens() {
 // Templates are stored independently (deduplicated across hosts)
 async function cacheAllTemplates() {
   if (confirmedHosts.length === 0) {
-    console.warn('No confirmed hosts to cache templates for');
     return;
   }
   
@@ -1512,7 +1500,6 @@ async function cacheAllTemplates() {
       // Check session status first
       const session = await checkSessionStatus();
       if (!session) {
-        console.warn(`No active session for host ${host}, skipping`);
         errorCount++;
         continue;
       }
@@ -1524,14 +1511,12 @@ async function cacheAllTemplates() {
           if (reposRes.status === 401) {
             handleSessionExpired();
           }
-          console.error(`Failed to get repositories for ${host}:`, await reposRes.text().catch(() => 'Unknown error'));
           errorCount++;
           continue;
         }
         
         const reposData = await reposRes.json();
         const repositories = reposData.repositories || [];
-        // console.log(`Found ${repositories.length} repositories on ${host}`);
         
         // For each repository, get all templates
         for (const repo of repositories) {
@@ -1547,7 +1532,6 @@ async function cacheAllTemplates() {
               params: { fabric_host: host, repo_name: repoName }
             });
             const templates = templatesData.templates || [];
-            // console.log(`Found ${templates.length} templates in repo ${repoName} on ${host}`);
             
             // Add templates to collection, deduplicating by repo_name + template_name + version
             for (const tpl of templates) {
@@ -1571,12 +1555,10 @@ async function cacheAllTemplates() {
             
             successCount++;
           } catch (error) {
-            console.error(`Error fetching templates for repo ${repoName} on ${host}:`, error);
             errorCount++;
           }
         }
       } catch (error) {
-        console.error(`Error fetching repositories for ${host}:`, error);
         errorCount++;
       }
     }
@@ -1596,11 +1578,9 @@ async function cacheAllTemplates() {
           logMsg(`Cached ${cacheData.count} unique templates from ${confirmedHosts.length} host(s)`);
         } else {
           const errorText = await cacheRes.text().catch(() => 'Unknown error');
-          console.error('Failed to cache templates:', errorText);
           showStatus(`Failed to cache templates: ${errorText}`, { hideAfterMs: 5000 });
         }
       } catch (error) {
-        console.error('Error caching templates:', error);
         showStatus(`Error caching templates: ${error.message || error}`, { hideAfterMs: 5000 });
       }
     } else {
@@ -1608,10 +1588,8 @@ async function cacheAllTemplates() {
     }
     
     if (errorCount > 0) {
-      console.warn(`Completed caching with ${errorCount} error(s)`);
     }
   } catch (error) {
-    console.error('Error in cacheAllTemplates:', error);
     showStatus(`Error caching templates: ${error.message || error}`, { hideAfterMs: 5000 });
   }
 }
@@ -1626,7 +1604,6 @@ function updateInstallSelect() {
   // First, collect templates from rows (workspaces that haven't been created yet)
   const rowTemplates = new Map();
   const allRows = document.querySelectorAll('.tpl-row');
-  // console.log(`updateInstallSelect: Found ${allRows.length} template rows to process`);
   
   allRows.forEach((row, idx) => {
     const selects = row.querySelectorAll('select');
@@ -1638,19 +1615,15 @@ function updateInstallSelect() {
     const template_name = templateFiltered ? templateFiltered.getValue() : '';
     const version = versionSelect?.value || '';
     
-    // console.log(`  Row ${idx + 1}: repo="${repo_name}", template="${template_name}", version="${version}"`);
     
     // Require template_name and version to be non-empty (repo_name is optional but helpful)
     if (template_name && template_name.trim() && version && version.trim()) {
       const key = `${template_name}|||${version}`;
       if (!rowTemplates.has(key)) {
         rowTemplates.set(key, { template_name, version, repo_name });
-        // console.log(`    -> Added to install select: ${template_name} (v${version})`);
       } else {
-        // console.log(`    -> Skipped (duplicate): ${template_name} (v${version})`);
       }
     } else {
-      // console.log(`    -> Skipped (incomplete): missing template_name or version`);
     }
   });
   
@@ -2163,7 +2136,6 @@ function addTplRow(prefill) {
   r.addEventListener('change', async () => {
     // Don't reset if this repo was restored from cache and change event was not user-initiated
     if (r._restoredFromCache && !r._userInitiatedChange) {
-      console.log(`Repo change event ignored - restored from cache`);
       return;
     }
     
@@ -2184,7 +2156,6 @@ function addTplRow(prefill) {
     // Check session status - tokens are managed server-side
     const session = await checkSessionStatus();
     if (!session) {
-      console.log(`No active session for repo ${repo_name}, skipping API call`);
       return;
     }
     
@@ -2202,7 +2173,6 @@ function addTplRow(prefill) {
         templateFiltered.enable();
       } catch (error) { /* surfaced via apiJson/showStatus */ }
     } catch (error) {
-      console.warn('Error loading templates from API:', error);
     }
   });
 
@@ -2210,7 +2180,6 @@ function addTplRow(prefill) {
   t.addEventListener('change', async () => {
     // Don't clear version if it was set from cache
     if (v._versionSetFromCache && v.value) {
-      console.log(`Template changed but version already set from cache (${v.value}), skipping reload`);
       return;
     }
     
@@ -2226,18 +2195,15 @@ function addTplRow(prefill) {
     const template_name = templateFiltered ? templateFiltered.getValue() : t.value;
     const host = getFabricHostPrimary();
     if (!host || !repo_name || !template_name) {
-      console.log('Template change handler: Missing values', { host, repo_name, template_name, tValue: t.value });
       return;
     }
     
-    console.log('Template change: Loading versions for', { repo_name, template_name });
     
     // LIVE API only (no cache)
     try {
       const resVer = await api('/repo/versions', { params: { fabric_host: host, repo_name, template_name } });
       if (resVer.ok) {
         const data = await resVer.json();
-        console.log('Versions loaded:', data.versions);
         (data.versions || []).forEach(ver => {
           const o = document.createElement('option');
           o.value = ver;
@@ -2251,10 +2217,8 @@ function addTplRow(prefill) {
           if (versionOpt) v.value = prefill.version;
         }
       } else {
-        console.error('Failed to load versions:', resVer.status, resVer.statusText);
       }
     } catch (error) {
-      console.error('Error loading versions:', error);
     }
   });
   
@@ -2295,44 +2259,33 @@ function addTplRow(prefill) {
 async function loadSection(sectionName) {
   const container = document.getElementById('content-container');
   if (!container) {
-    console.error('content-container element not found!');
     return;
   }
   
-  console.log(`Loading section: ${sectionName}`);
   const url = `/frontend/${sectionName}.html`;
-  console.log(`Fetching from: ${url}`);
   
   try {
     // Fetch HTML from /frontend/ path to match backend static file serving
     const response = await fetch(url);
-    console.log(`Response status: ${response.status} ${response.statusText}`);
     
     if (!response.ok) {
       const errorText = await response.text().catch(() => '');
-      console.error(`Failed to load ${sectionName}: ${response.status} ${response.statusText}`, errorText);
       container.innerHTML = `<div class="content-section"><p style="color: #f87171;">Error loading ${sectionName} section: ${response.status} ${response.statusText}</p><pre>${errorText}</pre></div>`;
       return;
     }
     
     const html = await response.text();
-    console.log(`Loaded HTML (${html.length} chars):`, html.substring(0, 200));
     container.innerHTML = html;
     
     // Verify content was inserted
-    console.log(`Container innerHTML length after insertion: ${container.innerHTML.length}`);
-    console.log(`Container has children: ${container.children.length}`);
     if (container.children.length > 0) {
-      console.log(`First child:`, container.children[0]);
     }
     
     // Wait for DOM to update, then initialize section-specific functionality
     setTimeout(() => {
-      console.log(`Initializing section: ${sectionName}`);
       initializeSection(sectionName);
     }, 50);
   } catch (error) {
-    console.error(`Error loading section ${sectionName}:`, error);
     container.innerHTML = `<div class="content-section"><p style="color: #f87171;">Error loading ${sectionName} section: ${error.message}</p></div>`;
   }
 }
@@ -2767,10 +2720,8 @@ function initializePreparationSection() {
 
 function initMenu() {
   const menuItems = document.querySelectorAll('.menu-item');
-  console.log('Initializing menu, found', menuItems.length, 'menu items');
   
   if (menuItems.length === 0) {
-    console.error('No menu items found!');
     return;
   }
   
@@ -2817,10 +2768,8 @@ function initMenu() {
       }
       
       const section = item.getAttribute('data-section');
-      console.log('Menu item clicked, section:', section);
       
       if (!section) {
-        console.error('Menu item has no data-section attribute');
         return;
       }
       
@@ -2872,12 +2821,10 @@ function initMenu() {
   const activeItem = document.querySelector('.menu-item.active');
   if (activeItem) {
     const defaultSection = activeItem.getAttribute('data-section');
-    console.log('Loading default section:', defaultSection);
     if (defaultSection) {
       loadSection(defaultSection);
     }
   } else {
-    console.warn('No active menu item found, defaulting to preparation');
     loadSection('preparation');
   }
 }
@@ -2886,18 +2833,14 @@ function initMenu() {
 function displayConfigName(name) {
   const display = el('configNameDisplay');
   const value = el('configNameValue');
-  console.log('displayConfigName called with:', name, 'display element:', display, 'value element:', value);
   if (display && value) {
     if (name && name.trim()) {
       value.textContent = name.trim();
       display.style.display = 'block';
-      console.log('Configuration name banner displayed:', name.trim());
     } else {
       display.style.display = 'none';
-      console.log('Configuration name banner hidden');
     }
   } else {
-    console.error('Could not find configNameDisplay or configNameValue elements');
   }
 }
 
@@ -3037,7 +2980,6 @@ async function loadEventConfigs() {
   try {
     const res = await api('/config/list');
     if (!res.ok) {
-      console.error('Failed to load configurations for event schedule');
       return;
     }
     
@@ -3053,7 +2995,6 @@ async function loadEventConfigs() {
       });
     }
   } catch (error) {
-    console.error('Error loading configurations for event schedule:', error);
   }
 }
 
@@ -3221,7 +3162,6 @@ async function loadEvents() {
     
   } catch (error) {
     eventsList.innerHTML = `<p style="color: #f87171;">Error loading events: ${error.message || error}</p>`;
-    console.error('Error loading events:', error);
   }
 }
 
@@ -3236,7 +3176,6 @@ async function deleteEvent(eventId) {
     loadEvents();
   } catch (error) {
     showStatus(`Error deleting event: ${error.message || error}`);
-    console.error('Error deleting event:', error);
   }
 }
 
@@ -3252,7 +3191,6 @@ async function viewEventExecutions(eventId) {
     showExecutionModal(data);
   } catch (error) {
     showStatus(`Error loading execution records: ${error.message || error}`);
-    console.error('Error loading execution records:', error);
   }
 }
 
@@ -3458,11 +3396,9 @@ async function loadConfigurations() {
         const configIdStr = btn.getAttribute('data-config-id');
         const configId = parseInt(configIdStr);
         if (isNaN(configId)) {
-          console.error('Invalid config ID:', configIdStr);
           showStatus('Error: Invalid configuration ID');
           return;
         }
-        console.log('Load button clicked for config ID:', configId);
         await loadConfigurationById(configId);
       });
     });
@@ -3475,11 +3411,9 @@ async function loadConfigurations() {
         const configIdStr = btn.getAttribute('data-config-id');
         const configId = parseInt(configIdStr);
         if (isNaN(configId)) {
-          console.error('Invalid config ID:', configIdStr);
           showStatus('Error: Invalid configuration ID');
           return;
         }
-        console.log('Edit button clicked for config ID:', configId);
         await editConfiguration(configId);
       });
     });
@@ -3492,7 +3426,6 @@ async function loadConfigurations() {
         const configIdStr = btn.getAttribute('data-config-id');
         const configId = parseInt(configIdStr);
         if (isNaN(configId)) {
-          console.error('Invalid config ID:', configIdStr);
           showStatus('Error: Invalid configuration ID');
           return;
         }
@@ -3558,7 +3491,6 @@ function showLoadingScreen(message = 'Loading configuration...') {
   }
   
   if (!overlay) {
-    console.error('Loading overlay element not found!', document.body.innerHTML.substring(0, 500));
     // Create the overlay if it doesn't exist
     overlay = document.createElement('div');
     overlay.id = 'loadingOverlay';
@@ -3571,7 +3503,6 @@ function showLoadingScreen(message = 'Loading configuration...') {
       </div>
     `;
     document.body.appendChild(overlay);
-    console.log('Created loading overlay dynamically');
   }
   
   const loadingText = document.getElementById('loadingText');
@@ -3584,7 +3515,6 @@ function showLoadingScreen(message = 'Loading configuration...') {
   overlay.style.opacity = '1';
   overlay.style.visibility = 'visible';
   overlay.classList.add('show');
-  console.log('Loading screen shown:', message);
 }
 
 function hideLoadingScreen() {
@@ -3604,7 +3534,6 @@ function hideLoadingScreen() {
     setTimeout(() => {
       overlay.style.display = 'none';
     }, 300);
-    console.log('Loading screen hidden');
   }
 }
 
@@ -3631,7 +3560,6 @@ async function loadConfigurationById(configId) {
     
     // Get the configuration name first
     const configName = configData.name || 'Unknown Configuration';
-    console.log('Loading configuration with name:', configName, 'Full configData:', configData);
     
     // Display configuration name at top (before switching sections)
     displayConfigName(configName);
@@ -3646,7 +3574,6 @@ async function loadConfigurationById(configId) {
       if (!isAlreadyOnPrep) {
         // Click to switch to preparation section
         prepItem.click();
-        console.log('Switched to preparation section');
         
         // Wait for section to load
         await new Promise(resolve => setTimeout(resolve, 300));
@@ -3661,7 +3588,6 @@ async function loadConfigurationById(configId) {
       }
       
       if (!el('apiBase')) {
-        console.error('Preparation section elements not found after waiting');
         showStatus('Error: Preparation section not loaded. Please try clicking on FabricStudio Preparation manually.');
         hideLoadingScreen();
         return;
@@ -3689,7 +3615,6 @@ async function loadConfigurationById(configId) {
     // Template restoration can take time (each template row takes ~1-2 seconds)
     const templatesCount = configData.config_data.templates ? configData.config_data.templates.length : 0;
     const waitTime = templatesCount > 0 ? Math.max(2000, templatesCount * 1500) + 500 : 500;
-    console.log(`Waiting ${waitTime}ms for configuration restoration to complete (${templatesCount} templates)...`);
     await new Promise(resolve => setTimeout(resolve, waitTime));
     
     showStatus(`Configuration '${configName}' loaded successfully`);
@@ -3698,7 +3623,6 @@ async function loadConfigurationById(configId) {
   } catch (error) {
     showStatus(`Error loading configuration: ${error.message || error}`);
     logMsg(`Error loading configuration: ${error.message || error}`);
-    console.error('Error loading configuration:', error);
     hideLoadingScreen();
   }
 }
@@ -3728,7 +3652,6 @@ async function editConfiguration(configId) {
     const configName = configData.name || 'Unknown Configuration';
     const config = configData.config_data;
     
-    console.log('Editing configuration with name:', configName, 'Full configData:', configData);
     
     // Show edit view and hide list view
     const listView = el('configsListView');
@@ -3744,7 +3667,6 @@ async function editConfiguration(configId) {
     const templatesCount = config.templates ? config.templates.length : 0;
     if (templatesCount > 0) {
       const waitTime = Math.max(2000, templatesCount * 1200) + 500; // Wait for setTimeout + buffer
-      console.log(`Waiting ${waitTime}ms for template rows to fully initialize...`);
       await new Promise(resolve => setTimeout(resolve, waitTime));
     } else {
       // Still wait a bit for form to settle
@@ -3762,7 +3684,6 @@ async function editConfiguration(configId) {
 }
 
 async function populateConfigEditForm(name, config) {
-  console.log('Populating edit form with config:', config);
   
   // Set configuration name
   const nameInput = el('editConfigName');
@@ -3792,7 +3713,6 @@ async function populateConfigEditForm(name, config) {
         port: h.port,
         isValid: true
       }));
-      console.log('Created validated hosts from confirmedHosts:', window.editValidatedHosts);
     } else if (config.fabricHost) {
       fabricHostInput.value = config.fabricHost;
       // Parse hosts from string if available
@@ -3805,7 +3725,6 @@ async function populateConfigEditForm(name, config) {
         };
       });
       window.editValidatedHosts = hosts;
-      console.log('Created validated hosts from fabricHost string:', window.editValidatedHosts);
     } else {
       fabricHostInput.value = '';
     }
@@ -3815,7 +3734,6 @@ async function populateConfigEditForm(name, config) {
   const chipsContainer = el('editFabricHostChips');
   const statusSpan = el('editFabricHostStatus');
   if (window.editValidatedHosts && window.editValidatedHosts.length > 0) {
-    console.log('Rendering chips for', window.editValidatedHosts.length, 'hosts');
     renderHostChipsForTarget('editFabricHost', 'editFabricHostChips', 'editFabricHostStatus', window.editValidatedHosts);
   } else {
     if (chipsContainer) chipsContainer.innerHTML = '';
@@ -3832,7 +3750,6 @@ async function populateConfigEditForm(name, config) {
   // Load NHI credentials into dropdown and set selected value
   const nhiCredentialSelect = el('editNhiCredentialSelect');
   const nhiCredentialId = config.nhiCredentialId;
-  console.log('NHI Credential ID from config:', nhiCredentialId);
   
   // Store NHI credential ID for saving (will be updated when dropdown changes)
   window.editNhiCredentialId = nhiCredentialId || '';
@@ -3843,7 +3760,6 @@ async function populateConfigEditForm(name, config) {
       if (res.ok) {
         const data = await res.json();
         const credentials = data.credentials || [];
-        console.log('Loaded credentials:', credentials);
         
         // Clear and rebuild dropdown
         nhiCredentialSelect.innerHTML = '<option value="">Select NHI credential...</option>';
@@ -3859,9 +3775,7 @@ async function populateConfigEditForm(name, config) {
           const credential = credentials.find(c => c.id.toString() === nhiCredentialId.toString());
           if (credential) {
             nhiCredentialSelect.value = nhiCredentialId.toString();
-            console.log('Set NHI credential dropdown to:', credential.name);
           } else {
-            console.warn('NHI credential not found with ID:', nhiCredentialId);
             // Keep the value as empty or show a message
           }
         } else {
@@ -3871,7 +3785,6 @@ async function populateConfigEditForm(name, config) {
         nhiCredentialSelect.innerHTML = '<option value="">Error loading credentials</option>';
       }
     } catch (err) {
-      console.warn('Could not load NHI credentials:', err);
       nhiCredentialSelect.innerHTML = '<option value="">Error loading credentials</option>';
     }
     
@@ -3879,7 +3792,6 @@ async function populateConfigEditForm(name, config) {
     if (!nhiCredentialSelect.hasAttribute('data-listener-added')) {
       nhiCredentialSelect.addEventListener('change', () => {
         window.editNhiCredentialId = nhiCredentialSelect.value || '';
-        console.log('NHI credential selection changed to:', window.editNhiCredentialId);
       });
       nhiCredentialSelect.setAttribute('data-listener-added', 'true');
     }
@@ -3920,7 +3832,6 @@ async function populateConfigEditForm(name, config) {
         }
       }
     } catch (err) {
-      console.warn('Could not load SSH profiles for edit form:', err);
     }
   }
   
@@ -3933,7 +3844,6 @@ async function populateConfigEditForm(name, config) {
   const tplFormList = el('editTplFormList');
   if (tplFormList) tplFormList.innerHTML = '';
   
-  console.log('Templates from config:', config.templates);
   
   // Load cached templates to populate dropdowns
   window.editCachedTemplates = [];
@@ -3942,10 +3852,8 @@ async function populateConfigEditForm(name, config) {
     if (cacheRes.ok) {
       const cacheData = await cacheRes.json();
       window.editCachedTemplates = cacheData.templates || [];
-      console.log('Loaded', window.editCachedTemplates.length, 'cached templates for edit form');
     }
   } catch (error) {
-    console.warn('Could not load cached templates:', error);
   }
   
   // Enable Add Row button
@@ -3971,14 +3879,11 @@ async function populateConfigEditForm(name, config) {
     // Wait longer to ensure all rows are fully initialized and values are set
     // Each row takes time to populate dropdowns and set values (about 1-1.5 seconds per row)
     const waitTime = Math.max(2000, rowsAdded * 1200); // 1.2 seconds per row
-    console.log(`Waiting ${waitTime}ms for ${rowsAdded} template rows to fully initialize...`);
     
     // Get the stored installSelect value before waiting, so we can set it during initial population
     const storedInstallSelect = config.installSelect || '';
-    console.log('Stored installSelect value:', storedInstallSelect || '(none)');
     
     setTimeout(() => {
-      console.log('All rows initialized. Populating dropdown with stored selection from the start...');
       // Pass the stored value - this will populate the dropdown AND set the stored value in one go
       // No visual flicker because the correct value is set during initial population
       updateEditInstallSelectFromRows(storedInstallSelect);
@@ -3988,21 +3893,17 @@ async function populateConfigEditForm(name, config) {
         const select = el('editInstallSelect');
         if (select && storedInstallSelect) {
           if (select.value === storedInstallSelect) {
-            console.log('✓ Verified: Stored selection is correctly set:', storedInstallSelect);
           } else {
-            console.warn('⚠ Warning: Stored selection may not have been set correctly. Expected:', storedInstallSelect, 'Got:', select.value);
             // Try to set it one more time if it didn't match
             const match = Array.from(select.options).find(o => o.value === storedInstallSelect);
             if (match) {
               select.value = storedInstallSelect;
-              console.log('✓ Corrected: Set stored selection to:', storedInstallSelect);
             }
           }
         }
       }, 200);
     }, waitTime);
   } else {
-    console.log('No templates found, showing empty dropdown');
     updateEditInstallSelect([], '');
   }
 }
@@ -4011,21 +3912,17 @@ async function populateConfigEditForm(name, config) {
 function initializeEditFabricHostInput() {
   let fh = el('editFabricHost');
   if (!fh) {
-    console.warn('editFabricHost element not found for initialization');
     return;
   }
   
-  console.log('Initializing editFabricHost input listeners');
   
   // Remove existing listeners if already initialized (clone to remove all listeners)
   if (fh.hasAttribute('data-listener-added')) {
-    console.log('Removing existing listeners and re-adding');
     const newInput = fh.cloneNode(true);
     fh.parentNode.replaceChild(newInput, fh);
     // Get reference to new element
     fh = el('editFabricHost');
     if (!fh) {
-      console.warn('Could not get new editFabricHost element after clone');
       return;
     }
   }
@@ -4040,7 +3937,6 @@ function initializeEditFabricHostInput() {
   
   // Helper function to render edit host chips
   function renderEditHostChips() {
-    console.log('renderEditHostChips called, validated hosts:', window.editValidatedHosts);
     if (!window.editValidatedHosts) {
       window.editValidatedHosts = [];
     }
@@ -4068,18 +3964,15 @@ function initializeEditFabricHostInput() {
   // Helper function to validate and add host to editValidatedHosts
   function validateAndAddEditHost(hostText) {
     if (!hostText || !hostText.trim()) {
-      console.log('validateAndAddEditHost: empty host text');
       return false;
     }
     
     const {host, port} = splitHostPort(hostText.trim());
-    console.log('validateAndAddEditHost: parsed', {host, port, hostText});
     
     const hostOk = isValidIp(host) || isValidDomain(host);
     const portOk = port === undefined || (port >= 1 && port <= 65535);
     const isValid = hostOk && portOk;
     
-    console.log('validateAndAddEditHost: validation', {hostOk, portOk, isValid});
     
     // Only add to validated hosts if valid
     if (isValid) {
@@ -4094,12 +3987,9 @@ function initializeEditFabricHostInput() {
       );
       if (!exists) {
         window.editValidatedHosts.push({host, port, isValid: true});
-        console.log('Added host to editValidatedHosts:', {host, port}, 'Total:', window.editValidatedHosts.length);
       } else {
-        console.log('Host already exists in editValidatedHosts:', {host, port});
       }
     } else {
-      console.log('Host validation failed:', {host, port, hostOk, portOk});
     }
     
     return isValid;
@@ -4108,23 +3998,18 @@ function initializeEditFabricHostInput() {
   fh.addEventListener('input', (e) => {
     const value = e.target.value;
     const storedLastValue = e.target._lastEditValue || '';
-    console.log('editFabricHost input event:', {value, storedLastValue, lengthDiff: value.length - storedLastValue.length, endsWithSpace: value.endsWith(' ')});
     
     if (value.length > storedLastValue.length && value.endsWith(' ')) {
       const spaceIndex = value.lastIndexOf(' ');
       const parts = value.substring(0, spaceIndex).split(/\s+/).filter(p => p.trim());
-      console.log('Space detected, parts:', parts);
       if (parts.length > 0) {
         const lastHost = parts[parts.length - 1];
-        console.log('Validating last host:', lastHost);
         const isValid = validateAndAddEditHost(lastHost);
-        console.log('Validation result:', isValid, 'Validated hosts count:', window.editValidatedHosts ? window.editValidatedHosts.length : 0);
         if (isValid) {
           const validatedStr = window.editValidatedHosts.map(({host, port}) => 
             host + (port !== undefined ? ':' + port : '')
           ).join(' ');
           e.target.value = validatedStr + ' ';
-          console.log('Updated input value to:', e.target.value);
           
           setTimeout(() => {
             e.target.setSelectionRange(e.target.value.length, e.target.value.length);
@@ -4132,7 +4017,6 @@ function initializeEditFabricHostInput() {
         } else {
           // Remove trailing space if host is invalid
           e.target.value = value.trimEnd();
-          console.log('Host invalid, removed trailing space');
         }
       }
       renderEditHostChips();
@@ -4288,9 +4172,7 @@ function addEditTplRow(prefill) {
     // Get unique template names for this repo from cache
     // Use window.editCachedTemplates which is set globally in populateConfigEditForm
     const cacheToUse = window.editCachedTemplates || [];
-    console.log(`Repo change (${repoName}): Using cache with ${cacheToUse.length} templates`);
     const templatesForRepo = cacheToUse.filter(t => t.repo_name === repoName);
-    console.log(`Repo change: Found ${templatesForRepo.length} templates for repo ${repoName}`);
     const uniqueNames = Array.from(new Set(templatesForRepo.map(t => t.template_name).filter(Boolean))).sort();
     
     const templateOptions = uniqueNames.map(name => {
@@ -4313,14 +4195,12 @@ function addEditTplRow(prefill) {
     const repoName = r.value;
     const templateName = templateFiltered ? templateFiltered.getValue() : t.value;
     
-    console.log(`handleTemplateChange called: repo="${repoName}", template="${templateName}"`);
     
     v.innerHTML = '';
     v.appendChild(optVerPh.cloneNode(true));
     v.disabled = true;
     
     if (!repoName || !templateName) {
-      console.log('handleTemplateChange: Missing repo or template, skipping version population');
       updateEditInstallSelectFromRows();
       return;
     }
@@ -4328,8 +4208,6 @@ function addEditTplRow(prefill) {
     // Get versions for this repo+template from cache
     // Use window.editCachedTemplates which is set in populateConfigEditForm
     const cacheToUse = window.editCachedTemplates || [];
-    console.log(`handleTemplateChange: Using cache with ${cacheToUse.length} templates`);
-    console.log(`handleTemplateChange: Looking for repo="${repoName}", template="${templateName}"`);
     
     const matchingTemplates = cacheToUse.filter(t => {
       const repoMatch = t.repo_name === repoName;
@@ -4337,14 +4215,12 @@ function addEditTplRow(prefill) {
       return repoMatch && templateMatch && t.version;
     });
     
-    console.log(`handleTemplateChange: Found ${matchingTemplates.length} matching templates:`, matchingTemplates);
     
     const versions = matchingTemplates
       .map(t => t.version)
       .filter(Boolean)
       .sort((a, b) => a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' }));
     
-    console.log(`handleTemplateChange: Extracted ${versions.length} unique versions:`, versions);
     
     versions.forEach(ver => {
       const o = document.createElement('option');
@@ -4354,7 +4230,6 @@ function addEditTplRow(prefill) {
     });
     
     v.disabled = false;
-    console.log(`handleTemplateChange: Populated version dropdown with ${versions.length} options`);
     
     // Add a small delay to ensure dropdowns are fully updated
     setTimeout(() => {
@@ -4391,32 +4266,26 @@ function addEditTplRow(prefill) {
       if (prefill.repo_name && r.options.length > 1) {
         r.value = prefill.repo_name;
         r.dispatchEvent(new Event('change'));
-        console.log(`Row prefill: Set repo to ${prefill.repo_name}`);
         
         setTimeout(() => {
           if (prefill.template_name) {
             templateFiltered.setValue(prefill.template_name);
-            console.log(`Row prefill: Set template input to ${prefill.template_name}`);
             
             // Also set the hidden select value
             if (templateFiltered.select) {
               templateFiltered.select.value = prefill.template_name;
-              console.log(`Row prefill: Set template select to ${prefill.template_name}`);
             }
             
             // Trigger change event to populate versions
             t.dispatchEvent(new Event('change'));
             
             // Manually trigger handleTemplateChange to ensure versions are populated
-            console.log(`Row prefill: Manually calling handleTemplateChange to populate versions`);
             setTimeout(() => {
               handleTemplateChange();
               
               // Wait for handleTemplateChange to populate versions dropdown
               setTimeout(() => {
-                console.log(`Row prefill: Checking version dropdown after handleTemplateChange, options: ${v.options.length}`);
                 if (v.options.length > 1) {
-                  console.log(`Row prefill: Available versions:`, Array.from(v.options).slice(1).map(o => o.value));
                 }
                 
                 if (prefill.version && v.options.length > 1) {
@@ -4424,27 +4293,21 @@ function addEditTplRow(prefill) {
                   if (verOpt) {
                     v.value = prefill.version;
                     v.dispatchEvent(new Event('change'));
-                    console.log(`Row prefill: ✓ Set version to ${prefill.version}`);
                   } else {
-                    console.warn(`Row prefill: Version ${prefill.version} not found in dropdown. Available options:`, Array.from(v.options).slice(1).map(o => o.value));
                     // Select first version if available
                     if (v.options.length > 1) {
                       v.value = v.options[1].value;
-                      console.log(`Row prefill: Selected first available version: ${v.value}`);
                     }
                   }
                 } else {
-                  console.warn(`Row prefill: Version dropdown not populated yet (options: ${v.options.length}) or no version provided. Prefill version was: ${prefill.version}`);
                   // Select first version if available
                   if (v.options.length > 1) {
                     v.value = v.options[1].value;
-                    console.log(`Row prefill: Selected first available version: ${v.value}`);
                   }
                 }
                 
                 // Wait a bit more to ensure all values are set, then update
                 setTimeout(() => {
-                  console.log('Row prefilled, calling updateEditInstallSelectFromRows');
                   updateEditInstallSelectFromRows();
                 }, 300);
               }, 500); // Wait for versions to be populated
@@ -4738,7 +4601,6 @@ async function handleSaveEditConfig() {
           originalConfigData = originalData.config_data || null;
         }
       } catch (err) {
-        console.warn('Could not retrieve original config:', err);
       }
     }
     
@@ -4950,7 +4812,6 @@ function hideRunProgress() {
 
 // Handler function for run button
 async function handleRunButton() {
-  console.log('Run button clicked');
   clearConfigName();
   const hosts = getAllConfirmedHosts();
   if (hosts.length === 0) {
@@ -4970,7 +4831,6 @@ async function handleRunButton() {
   }
   
   try {
-    console.log('Run operation started');
     // STEP 1: Install Workspace (if not already installed)
     // Check if tokens are available, if not try to acquire them
     const hosts = parseFabricHosts();
@@ -5030,9 +4890,8 @@ async function handleRunButton() {
       !existingKeys.has(`${template_name}|||${version}`)
     );
     
-    console.log(`Total templates in rows: ${allRowTemplates.length}`);
-    console.log(`Templates already created: ${existingTemplates.length}`);
-    console.log(`Templates to create: ${templatesToCreate.length}`, templatesToCreate.map(t => t.template_name));
+    // Track failed hosts across all operations (declared at function scope)
+    const failedHosts = new Set();
     
     // If we need to create templates, run preparation steps first
     if (templatesToCreate.length > 0) {
@@ -5123,7 +4982,6 @@ async function handleRunButton() {
       
       // Process templates sequentially (one at a time)
       const totalTemplates = templatesToCreate.length;
-      console.log(`Starting sequential creation of ${totalTemplates} templates:`, templatesToCreate.map(t => `${t.template_name} v${t.version}`));
       logMsg(`Starting sequential creation of ${totalTemplates} templates: ${templatesToCreate.map(t => t.template_name).join(', ')}`);
       
       let createdCount = 0;
@@ -5131,8 +4989,19 @@ async function handleRunButton() {
       // Process each template one at a time
       for (let i = 0; i < templatesToCreate.length; i++) {
         const rowTemplate = templatesToCreate[i];
-        console.log(`Processing template ${i + 1}/${totalTemplates}: ${rowTemplate.template_name} v${rowTemplate.version}`);
         logMsg(`[${i + 1}/${totalTemplates}] Starting creation process for ${rowTemplate.template_name} v${rowTemplate.version}`);
+        
+        // Check if all hosts have failed before processing this template
+        const availableHostsBeforeTemplate = hosts.filter(({host}) => !failedHosts.has(host));
+        if (availableHostsBeforeTemplate.length === 0) {
+          const errorMsg = `All hosts have failed. Stopping execution before processing template '${rowTemplate.template_name}'.`;
+          showStatus(errorMsg);
+          logMsg(errorMsg);
+          updateRunProgress(100, `Execution stopped - all hosts failed`);
+          renderTemplates();
+          stopRunTimer();
+          return;
+        }
         
         // Check for running tasks before creating this template
         await waitForNoRunningTasks(hosts, `Create Template ${rowTemplate.template_name}`);
@@ -5157,7 +5026,6 @@ async function handleRunButton() {
               hosts: [host] 
             };
             templates.push(t);
-            console.log(`Added template to tracking: ${t.template_name} v${t.version} on ${host}`);
           } else {
             t.status = 'spin';
             t.createProgress = 0;
@@ -5166,7 +5034,6 @@ async function handleRunButton() {
             if (!t.host || t.host === 'host' || t.host === 'Host') {
               t.host = host;
             }
-            console.log(`Found existing template entry: ${t.template_name} v${t.version} on ${host}`);
           }
         });
         renderTemplates();
@@ -5177,7 +5044,11 @@ async function handleRunButton() {
         
         // Process all hosts for this template in parallel
         const hostPromises = hosts.map(async ({host}) => {
-          console.log(`  Creating ${rowTemplate.template_name} on ${host}`);
+          // Skip hosts that have already failed
+          if (failedHosts.has(host)) {
+            return {host, success: false, error: 'Host failed during previous template creation', skipped: true};
+          }
+          
           // Find the template entry for this specific host
           let t = templates.find(t => 
             t.template_name === rowTemplate.template_name && 
@@ -5216,7 +5087,6 @@ async function handleRunButton() {
             logMsg(`Template located on ${host}`);
 
             // 2) create fabric
-            console.log(`  Creating fabric on ${host} for ${t.template_name} v${t.version} with template_id ${template_id}`);
             logMsg(`Creating fabric ${t.template_name} v${t.version} on ${host} (template_id: ${template_id})`);
             
             res = await api('/model/fabric', {
@@ -5230,22 +5100,28 @@ async function handleRunButton() {
               }),
             });
             
-            console.log(`  Fabric creation response from ${host}:`, res.status, res.statusText);
             if (!res.ok) {
               const errorText = await res.text().catch(() => `HTTP ${res.status}`);
-              const errorMsg = `Failed to create fabric '${t.template_name}' v${t.version} on ${host}: ${errorText}`;
-              logMsg(errorMsg);
+              // Try to parse JSON error response to extract detail
+              let errorDetail = errorText;
+              try {
+                const errorJson = JSON.parse(errorText);
+                if (errorJson.detail) {
+                  errorDetail = errorJson.detail;
+                }
+              } catch (e) {
+                // Not JSON, use errorText as is
+              }
+              const errorMsg = `Failed to create fabric '${t.template_name}' v${t.version} on ${host}: ${errorDetail}`;
               showStatus(errorMsg);
-              console.error(`  Create fabric failed on ${host}:`, errorText);
               t.status = 'err';
               t.createProgress = 0;
               renderTemplates();
-              return {host, success: false, error: errorText || 'Create failed'};
+              return {host, success: false, error: errorDetail || 'Create failed'};
             }
             
             const responseData = await res.json().catch(() => ({}));
             logMsg(`Fabric creation request submitted on ${host} for ${t.template_name} v${t.version} (template_id: ${template_id})`);
-            console.log(`  Fabric creation request submitted on ${host} for ${t.template_name}`, responseData);
 
             // 3) live poll running task count until zero or timeout for creation
             const createStart = Date.now();
@@ -5279,13 +5155,21 @@ async function handleRunButton() {
               if ((d.running_count ?? 0) === 0) {
                 // Check for task errors after tasks complete
                 try {
-                  const errorsRes = await api('/tasks/errors', { params: { fabric_host: host, limit: 20 } });
+                  // Capture timestamp and template name for filtering
+                  const createStartTime = new Date(createStart).toISOString();
+                  const errorsRes = await api('/tasks/errors', { 
+                    params: { 
+                      fabric_host: host, 
+                      limit: 20,
+                      fabric_name: t.template_name,
+                      since_timestamp: createStartTime
+                    } 
+                  });
                   if (errorsRes.ok) {
                     const errorsData = await errorsRes.json();
                     if (errorsData.errors && errorsData.errors.length > 0) {
                       const errorMessages = errorsData.errors.map(err => `Task '${err.task_name}': ${err.error}`).join('; ');
                       const errorMsg = `Template '${t.template_name}' v${t.version} creation completed on ${host} but with errors: ${errorMessages}`;
-                      logMsg(errorMsg);
                       showStatus(errorMsg);
                       t.status = 'err';
                       t.createProgress = 0;
@@ -5294,7 +5178,6 @@ async function handleRunButton() {
                     }
                   }
                 } catch (error) {
-                  console.warn(`Failed to check task errors on ${host}:`, error);
                   // Continue anyway - this is not critical
                 }
                 
@@ -5306,7 +5189,6 @@ async function handleRunButton() {
                 return {host, success: true};
               } else {
                 const errorMsg = `Template '${t.template_name}' v${t.version} creation timeout on ${host} - tasks still running`;
-                logMsg(errorMsg);
                 showStatus(errorMsg);
                 t.status = 'err';
                 t.createProgress = 0;
@@ -5316,7 +5198,6 @@ async function handleRunButton() {
             } else {
               const errorText = await done.text().catch(() => 'Unknown error');
               const errorMsg = `Failed to check task status on ${host} for '${t.template_name}' v${t.version}: ${errorText}`;
-              logMsg(errorMsg);
               showStatus(errorMsg);
               t.status = 'err';
               t.createProgress = 0;
@@ -5325,9 +5206,7 @@ async function handleRunButton() {
             }
           } catch (error) {
             const errorMsg = `Error processing template '${rowTemplate.template_name}' v${rowTemplate.version} on ${host}: ${error.message || error}`;
-            logMsg(errorMsg);
             showStatus(errorMsg);
-            console.error(`Error processing ${rowTemplate.template_name} on ${host}:`, error);
             if (t) {
               t.status = 'err';
               t.createProgress = 0;
@@ -5340,29 +5219,52 @@ async function handleRunButton() {
         const results = await Promise.all(hostPromises);
         const successCount = results.filter(r => r.success).length;
         
-        // Collect error details for failed hosts
-        const failedHosts = results.filter(r => !r.success);
+        // Collect error details for failed hosts (excluding skipped ones)
+        const failedHostsForTemplate = results.filter(r => !r.success && !r.skipped);
+        
+        // Track failed hosts to skip installation later
+        failedHostsForTemplate.forEach(f => failedHosts.add(f.host));
+        
+        // Check if all hosts failed for this template
+        const availableHostsForTemplate = hosts.filter(({host}) => !failedHosts.has(host));
+        
+        // Stop execution if this template failed on all remaining hosts
+        if (successCount === 0 && failedHostsForTemplate.length > 0) {
+          const errorDetails = failedHostsForTemplate.map(f => `${f.host}: ${f.error || 'Unknown error'}`).join('; ');
+          const errorMsg = `Template '${rowTemplate.template_name}' v${rowTemplate.version} creation failed on all hosts: ${errorDetails}`;
+          showStatus(errorMsg);
+          logMsg(`Stopping execution - template creation failed on all hosts`);
+          updateRunProgress(100, `Execution stopped - template creation failed`);
+          renderTemplates();
+          stopRunTimer();
+          return;
+        }
+        
+        // Also stop if all hosts have failed (from previous templates)
+        if (availableHostsForTemplate.length === 0) {
+          const errorMsg = `All hosts have failed. Stopping execution.`;
+          showStatus(errorMsg);
+          logMsg(errorMsg);
+          logMsg(`Stopping execution - all hosts failed`);
+          updateRunProgress(100, `Execution stopped - all hosts failed`);
+          renderTemplates();
+          stopRunTimer();
+          return;
+        }
         
         // Status is already updated per host in the promise handlers above
         // Just update summary messages
         if (successCount > 0) {
           createdCount++;
           if (successCount < hosts.length) {
-            const failedHostNames = failedHosts.map(f => f.host).join(', ');
+            const failedHostNames = failedHostsForTemplate.map(f => f.host).join(', ');
             showStatus(`Template '${rowTemplate.template_name}' created on ${successCount}/${hosts.length} host(s). Failed on: ${failedHostNames}`);
           }
-        } else {
-          const errorDetails = failedHosts.map(f => `${f.host}: ${f.error || 'Unknown error'}`).join('; ');
-          const errorMsg = `Template '${rowTemplate.template_name}' v${rowTemplate.version} creation failed on all hosts: ${errorDetails}`;
-          showStatus(errorMsg);
         }
         renderTemplates();
         
         if (successCount > 0) {
           logMsg(`Template '${rowTemplate.template_name}' v${rowTemplate.version} creation completed on ${successCount}/${hosts.length} host(s)`);
-        } else {
-          const errorDetails = failedHosts.map(f => `${f.host}: ${f.error || 'Unknown error'}`).join('; ');
-          logMsg(`Template '${rowTemplate.template_name}' v${rowTemplate.version} creation failed on all hosts: ${errorDetails}`);
         }
         
         // Wait for all running tasks to complete on all hosts before proceeding to next template
@@ -5374,7 +5276,6 @@ async function handleRunButton() {
         updateRunProgress(completedProgress, `Template ${i + 1}/${totalTemplates} created: ${rowTemplate.template_name}`);
       }
       
-      console.log(`Sequential template creation completed. Created: ${createdCount}/${totalTemplates}`);
       updateRunProgress(60, `All workspace templates processed: ${createdCount}/${totalTemplates} created successfully`);
       renderTemplates();
       
@@ -5416,27 +5317,37 @@ async function handleRunButton() {
       }
       
       try {
-        const sshResults = await executeSshProfiles(hosts, sshProfileId, encryptionPassword, sshWaitTime);
-        const sshSuccessCount = sshResults.filter(r => r.success).length;
+        // Filter out failed hosts before SSH execution
+        const availableHostsForSsh = hosts.filter(({host}) => !failedHosts.has(host));
         
-        if (sshSuccessCount === hosts.length) {
-          updateRunProgress(63, 'SSH profiles executed successfully!');
-          // showStatus already calls logMsg internally, so don't duplicate
-          showStatus(`SSH profiles executed successfully on all ${hosts.length} host(s)`);
+        if (availableHostsForSsh.length === 0) {
+          showStatus('Skipping SSH profile execution - all hosts failed during template creation.');
+          logMsg('Skipping SSH profile execution - all hosts failed during template creation');
         } else {
-          updateRunProgress(63, `SSH profiles executed on ${sshSuccessCount}/${hosts.length} host(s)`);
-          // showStatus already calls logMsg internally, so don't duplicate
-          showStatus(`SSH profiles executed on ${sshSuccessCount}/${hosts.length} host(s)`);
+          if (failedHosts.size > 0) {
+            const failedHostNames = Array.from(failedHosts).join(', ');
+            logMsg(`Skipping SSH execution on failed hosts: ${failedHostNames}. Executing on ${availableHostsForSsh.length} remaining host(s).`);
+          }
           
-          // Report errors but continue with installation
-          const errors = sshResults.filter(r => !r.success).map(r => `${r.host}: ${r.error || 'Unknown error'}`);
-          if (errors.length > 0) {
-            showStatus(`SSH profile errors (continuing with installation):\n${errors.join('\n')}`, { error: true });
-            logMsg(`SSH profile errors: ${errors.join('; ')}`);
+          const sshResults = await executeSshProfiles(availableHostsForSsh, sshProfileId, encryptionPassword, sshWaitTime);
+          const sshSuccessCount = sshResults.filter(r => r.success).length;
+          
+          if (sshSuccessCount === availableHostsForSsh.length) {
+            updateRunProgress(63, 'SSH profiles executed successfully!');
+            showStatus(`SSH profiles executed successfully on all ${availableHostsForSsh.length} host(s)`);
+          } else {
+            updateRunProgress(63, `SSH profiles executed on ${sshSuccessCount}/${availableHostsForSsh.length} host(s)`);
+            showStatus(`SSH profiles executed on ${sshSuccessCount}/${availableHostsForSsh.length} host(s)`);
+            
+            // Report errors but continue with installation
+            const errors = sshResults.filter(r => !r.success).map(r => `${r.host}: ${r.error || 'Unknown error'}`);
+            if (errors.length > 0) {
+              showStatus(`SSH profile errors (continuing with installation):\n${errors.join('\n')}`, { error: true });
+              logMsg(`SSH profile errors: ${errors.join('; ')}`);
+            }
           }
         }
       } catch (error) {
-        console.error('Error executing SSH profiles:', error);
         logMsg(`SSH profile execution error: ${error.message || error}`);
         showStatus(`Error executing SSH profiles: ${error.message || error}`, { error: true });
         // Continue with installation even if SSH fails
@@ -5446,7 +5357,6 @@ async function handleRunButton() {
     // STEP 2: Install the selected workspace (after SSH profiles execute)
     updateRunProgress(64, 'Preparing to install selected workspace...');
     const opt = el('installSelect').value;
-    console.log('Selected template option:', opt);
     
     let template_name, version, repo_name;
     if (!opt) {
@@ -5454,7 +5364,6 @@ async function handleRunButton() {
       const select = el('installSelect');
       if (select && select.options.length > 0 && select.options[0].value) {
         [template_name, version] = select.options[0].value.split('|||');
-        console.log('Auto-selected from dropdown:', template_name, version);
       } else {
         const created = templates.filter(t => t.status === 'created' || t.status === 'installed');
         if (created.length === 0) {
@@ -5468,11 +5377,9 @@ async function handleRunButton() {
         const first = created[0];
         template_name = first.template_name;
         version = first.version;
-        console.log('Auto-selected from created templates:', template_name, version);
       }
     } else {
       [template_name, version] = opt.split('|||');
-      console.log('Using selected template:', template_name, version);
     }
     
     // Get repo_name from rows if needed
@@ -5493,7 +5400,25 @@ async function handleRunButton() {
     
     // Create separate template entry for each host for installation tracking
     const installTargets = [];
-    hosts.forEach(({host}) => {
+    // Filter out hosts that failed during creation
+    const availableHosts = hosts.filter(({host}) => !failedHosts.has(host));
+    
+    if (availableHosts.length === 0) {
+      showStatus(`Cannot install workspace: all hosts failed during template creation. Skipping installation.`);
+      logMsg(`Skipping installation - all hosts failed during template creation`);
+      updateRunProgress(100, 'Installation skipped - all hosts failed');
+      renderTemplates();
+      stopRunTimer();
+      return;
+    }
+    
+    if (failedHosts.size > 0) {
+      const failedHostNames = Array.from(failedHosts).join(', ');
+      showStatus(`Skipping installation on failed hosts: ${failedHostNames}. Installing on ${availableHosts.length} remaining host(s).`);
+      logMsg(`Skipping installation on failed hosts: ${failedHostNames}. Installing on ${availableHosts.length} remaining host(s).`);
+    }
+    
+    availableHosts.forEach(({host}) => {
       let target = templates.find(t => 
         t.template_name === template_name && 
         t.version === version && 
@@ -5535,7 +5460,6 @@ async function handleRunButton() {
     if (!template_name || !version) {
       showStatus('Error: Template name and version are required');
       logMsg('Error: Missing template_name or version');
-      console.error('Missing template info:', { template_name, version });
       hideRunProgress();
       stopRunTimer();
       return;
@@ -5547,7 +5471,6 @@ async function handleRunButton() {
     if (!sessionStatus) {
       showStatus(`Error: No active session. Please reload NHI credential.`);
       logMsg(`Error: No active session`);
-      console.error('No active session');
       hideRunProgress();
       stopRunTimer();
       return;
@@ -5557,14 +5480,12 @@ async function handleRunButton() {
     const totalHosts = hosts.length;
     const hostProgressMap = new Map(); // Track individual host progress
     
-    console.log(`Starting installation on ${totalHosts} host(s) for ${template_name} v${version}`);
     logMsg(`Installing workspace ${template_name} v${version} on ${totalHosts} host(s)`);
     
     // Install on all hosts in parallel
     const installPromises = installTargets.map(async ({target, host}, hostIdx) => {
       try {
         const installStart = Date.now();
-        console.log(`Installing workspace on ${host}:`, { fabric_host: host, template_name, version });
         logMsg(`Sending install request to ${host} for ${template_name} v${version}`);
         
         const res = await api('/runtime/fabric/install', {
@@ -5577,11 +5498,9 @@ async function handleRunButton() {
           }),
         });
         
-        console.log(`Install response from ${host}:`, res.status, res.statusText);
         if (!res.ok) {
           const errorText = await res.text();
           logMsg(`Install workspace failed on ${host}: HTTP ${res.status} - ${errorText}`);
-          console.error(`Install failed on ${host}:`, errorText);
           hostProgressMap.set(host, 100); // Mark as done (failed)
           target.status = 'err';
           target.installProgress = 0;
@@ -5630,13 +5549,21 @@ async function handleRunButton() {
           if ((d.running_count ?? 0) === 0) {
             // Check for task errors after tasks complete
             try {
-              const errorsRes = await api('/tasks/errors', { params: { fabric_host: host, limit: 20 } });
+              // Capture timestamp and template name for filtering
+              const installStartTime = new Date(installStart).toISOString();
+              const errorsRes = await api('/tasks/errors', { 
+                params: { 
+                  fabric_host: host, 
+                  limit: 20,
+                  fabric_name: template_name,
+                  since_timestamp: installStartTime
+                } 
+              });
               if (errorsRes.ok) {
                 const errorsData = await errorsRes.json();
                 if (errorsData.errors && errorsData.errors.length > 0) {
                   const errorMessages = errorsData.errors.map(err => `Task '${err.task_name}': ${err.error}`).join('; ');
                   const errorMsg = `Workspace '${template_name}' v${version} installation completed on ${host} but with errors: ${errorMessages}`;
-                  logMsg(errorMsg);
                   showStatus(errorMsg);
                   target.status = 'err';
                   target.installProgress = 0;
@@ -5647,7 +5574,6 @@ async function handleRunButton() {
                 }
               }
             } catch (error) {
-              console.warn(`Failed to check task errors on ${host}:`, error);
               // Continue anyway - this is not critical
             }
             
@@ -5672,7 +5598,6 @@ async function handleRunButton() {
         return {host, success: false, error: 'Status check failed'};
       } catch (error) {
         logMsg(`Error installing on ${host}: ${error.message || error}`);
-        console.error(`Error installing on ${host}:`, error);
         hostProgressMap.set(host, 100); // Mark as done (error)
         target.status = 'err';
         target.installProgress = 0;
@@ -5699,7 +5624,6 @@ async function handleRunButton() {
     renderTemplates(); // Update UI state
     stopRunTimer(); // Stop the timer but keep progress bar visible
   } catch (error) {
-    console.error('Error in Run operation:', error);
     logMsg(`Run operation error: ${error.message || error}`);
     showStatus(`Error: ${error.message || error}`);
     hideRunProgress();
@@ -5780,7 +5704,6 @@ function collectConfiguration() {
 
 async function restoreConfiguration(config) {
   try {
-    console.log('Restoring configuration:', config);
     
     // Ensure preparation section is loaded - wait for elements to exist
     let attempts = 0;
@@ -5790,7 +5713,6 @@ async function restoreConfiguration(config) {
     }
     
     if (!el('apiBase')) {
-      console.error('Preparation section elements not found after waiting');
       showStatus('Error: Preparation section not loaded. Please try again.');
       return;
     }
@@ -5799,20 +5721,17 @@ async function restoreConfiguration(config) {
     const apiBaseInput = el('apiBase');
     if (apiBaseInput && config.apiBase !== undefined && config.apiBase) {
       apiBaseInput.value = config.apiBase;
-      console.log('Restored apiBase:', config.apiBase);
     }
     
     // Restore other basic fields - always safe, no API calls
     const fabricHostInput = el('fabricHost');
     if (fabricHostInput && config.fabricHost !== undefined) {
       fabricHostInput.value = config.fabricHost || '';
-      console.log('Restored fabricHost:', config.fabricHost);
     }
     
     const expertModeInput = el('expertMode');
     if (expertModeInput && config.expertMode !== undefined) {
       expertModeInput.checked = config.expertMode || false;
-      console.log('Restored expertMode:', config.expertMode);
     }
     
     // Restore NHI credential selection if available, and auto-load with password prompt
@@ -5846,7 +5765,115 @@ async function restoreConfiguration(config) {
               // Enable confirm button now that credentials are loaded
               const confirmBtn = el('btnConfirmHosts');
               if (confirmBtn) confirmBtn.disabled = false;
-              showStatus('NHI credential loaded for configuration');
+              
+              // Automatically confirm hosts if they are available from NHI credential
+              // This makes the configuration ready to run without manual confirmation
+              if (nhiData.hosts_with_tokens && Array.isArray(nhiData.hosts_with_tokens) && nhiData.hosts_with_tokens.length > 0) {
+                // Populate NHI hosts field if not already populated
+                const fabricHostFromNhiInput = el('fabricHostFromNhi');
+                if (fabricHostFromNhiInput) {
+                  const nhiHostsStr = nhiData.hosts_with_tokens.sort().join(' ');
+                  fabricHostFromNhiInput.value = nhiHostsStr;
+                  // Validate and populate hosts from NHI credential
+                  populateHostsFromInput(nhiHostsStr, 'fabricHostFromNhi', 'fabricHostFromNhiChips', 'fabricHostFromNhiStatus');
+                  
+                  // Wait a bit for validation to complete, then check validated hosts
+                  await new Promise(resolve => setTimeout(resolve, 100));
+                }
+                
+                // Check if we have validated hosts from NHI credential
+                if (window.validatedNhiHosts && window.validatedNhiHosts.length > 0) {
+                  // Automatically confirm hosts from NHI credential
+                  confirmedHosts = window.validatedNhiHosts.map(({host, port}) => ({host, port}));
+                  validatedHosts = [...window.validatedNhiHosts];
+                  
+                  // Update manual input to match
+                  const fabricHostInput = el('fabricHost');
+                  if (fabricHostInput) {
+                    const confirmedHostsStr = confirmedHosts.map(({host, port}) => 
+                      host + (port !== undefined ? ':' + port : '')
+                    ).join(' ');
+                    fabricHostInput.value = confirmedHostsStr;
+                    renderHostChips();
+                    updateValidationStatus();
+                    fabricHostInput.readOnly = true;
+                    fabricHostInput.disabled = false;
+                    fabricHostInput.style.backgroundColor = '#f5f5f7';
+                    fabricHostInput.style.cursor = 'not-allowed';
+                  }
+                  
+                  // Make NHI credential input readonly
+                  if (fabricHostFromNhiInput) {
+                    const nhiHostsStr = window.validatedNhiHosts.map(({host, port}) => 
+                      host + (port !== undefined ? ':' + port : '')
+                    ).join(' ');
+                    fabricHostFromNhiInput.value = nhiHostsStr;
+                    fabricHostFromNhiInput.readOnly = true;
+                    fabricHostFromNhiInput.disabled = false;
+                    fabricHostFromNhiInput.style.backgroundColor = '#f5f5f7';
+                    fabricHostFromNhiInput.style.cursor = 'not-allowed';
+                  }
+                  
+                  // Render host list and acquire tokens
+                  await renderFabricHostList();
+                  const hostsListRow = el('hostsListRow');
+                  if (hostsListRow) hostsListRow.style.display = '';
+                  showStatus('Hosts confirmed. Acquiring tokens...');
+                  
+                  // Automatically acquire tokens
+                  if (await acquireTokens()) {
+                    const addRowBtn = el('btnAddRow');
+                    if (addRowBtn) addRowBtn.disabled = false;
+                    showStatus('Configuration loaded and ready. Caching templates...', { hideAfterMs: 1000 });
+                    // Cache templates
+                    await cacheAllTemplates();
+                  } else {
+                    showStatus('Configuration loaded but token acquisition failed. Please check credentials.');
+                  }
+                } else {
+                  // NHI credential loaded but hosts not validated yet, use confirmed hosts from config if available
+                  if (config.confirmedHosts && config.confirmedHosts.length > 0) {
+                    confirmedHosts = config.confirmedHosts.map(h => ({ host: h.host, port: h.port }));
+                    validatedHosts = config.confirmedHosts.map(h => ({ 
+                      host: h.host, 
+                      port: h.port, 
+                      isValid: true 
+                    }));
+                    await renderFabricHostList();
+                    renderHostChips();
+                    const fabricHostInput = el('fabricHost');
+                    if (fabricHostInput) {
+                      const hostString = validatedHosts.map(({host, port}) => 
+                        host + (port !== undefined ? ':' + port : '')
+                      ).join(' ');
+                      fabricHostInput.value = hostString;
+                    }
+                    showStatus('NHI credential loaded. Hosts confirmed from configuration.');
+                  } else {
+                    showStatus('NHI credential loaded. Compare hosts from credential with Host List.');
+                  }
+                }
+              } else if (config.confirmedHosts && config.confirmedHosts.length > 0) {
+                // Fallback: Use confirmed hosts from configuration if NHI credential doesn't have hosts
+                confirmedHosts = config.confirmedHosts.map(h => ({ host: h.host, port: h.port }));
+                validatedHosts = config.confirmedHosts.map(h => ({ 
+                  host: h.host, 
+                  port: h.port, 
+                  isValid: true 
+                }));
+                await renderFabricHostList();
+                renderHostChips();
+                const fabricHostInput = el('fabricHost');
+                if (fabricHostInput) {
+                  const hostString = validatedHosts.map(({host, port}) => 
+                    host + (port !== undefined ? ':' + port : '')
+                  ).join(' ');
+                  fabricHostInput.value = hostString;
+                }
+                showStatus('NHI credential loaded. Hosts confirmed from configuration.');
+              } else {
+                showStatus('NHI credential loaded. Compare hosts from credential with Host List.');
+              }
             } else {
               const errText = await res.text().catch(() => 'Failed to load NHI credential');
               showStatus(`Failed to load NHI credential: ${errText}`);
@@ -5855,7 +5882,6 @@ async function restoreConfiguration(config) {
             showStatus('Enter Encryption Password to load NHI credential for this configuration');
           }
         } catch (e) {
-          console.error('Error auto-loading NHI credential:', e);
           showStatus('Error loading NHI credential for configuration');
         }
       }
@@ -5863,13 +5889,11 @@ async function restoreConfiguration(config) {
     const newHostnameInput = el('newHostname');
     if (newHostnameInput && config.newHostname !== undefined) {
       newHostnameInput.value = config.newHostname || '';
-      console.log('Restored newHostname:', config.newHostname);
     }
     
     const chgPassInput = el('chgPass');
     if (chgPassInput && config.chgPass !== undefined) {
       chgPassInput.value = config.chgPass || '';
-      console.log('Restored chgPass');
     }
     
     // Restore SSH profile selection
@@ -5878,14 +5902,12 @@ async function restoreConfiguration(config) {
       // Ensure SSH profiles are loaded first
       await loadSshProfilesForPreparation();
       sshProfileSelect.value = config.sshProfileId || '';
-      console.log('Restored sshProfileId:', config.sshProfileId);
     }
     
     // Restore SSH wait time
     const sshWaitTimeInput = el('sshWaitTime');
     if (sshWaitTimeInput && config.sshWaitTime !== undefined) {
       sshWaitTimeInput.value = config.sshWaitTime || 60;
-      console.log('Restored sshWaitTime:', config.sshWaitTime);
     }
     
     // Update expert mode visibility
@@ -5894,24 +5916,20 @@ async function restoreConfiguration(config) {
       out.style.display = el('expertMode').checked ? 'block' : 'none';
     }
     
-    // Restore confirmed hosts and validated hosts if available
+    // Restore confirmed hosts if not already done during NHI credential loading
+    // This handles cases where NHI credential wasn't loaded or doesn't have hosts
     try {
-      if (config.confirmedHosts && config.confirmedHosts.length > 0) {
-        // Restore confirmed hosts
+      if ((!currentNhiId || confirmedHosts.length === 0) && config.confirmedHosts && config.confirmedHosts.length > 0) {
+        // Restore confirmed hosts from configuration
         confirmedHosts = config.confirmedHosts.map(h => ({ host: h.host, port: h.port }));
-        
-        // Also restore validatedHosts for chip display
         validatedHosts = config.confirmedHosts.map(h => ({ 
           host: h.host, 
           port: h.port, 
           isValid: true 
         }));
-        
-        // Render the host list and chips
         await renderFabricHostList();
         renderHostChips();
-        
-        // Also update the fabricHost input to show the hosts as space-separated
+        const fabricHostInput = el('fabricHost');
         if (fabricHostInput) {
           const hostString = validatedHosts.map(({host, port}) => 
             host + (port !== undefined ? ':' + port : '')
@@ -5919,11 +5937,6 @@ async function restoreConfiguration(config) {
           fabricHostInput.value = hostString;
         }
       } else if (config.fabricHost && fabricHostInput) {
-        // If we have fabricHost string, populate it and parse
-        fabricHostInput.value = config.fabricHost;
-        populateHostsFromInput(config.fabricHost, 'fabricHost', 'fabricHostChips', 'fabricHostStatus');
-        
-        // Parse and confirm hosts from fabricHost input
         const hosts = parseFabricHosts();
         confirmedHosts = hosts.map(h => ({ host: h.host, port: h.port }));
         validatedHosts = hosts.map(h => ({ host: h.host, port: h.port, isValid: true }));
@@ -5932,7 +5945,6 @@ async function restoreConfiguration(config) {
       }
     } catch (err) {
       logMsg(`Warning: Error restoring hosts: ${err.message || err}`);
-      console.error('Error restoring hosts:', err);
     }
     
     // Note: User must load NHI credential with password to decrypt credentials
@@ -5974,23 +5986,11 @@ async function restoreConfiguration(config) {
       cachedTemplates = cacheData.templates || [];
       // Store globally so event handlers can use it to avoid API calls
       window.cachedTemplates = cachedTemplates;
-      console.log('Loaded', cachedTemplates.length, 'cached templates for restoration');
-      
-      // Log sample of cached templates for debugging
-      if (cachedTemplates.length > 0) {
-        console.log('Sample cached templates (first 5):', cachedTemplates.slice(0, 5).map(t => ({
-          repo_name: t.repo_name,
-          template_name: t.template_name,
-          version: t.version
-        })));
-      }
     } catch (error) {
-      console.warn('Could not load cached templates:', error);
     }
     
     // Restore template rows sequentially - use cached templates if API not available
     if (config.templates && config.templates.length > 0) {
-      console.log(`Restoring ${config.templates.length} template row(s)`);
       
       // First, try to populate repositories from cache or API
       const host = getFabricHostPrimary();
@@ -6001,7 +6001,6 @@ async function restoreConfiguration(config) {
       if (cachedTemplates.length > 0) {
         // Get unique repos from cache
         availableRepos = Array.from(new Set(cachedTemplates.map(t => t.repo_name).filter(Boolean))).sort();
-        console.log('Using', availableRepos.length, 'repositories from cache');
       } else if (host && session) {
         // Try to load from API - cookies sent automatically
         try {
@@ -6009,22 +6008,18 @@ async function restoreConfiguration(config) {
           if (reposRes.ok) {
             const reposData = await reposRes.json();
             availableRepos = (reposData.repositories || []).map(r => r.name).filter(Boolean);
-            console.log('Loaded', availableRepos.length, 'repositories from API');
           }
         } catch (err) {
-          console.warn('Could not load repositories from API:', err);
         }
       }
       
       for (let i = 0; i < config.templates.length; i++) {
         try {
           const {repo_name, template_name, version} = config.templates[i];
-          console.log(`Restoring template row ${i + 1}/${config.templates.length}:`, {repo_name, template_name, version});
           
           // Check if repo_name and template_name are valid (non-empty strings)
           // Version can be empty, but if it is, we'll try to restore anyway and let the user select a version
           if (!repo_name || !template_name || (typeof repo_name !== 'string') || (typeof template_name !== 'string')) {
-            console.log(`Skipping incomplete template row ${i + 1}: missing or invalid repo_name or template_name`);
             continue;
           }
           
@@ -6034,7 +6029,6 @@ async function restoreConfiguration(config) {
           const trimmedVersion = (version && typeof version === 'string') ? version.trim() : '';
           
           if (!trimmedRepo || !trimmedTemplate) {
-            console.log(`Skipping incomplete template row ${i + 1}: repo_name or template_name is empty after trimming`);
             continue;
           }
           
@@ -6046,13 +6040,11 @@ async function restoreConfiguration(config) {
           // Add the row first
           try {
             addTplRow({ repo_name: finalRepo, template_name: finalTemplate, version: finalVersion });
-            console.log(`Added template row ${i + 1} with prefill (repo: ${finalRepo}, template: ${finalTemplate}, version: ${finalVersion || 'empty'})`);
             
             // Get the row we just added
             await new Promise(resolve => setTimeout(resolve, 200));
             const rows = document.querySelectorAll('.tpl-row');
             if (rows.length === 0) {
-              console.warn(`Could not find added row ${i + 1}`);
               continue;
             }
             
@@ -6063,7 +6055,6 @@ async function restoreConfiguration(config) {
             const v = selects.length > 2 ? selects[selects.length - 1] : (selects[1] || null);
             
             if (!r || !templateFiltered || !v) {
-              console.warn(`Row ${i + 1} missing required elements (repo, template, or version dropdown)`);
               continue;
             }
             
@@ -6078,7 +6069,6 @@ async function restoreConfiguration(config) {
                   r.appendChild(opt);
                 });
                 r.disabled = false;
-                console.log(`Populated ${availableRepos.length} repositories from cache for row ${i + 1}`);
               }
               
               // Set repo value WITHOUT triggering change event to avoid API calls
@@ -6086,7 +6076,6 @@ async function restoreConfiguration(config) {
                 // Temporarily remove event listeners to prevent API calls
                 const originalValue = r.value;
                 r.value = finalRepo;
-                console.log(`Set repo to ${finalRepo} for row ${i + 1} (no API calls)`);
                 
                 // Ensure repo value persists - add a flag to prevent clearing
                 r._restoredFromCache = true;
@@ -6103,11 +6092,9 @@ async function restoreConfiguration(config) {
                 });
                 templateFiltered.populateOptions(templateOptions);
                 templateFiltered.enable();
-                console.log(`Populated ${uniqueNames.length} templates from cache for repo ${finalRepo}`);
                 
                 // Verify repo value is still set after populateOptions
                 if (r.value !== finalRepo) {
-                  console.warn(`Repo value was cleared! Restoring to ${finalRepo}`);
                   r.value = finalRepo;
                 }
                 
@@ -6125,11 +6112,9 @@ async function restoreConfiguration(config) {
                   if (templateFiltered.datalist) {
                     templateFiltered.updateDatalist();
                   }
-                  console.log(`Set template to ${finalTemplate} for row ${i + 1} (no API calls)`);
                   
                   // Verify repo value is still set after setting template
                   if (r.value !== finalRepo) {
-                    console.warn(`Repo value was cleared after setting template! Restoring to ${finalRepo}`);
                     r.value = finalRepo;
                   }
                   
@@ -6144,14 +6129,11 @@ async function restoreConfiguration(config) {
                     t.version.trim() !== ''
                   );
                   
-                  console.log(`Looking for versions in cache: repo="${finalRepo}", template="${finalTemplate}"`);
-                  console.log(`  Found ${matchingTemplates.length} matching templates:`, matchingTemplates.map(t => ({ repo: t.repo_name, template: t.template_name, version: t.version })));
                   
                   const versions = Array.from(new Set(matchingTemplates.map(t => t.version.trim())))
                     .filter(Boolean)
                     .sort((a, b) => a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' }));
                   
-                  console.log(`  Extracted ${versions.length} unique versions:`, versions);
                   
                   // Clear and populate version dropdown
                   v.innerHTML = '';
@@ -6166,12 +6148,9 @@ async function restoreConfiguration(config) {
                       o.value = ver;
                       o.textContent = ver;
                       v.appendChild(o);
-                      console.log(`    Added version option: ${ver}`);
                     });
                     v.disabled = false;
-                    console.log(`✓ Populated ${versions.length} versions from cache for ${finalRepo}/${finalTemplate}`);
                   } else {
-                    console.warn(`⚠ No versions found in cache for ${finalRepo}/${finalTemplate}`);
                     v.disabled = true;
                   }
                   
@@ -6181,34 +6160,27 @@ async function restoreConfiguration(config) {
                     if (finalVersion && versions.includes(finalVersion)) {
                       await new Promise(resolve => setTimeout(resolve, 100));
                       v.value = finalVersion;
-                      console.log(`✓ Set version to ${finalVersion} for row ${i + 1}`);
                     } else if (finalVersion) {
-                      console.warn(`Version ${finalVersion} not found in cache for ${finalRepo}/${finalTemplate}. Available:`, versions);
                       // Select first version if available
                       if (v.options.length > 1) {
                         v.value = v.options[1].value;
-                        console.log(`✓ Selected first available version: ${v.value} for row ${i + 1}`);
                       }
                     } else {
                       // No version specified in config - select first available
                       if (v.options.length > 1) {
                         v.value = v.options[1].value;
-                        console.log(`✓ Auto-selected first available version: ${v.value} for row ${i + 1} (no version in config)`);
                       }
                     }
                     
                     // Double-check version is set
                     if (!v.value && v.options.length > 1) {
                       v.value = v.options[1].value;
-                      console.log(`✓ Re-check: Set version to ${v.value} for row ${i + 1}`);
                     }
                     
                     // Store that we've set the version to prevent it from being cleared
                     v._versionSetFromCache = true;
                     
-                    console.log(`✓ Final version for row ${i + 1}: ${v.value} (options: ${v.options.length})`);
                   } else {
-                    console.warn(`⚠ Version dropdown has no options for row ${i + 1} (repo: ${finalRepo}, template: ${finalTemplate})`);
                   }
                   
                   // Final verification: ensure repo value is still set
@@ -6217,10 +6189,8 @@ async function restoreConfiguration(config) {
                     r.value = finalRepo;
                   }
                 } else {
-                  console.warn(`Template ${finalTemplate} not found in cache for repo ${finalRepo}`);
                 }
               } else {
-                console.warn(`Repo ${finalRepo} not found in cached repositories`);
               }
               
             } else {
@@ -6229,7 +6199,6 @@ async function restoreConfiguration(config) {
               if (r._loadRepositories) {
                 try {
                   if (host && token) {
-                    console.log(`Loading repositories for row ${i + 1}...`);
                     const loaded = await r._loadRepositories();
                     if (loaded) {
                       // Wait for repos to populate
@@ -6238,11 +6207,9 @@ async function restoreConfiguration(config) {
                         await new Promise(resolve => setTimeout(resolve, 100));
                         repoAttempts++;
                       }
-                      console.log(`Repositories loaded for row ${i + 1}, found ${r.options.length} options`);
                     }
                   }
                 } catch (err) {
-                  console.warn(`Could not load repositories for row ${i + 1}:`, err);
                 }
               }
               
@@ -6257,7 +6224,6 @@ async function restoreConfiguration(config) {
                 }
               } else if (finalRepo) {
                 // No token - skip API calls, just log warning
-                console.warn(`Skipping API calls for row ${i + 1} (no token available). Using cached data only.`);
               }
               
               // Set template value if not already set from cache path above
@@ -6283,19 +6249,15 @@ async function restoreConfiguration(config) {
                   if (host && token) {
                     v.dispatchEvent(new Event('change'));
                   }
-                  console.log(`Set version to ${finalVersion} for row ${i + 1}`);
                 } else {
-                  console.warn(`Version ${finalVersion} not found in dropdown for row ${i + 1}. Available:`, Array.from(v.options).map(o => o.value));
                   // Select first version if available
                   if (v.options.length > 1) {
                     v.value = v.options[1].value;
-                    console.log(`Selected first available version: ${v.value} for row ${i + 1}`);
                   }
                 }
               } else if (v.options.length > 1) {
                 // No version specified - select first available version
                 v.value = v.options[1].value;
-                console.log(`No version specified for row ${i + 1}, selected first available: ${v.value}`);
               }
             }
             
@@ -6305,19 +6267,10 @@ async function restoreConfiguration(config) {
             // Double-check version is set - if not, try to set it again
             if (!v.value && v.options.length > 1) {
               v.value = v.options[1].value;
-              console.log(`✓ Re-check: Set version to ${v.value} for row ${i + 1}`);
             }
-            
-            console.log(`Row ${i + 1} restoration complete. Final values:`, {
-              repo: r.value,
-              template: templateFiltered ? templateFiltered.getValue() : 'N/A',
-              version: v.value || '(empty - this will cause issues!)',
-              versionOptions: v.options.length
-            });
             
             // Ensure repo value is still set before moving to next row
             if (r.value !== finalRepo && finalRepo) {
-              console.warn(`Repo value lost for row ${i + 1}! Restoring to ${finalRepo}`);
               r.value = finalRepo;
             }
             
@@ -6325,23 +6278,19 @@ async function restoreConfiguration(config) {
             await new Promise(resolve => setTimeout(resolve, 300));
           } catch (err) {
             logMsg(`Warning: Error adding template row ${i + 1}: ${err.message || err}`);
-            console.error(`Error adding template row ${i + 1}:`, err);
             continue;
           }
         } catch (err) {
           logMsg(`Warning: Error restoring template row ${i + 1}: ${err.message || err}`);
-          console.error(`Error restoring template row ${i + 1}:`, err);
         }
       }
       
-      console.log(`Finished restoring ${config.templates.length} template row(s)`);
       
       // Shorter wait before updating install select - we've already set all values from cache
       await new Promise(resolve => setTimeout(resolve, 300));
       
       // Verify all rows were restored correctly and ensure versions are set
       const finalRows = document.querySelectorAll('.tpl-row');
-      console.log(`Verification: Found ${finalRows.length} template rows in DOM`);
       
       finalRows.forEach((row, idx) => {
         const selects = row.querySelectorAll('select');
@@ -6357,7 +6306,6 @@ async function restoreConfiguration(config) {
           if (!version && versionSelect.options.length > 1) {
             version = versionSelect.options[1].value;
             versionSelect.value = version;
-            console.log(`✓ Fixed: Set version to ${version} for row ${idx + 1}`);
           }
           
           // Try to populate versions from cache if still empty
@@ -6376,7 +6324,6 @@ async function restoreConfiguration(config) {
                 versionSelect.appendChild(opt);
               });
               versionSelect.value = versions[0];
-              console.log(`✓ Populated and set version to ${versions[0]} for row ${idx + 1}`);
             }
           }
         }
@@ -6386,12 +6333,10 @@ async function restoreConfiguration(config) {
       await new Promise(resolve => setTimeout(resolve, 100));
       
     } else {
-      console.log('No templates to restore in configuration');
     }
     
     // Update install select dropdown with restored templates
     try {
-      console.log('Updating install select dropdown...');
       
       // Call updateInstallSelect to populate dropdown immediately
       updateInstallSelect();
@@ -6406,9 +6351,7 @@ async function restoreConfiguration(config) {
           const option = Array.from(select.options).find(opt => opt.value === config.installSelect);
           if (option) {
             select.value = config.installSelect;
-            console.log('✓ Restored install select value:', config.installSelect);
           } else {
-            console.warn('Install select value not found:', config.installSelect);
             // Set to first option if available
             if (select.options.length > 0) {
               select.value = select.options[0].value;
@@ -6426,17 +6369,14 @@ async function restoreConfiguration(config) {
           const option = Array.from(select.options).find(opt => opt.value === config.installSelect);
           if (option) {
             select.value = config.installSelect;
-            console.log('✓ Restored install select value (retry):', config.installSelect);
           }
         }
       }
     } catch (err) {
       logMsg(`Warning: Error updating install select: ${err.message || err}`);
-      console.error('Error updating install select:', err);
     }
     
     // Bypass all gating conditions - enable all buttons and inputs
-    console.log('Bypassing all gating conditions after configuration restore...');
     
     // Set flag to bypass gating conditions
     bypassGatingConditions = true;
@@ -6445,28 +6385,24 @@ async function restoreConfiguration(config) {
     const btnConfirmHosts = el('btnConfirmHosts');
     if (btnConfirmHosts) {
       btnConfirmHosts.disabled = false;
-      console.log('Enabled Confirm button (gating bypassed)');
     }
     
     // Enable Add Row button (normally disabled until hosts are confirmed)
     const btnAddRow = el('btnAddRow');
     if (btnAddRow) {
       btnAddRow.disabled = false;
-      console.log('Enabled Add Row button (gating bypassed)');
     }
     
     // Enable Run button (normally disabled based on template rows being filled)
     const btnRun = el('btnInstallSelected');
     if (btnRun) {
       btnRun.disabled = false;
-      console.log('Enabled Run button (gating bypassed)');
     }
     
     // Enable Install Select dropdown (normally disabled initially)
     const installSelect = el('installSelect');
     if (installSelect) {
       installSelect.disabled = false;
-      console.log('Enabled Install Select dropdown (gating bypassed)');
     }
     
     // Enable all other buttons that might be disabled by setActionsEnabled
@@ -6702,7 +6638,6 @@ function setupEventButtons() {
       const errorText = await res.text();
       const errorMessage = errorText || `Failed to create event: ${res.status} ${res.statusText}`;
       showStatus(`Failed to create event: ${errorMessage}`);
-      console.error('Event save error:', errorMessage, 'Request payload:', { name, date, time, configId, autoRun });
       return;
     }
     
@@ -6790,7 +6725,6 @@ function setupEventButtons() {
           const errorText = await res.text();
           const errorMessage = errorText || `Failed to update event: ${res.status} ${res.statusText}`;
           showStatus(`Failed to update event: ${errorMessage}`);
-          console.error('Event save error:', errorMessage);
           return;
         }
         
@@ -7073,7 +7007,6 @@ async function handleSaveConfigButton() {
   try {
     config = collectConfiguration();
   } catch (error) {
-    console.error('Error in collectConfiguration:', error);
     showStatus(`Error collecting configuration: ${error.message || error}`);
     return;
   }
@@ -7152,13 +7085,6 @@ async function loadNhiCredentials() {
     
     const data = await res.json();
     const credentials = data.credentials || [];
-    
-    // Debug: Log credentials to see token_lifetime
-    console.log('NHI Credentials loaded:', credentials.map(c => ({
-      name: c.name,
-      client_id: c.client_id,
-      token_lifetime: c.token_lifetime
-    })));
     
     if (credentials.length === 0) {
       nhiList.innerHTML = '<p>No NHI credentials found. Use the form above to create one.</p>';
@@ -7272,7 +7198,6 @@ async function loadNhiCredentials() {
     
   } catch (error) {
     nhiList.innerHTML = `<p style="color: #f87171;">Error loading NHI credentials: ${error.message || error}</p>`;
-    console.error('Error loading NHI credentials:', error);
   }
 }
 
@@ -7562,7 +7487,6 @@ function setupNhiButtons() {
         showNhiStatus(fullMessage, { error: true });
         showStatus(fullMessage, { error: true });
         logMsg(`NHI credential saved: ${name}, but token errors: ${errorMsg}`);
-        console.error('Token retrieval errors:', data.token_errors);
       } else {
         showNhiStatus(data.message || 'NHI credential saved successfully');
     showStatus(data.message || 'NHI credential saved successfully');
@@ -7655,7 +7579,6 @@ function setupNhiButtons() {
         showNhiStatus(fullMessage, { error: true });
         showStatus(fullMessage, { error: true });
         logMsg(`NHI credential updated: ${name} (ID: ${editingNhiId}), but token errors: ${errorMsg}`);
-        console.error('Token retrieval errors:', data.token_errors);
       } else {
         showNhiStatus(data.message || 'NHI credential updated successfully');
     showStatus(data.message || 'NHI credential updated successfully');
@@ -7820,7 +7743,6 @@ async function loadSshKeys() {
     
   } catch (error) {
     sshKeysList.innerHTML = `<p style="color: #f87171;">Error loading SSH keys: ${error.message || error}</p>`;
-    console.error('Error loading SSH keys:', error);
   }
 }
 
@@ -8215,7 +8137,6 @@ async function loadSshCommandProfiles() {
     
   } catch (error) {
     profilesList.innerHTML = `<p style="color: #f87171;">Error loading SSH command profiles: ${error.message || error}</p>`;
-    console.error('Error loading SSH command profiles:', error);
   }
 }
 
@@ -8358,7 +8279,6 @@ async function loadSshKeysForProfile() {
   try {
     const res = await api('/ssh-keys/list');
     if (!res.ok) {
-      console.error('Failed to load SSH keys for profile dropdown');
       return;
     }
     
@@ -8376,7 +8296,6 @@ async function loadSshKeysForProfile() {
       sshKeySelect.appendChild(option);
     });
   } catch (error) {
-    console.error('Error loading SSH keys for profile dropdown:', error);
   }
 }
 
@@ -8621,7 +8540,6 @@ async function loadSshProfilesForPreparation() {
   try {
     const res = await api('/ssh-command-profiles/list');
     if (!res.ok) {
-      console.error('Failed to load SSH profiles for preparation dropdown');
       return;
     }
     
@@ -8639,7 +8557,6 @@ async function loadSshProfilesForPreparation() {
       sshProfileSelect.appendChild(option);
     });
   } catch (error) {
-    console.error('Error loading SSH profiles for preparation dropdown:', error);
   }
 }
 
@@ -8728,7 +8645,7 @@ function setupAuditLogsButtons() {
 }
 
 // Server Logs functions
-let currentServerLogFilters = { method: '', status: '', path: '', user: '', ip: '' };
+let currentServerLogFilters = { level: '', logger_name: '', message: '' };
 
 function setupServerLogsButtons() {
   const refreshBtn = el('btnServerLogsRefresh');
@@ -8742,20 +8659,17 @@ function setupServerLogsButtons() {
 }
 
 function applyServerLogFilters() {
-  currentServerLogFilters.method = (el('serverLogMethod')?.value || '');
-  currentServerLogFilters.status = (el('serverLogStatus')?.value || '');
-  currentServerLogFilters.path = (el('serverLogPath')?.value || '').trim();
-  currentServerLogFilters.user = (el('serverLogUser')?.value || '').trim();
-  currentServerLogFilters.ip = currentServerLogFilters.user;
+  currentServerLogFilters.level = (el('serverLogLevel')?.value || '');
+  currentServerLogFilters.logger_name = (el('serverLogLogger')?.value || '').trim();
+  currentServerLogFilters.message = (el('serverLogMessage')?.value || '').trim();
   loadServerLogs();
 }
 
 function clearServerLogFilters() {
-  if (el('serverLogMethod')) el('serverLogMethod').value = '';
-  if (el('serverLogStatus')) el('serverLogStatus').value = '';
-  if (el('serverLogPath')) el('serverLogPath').value = '';
-  if (el('serverLogUser')) el('serverLogUser').value = '';
-  currentServerLogFilters = { method: '', status: '', path: '', user: '', ip: '' };
+  if (el('serverLogLevel')) el('serverLogLevel').value = '';
+  if (el('serverLogLogger')) el('serverLogLogger').value = '';
+  if (el('serverLogMessage')) el('serverLogMessage').value = '';
+  currentServerLogFilters = { level: '', logger_name: '', message: '' };
   loadServerLogs();
 }
 
@@ -8765,12 +8679,10 @@ async function loadServerLogs() {
   try {
     listEl.innerHTML = '<p>Loading server logs...</p>';
     let url = '/server-logs/list?limit=1000';
-    const { method, status, path, user, ip } = currentServerLogFilters;
-    if (method) url += `&method=${encodeURIComponent(method)}`;
-    if (status) url += `&status=${encodeURIComponent(status)}`;
-    if (path) url += `&path=${encodeURIComponent(path)}`;
-    if (user) url += `&user=${encodeURIComponent(user)}`;
-    if (ip) url += `&ip=${encodeURIComponent(ip)}`;
+    const { level, logger_name, message } = currentServerLogFilters;
+    if (level) url += `&level=${encodeURIComponent(level)}`;
+    if (logger_name) url += `&logger_name=${encodeURIComponent(logger_name)}`;
+    if (message) url += `&message=${encodeURIComponent(message)}`;
     const res = await api(url);
     if (!res.ok) {
       listEl.innerHTML = `<p style="color: #f87171;">Error loading server logs: ${res.statusText}</p>`;
@@ -8785,21 +8697,17 @@ async function loadServerLogs() {
     let html = '<table style="width: 100%; border-collapse: collapse; background: white; border: 1px solid #d2d2d7;">';
     html += '<thead><tr style="background: #f5f5f7; border-bottom: 2px solid #d2d2d7;">';
     html += '<th style="padding: 10px; text-align: left;">Time</th>';
-    html += '<th style="padding: 10px; text-align: left;">Method</th>';
-    html += '<th style="padding: 10px; text-align: left;">Path</th>';
-    html += '<th style="padding: 10px; text-align: left;">Status</th>';
-    html += '<th style="padding: 10px; text-align: left;">Duration</th>';
-    html += '<th style="padding: 10px; text-align: left;">IP</th>';
+    html += '<th style="padding: 10px; text-align: left;">Level</th>';
+    html += '<th style="padding: 10px; text-align: left;">Logger</th>';
+    html += '<th style="padding: 10px; text-align: left;">Message</th>';
     html += '</tr></thead><tbody>';
     logs.forEach(l => {
       const ts = new Date(l.created_at).toLocaleString();
       html += '<tr style="border-bottom: 1px solid #eee;">';
       html += `<td style="padding: 8px; font-size: 12px;">${ts}</td>`;
-      html += `<td style="padding: 8px; font-size: 12px;">${l.method}</td>`;
-      html += `<td style="padding: 8px; font-size: 12px;">${l.path}</td>`;
-      html += `<td style="padding: 8px; font-size: 12px;">${l.status}</td>`;
-      html += `<td style="padding: 8px; font-size: 12px;">${l.duration_ms} ms</td>`;
-      html += `<td style="padding: 8px; font-size: 12px;">${l.ip_address || '-'}</td>`;
+      html += `<td style="padding: 8px; font-size: 12px;">${l.level || '-'}</td>`;
+      html += `<td style="padding: 8px; font-size: 12px;">${l.logger_name || '-'}</td>`;
+      html += `<td style="padding: 8px; font-size: 12px; word-break: break-word;">${l.message || '-'}</td>`;
       html += '</tr>';
     });
     html += '</tbody></table>';
@@ -8811,13 +8719,11 @@ async function loadServerLogs() {
 
 async function exportServerLogs() {
   let url = '/server-logs/export';
-  const { method, status, path, user, ip } = currentServerLogFilters;
+  const { level, logger_name, message } = currentServerLogFilters;
   const params = [];
-  if (method) params.push(`method=${encodeURIComponent(method)}`);
-  if (status) params.push(`status=${encodeURIComponent(status)}`);
-  if (path) params.push(`path=${encodeURIComponent(path)}`);
-  if (user) params.push(`user=${encodeURIComponent(user)}`);
-  if (ip) params.push(`ip=${encodeURIComponent(ip)}`);
+  if (level) params.push(`level=${encodeURIComponent(level)}`);
+  if (logger_name) params.push(`logger_name=${encodeURIComponent(logger_name)}`);
+  if (message) params.push(`message=${encodeURIComponent(message)}`);
   if (params.length) url += '?' + params.join('&');
   const res = await fetch(url);
   if (!res.ok) {
@@ -8912,7 +8818,6 @@ async function loadAuditLogs() {
     logsList.innerHTML = html;
   } catch (error) {
     logsList.innerHTML = `<p style="color: #f87171;">Error loading audit logs: ${error.message || error}</p>`;
-    console.error('Error loading audit logs:', error);
   }
 }
 
@@ -8949,6 +8854,5 @@ async function exportAuditLogs() {
     showStatus('Audit logs exported successfully');
   } catch (error) {
     showStatus(`Error exporting audit logs: ${error.message || error}`);
-    console.error('Error exporting audit logs:', error);
   }
 }

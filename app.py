@@ -50,36 +50,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = FastAPI()
 
-# HTTP request logging middleware (stores basic request/response info)
-@app.middleware("http")
-async def http_logging_middleware(request: Request, call_next):
-    start_time = time.time()
-    response = await call_next(request)
-    duration_ms = int((time.time() - start_time) * 1000)
-    # Avoid logging server log endpoints themselves to reduce noise
-    try:
-        path = request.url.path
-        if not path.startswith("/server-logs"):
-            method = request.method
-            status = response.status_code
-            ip = request.headers.get("X-Forwarded-For", "").split(",")[0].strip() or request.headers.get("X-Real-IP") or (request.client.host if request.client else "unknown")
-            user = None  # No auth users currently; reserved for future
-            # Insert into DB (best-effort; errors ignored)
-            conn = sqlite3.connect(DB_PATH)
-            c = conn.cursor()
-            try:
-                c.execute('''
-                    INSERT INTO http_logs (method, path, status, duration_ms, user, ip_address)
-                    VALUES (?, ?, ?, ?, ?, ?)
-                ''', (method, path, status, duration_ms, user, ip))
-                conn.commit()
-            except Exception:
-                pass
-            finally:
-                conn.close()
-    except Exception:
-        pass
-    return response
+# HTTP request logging middleware removed - now using INFO log handler instead
 
 # Exception handler for request validation errors
 @app.exception_handler(RequestValidationError)
@@ -156,6 +127,35 @@ def get_access_token_from_request(request: Request, fabric_host: str = None) -> 
 
 # Database setup - use environment variable or default to current directory
 DB_PATH = os.environ.get("DB_PATH", "fabricstudio_ui.db")
+
+# Custom logging handler to capture INFO logs to database
+class DatabaseLogHandler(logging.Handler):
+    """Custom logging handler that writes INFO level logs to database"""
+    
+    def emit(self, record):
+        try:
+            # Only log INFO level messages
+            if record.levelno == logging.INFO:
+                conn = sqlite3.connect(DB_PATH)
+                c = conn.cursor()
+                try:
+                    # Format log message
+                    message = self.format(record)
+                    logger_name = record.name
+                    level = record.levelname
+                    created_at = datetime.now(timezone.utc).isoformat()
+                    
+                    c.execute('''
+                        INSERT INTO app_logs (level, logger_name, message, created_at)
+                        VALUES (?, ?, ?, ?)
+                    ''', (level, logger_name, message, created_at))
+                    conn.commit()
+                except Exception:
+                    pass
+                finally:
+                    conn.close()
+        except Exception:
+            pass
 
 def init_db():
     """Initialize the SQLite database with configurations and event_schedules tables"""
@@ -420,22 +420,22 @@ def init_db():
     c.execute('CREATE INDEX IF NOT EXISTS idx_sessions_expires_at ON sessions(expires_at)')
     c.execute('CREATE INDEX IF NOT EXISTS idx_sessions_nhi_credential_id ON sessions(nhi_credential_id)')
 
-    # Create HTTP request logs table
+    # Create application logs table (replaces http_logs)
     c.execute('''
-        CREATE TABLE IF NOT EXISTS http_logs (
+        CREATE TABLE IF NOT EXISTS app_logs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            method TEXT,
-            path TEXT,
-            status INTEGER,
-            duration_ms INTEGER,
-            user TEXT,
-            ip_address TEXT,
+            level TEXT NOT NULL,
+            logger_name TEXT,
+            message TEXT NOT NULL,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     ''')
-    c.execute('CREATE INDEX IF NOT EXISTS idx_http_logs_created_at ON http_logs(created_at)')
-    c.execute('CREATE INDEX IF NOT EXISTS idx_http_logs_status ON http_logs(status)')
-    c.execute('CREATE INDEX IF NOT EXISTS idx_http_logs_method ON http_logs(method)')
+    c.execute('CREATE INDEX IF NOT EXISTS idx_app_logs_created_at ON app_logs(created_at)')
+    c.execute('CREATE INDEX IF NOT EXISTS idx_app_logs_level ON app_logs(level)')
+    c.execute('CREATE INDEX IF NOT EXISTS idx_app_logs_logger_name ON app_logs(logger_name)')
+    
+    # Drop old http_logs table if it exists (replaced by app_logs)
+    c.execute('DROP TABLE IF EXISTS http_logs')
     
     conn.commit()
     conn.close()
@@ -517,10 +517,12 @@ def log_audit(action: str, user: str = None, details: str = None, ip_address: st
                 conn.close()
                 return
         
+        # Use timezone-aware timestamp
+        now_utc = datetime.now(timezone.utc)
         c.execute('''
             INSERT INTO audit_logs (action, user, details, ip_address, created_at)
-            VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
-        ''', (action, user, details, ip_address))
+            VALUES (?, ?, ?, ?, ?)
+        ''', (action, user, details, ip_address, now_utc.isoformat()))
         conn.commit()
         conn.close()
     except Exception as e:
@@ -842,6 +844,13 @@ def get_session_key_temp(session_id: str) -> Optional[bytes]:
 # Initialize database on startup
 init_db()
 
+# Add database handler to root logger after DB is initialized
+db_handler = DatabaseLogHandler()
+db_handler.setLevel(logging.INFO)
+formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
+db_handler.setFormatter(formatter)
+logging.getLogger().addHandler(db_handler)
+
 # Adjust allowed origins to your frontend(s)
 app.add_middleware(
     CORSMiddleware,
@@ -1075,7 +1084,11 @@ def model_fabric_create(request: Request, req: CreateFabricReq):
     token = get_access_token_from_request(request, req.fabric_host)
     if not token:
         raise HTTPException(401, "Missing access_token in session or Authorization header")
+    create_start = datetime.now(timezone.utc)
     result = create_fabric(req.fabric_host, token, req.template_id, req.template_name, req.version)
+    create_end = datetime.now(timezone.utc)
+    create_duration = (create_end - create_start).total_seconds()
+    
     if isinstance(result, tuple):
         success, errors = result
     else:
@@ -1085,7 +1098,7 @@ def model_fabric_create(request: Request, req: CreateFabricReq):
     
     if not success:
         try:
-            log_audit("fabric_create_error", details=f"host={req.fabric_host} template={req.template_name} version={req.version} errors={' ; '.join(errors) if errors else 'unknown'}", ip_address=get_client_ip(request))
+            log_audit("fabric_create_error", details=f"host={req.fabric_host} template={req.template_name} version={req.version} errors={' ; '.join(errors) if errors else 'unknown'} duration_s={create_duration:.1f}", ip_address=get_client_ip(request))
         except Exception:
             pass
         error_msg = "Failed to create fabric"
@@ -1095,7 +1108,7 @@ def model_fabric_create(request: Request, req: CreateFabricReq):
             error_msg += ": creation timed out or encountered an error"
         raise HTTPException(500, error_msg)
     try:
-        log_audit("fabric_created", details=f"host={req.fabric_host} template={req.template_name} version={req.version}", ip_address=get_client_ip(request))
+        log_audit("fabric_created", details=f"host={req.fabric_host} template={req.template_name} version={req.version} duration_s={create_duration:.1f}", ip_address=get_client_ip(request))
     except Exception:
         pass
     return {"status": "ok", "message": "Fabric created successfully"}
@@ -1106,7 +1119,11 @@ def model_fabric_install(request: Request, req: InstallFabricReq):
     token = get_access_token_from_request(request, req.fabric_host)
     if not token:
         raise HTTPException(401, "Missing access_token in session or Authorization header")
+    install_start = datetime.now(timezone.utc)
     result = install_fabric(req.fabric_host, token, req.template_name, req.version)
+    install_end = datetime.now(timezone.utc)
+    install_duration = (install_end - install_start).total_seconds()
+    
     if isinstance(result, tuple):
         success, errors = result
     else:
@@ -1116,7 +1133,7 @@ def model_fabric_install(request: Request, req: InstallFabricReq):
     
     if not success:
         try:
-            log_audit("fabric_install_error", details=f"host={req.fabric_host} template={req.template_name} version={req.version} errors={' ; '.join(errors) if errors else 'unknown'}", ip_address=get_client_ip(request))
+            log_audit("fabric_install_error", details=f"host={req.fabric_host} template={req.template_name} version={req.version} errors={' ; '.join(errors) if errors else 'unknown'} duration_s={install_duration:.1f}", ip_address=get_client_ip(request))
         except Exception:
             pass
         error_msg = "Failed to install fabric"
@@ -1126,7 +1143,7 @@ def model_fabric_install(request: Request, req: InstallFabricReq):
             error_msg += ": installation timed out or encountered an error"
         raise HTTPException(500, error_msg)
     try:
-        log_audit("fabric_installed", details=f"host={req.fabric_host} template={req.template_name} version={req.version}", ip_address=get_client_ip(request))
+        log_audit("fabric_installed", details=f"host={req.fabric_host} template={req.template_name} version={req.version} duration_s={install_duration:.1f}", ip_address=get_client_ip(request))
     except Exception:
         pass
     return {"status": "ok", "message": "Fabric installed successfully"}
@@ -1153,12 +1170,21 @@ def tasks_status(request: Request, fabric_host: str):
 
 
 @app.get("/tasks/errors")
-def tasks_errors(request: Request, fabric_host: str, limit: int = 20):
+def tasks_errors(request: Request, fabric_host: str, limit: int = 20, fabric_name: Optional[str] = None, since_timestamp: Optional[str] = None):
     """Get recent task errors from the FabricStudio host"""
     token = get_access_token_from_request(request, fabric_host)
     if not token:
         raise HTTPException(401, "Missing access_token in session or Authorization header")
-    errors = get_recent_task_errors(fabric_host, token, limit=limit)
+    
+    # Parse since_timestamp if provided
+    since_dt = None
+    if since_timestamp:
+        try:
+            since_dt = datetime.fromisoformat(since_timestamp.replace('Z', '+00:00'))
+        except Exception:
+            pass
+    
+    errors = get_recent_task_errors(fabric_host, token, limit=limit, since_timestamp=since_dt, fabric_name=fabric_name)
     return {"errors": errors, "count": len(errors)}
 
 
@@ -2019,7 +2045,7 @@ def run_configuration(config_data: dict, event_name: str, event_id: Optional[int
     """Execute a configuration (same logic as frontend Run button)"""
     
     execution_record_id = None
-    started_at = datetime.now()
+    started_at = datetime.now(timezone.utc)
     
     try:
         errors = []
@@ -2052,7 +2078,7 @@ def run_configuration(config_data: dict, event_name: str, event_id: Optional[int
         hosts = config_data.get('confirmedHosts', [])
         if not hosts:
             logger.warning(f"No hosts configured for event {event_name}")
-            completed_at = datetime.now()
+            completed_at = datetime.now(timezone.utc)
             if execution_record_id is not None:
                 conn = sqlite3.connect(DB_PATH)
                 c = conn.cursor()
@@ -2184,7 +2210,7 @@ def run_configuration(config_data: dict, event_name: str, event_id: Optional[int
                         msg = f"Failed to acquire token for host {host}"
                         logger.error(f"Event '{event_name}': {msg}")
                         errors.append(msg)
-                        completed_at = datetime.now()
+                        completed_at = datetime.now(timezone.utc)
                         if execution_record_id is not None:
                             conn = sqlite3.connect(DB_PATH)
                             c = conn.cursor()
@@ -2210,7 +2236,7 @@ def run_configuration(config_data: dict, event_name: str, event_id: Optional[int
                     msg = f"Error acquiring token for host {host}: {e}"
                     logger.error(f"Event '{event_name}': {msg}")
                     errors.append(msg)
-                    completed_at = datetime.now()
+                    completed_at = datetime.now(timezone.utc)
                     if execution_record_id is not None:
                         conn = sqlite3.connect(DB_PATH)
                         c = conn.cursor()
@@ -2291,6 +2317,8 @@ def run_configuration(config_data: dict, event_name: str, event_id: Optional[int
                     errors.append(msg)
         
         # Step 3: Create all workspace templates
+        fabric_creation_details = []  # Track fabric creation details
+        failed_hosts = set()  # Track hosts that failed during creation
         if templates_list:
             for template_info in templates_list:
                 template_name = template_info.get('template_name', '')
@@ -2313,25 +2341,47 @@ def run_configuration(config_data: dict, event_name: str, event_id: Optional[int
                 
                 # Create template on all hosts
                 for host in host_tokens.keys():
+                    # Skip hosts that have already failed
+                    if host in failed_hosts:
+                        continue
+                    
                     try:
                         # Get template ID
                         template_id = get_template(host, host_tokens[host], template_name, repo_name, version)
                         if template_id:
                             # Create fabric (pass template name and version per API signature)
+                            fabric_create_start = datetime.now(timezone.utc)
                             result = create_fabric(host, host_tokens[host], template_id, template_name, version)
+                            fabric_create_end = datetime.now(timezone.utc)
+                            fabric_duration = (fabric_create_end - fabric_create_start).total_seconds()
+                            
                             if isinstance(result, tuple):
                                 success, task_errors = result
                             else:
                                 success = result
                                 task_errors = []
                             
+                            # Track fabric creation details
+                            fabric_creation_details.append({
+                                "host": host,
+                                "template_name": template_name,
+                                "repo_name": repo_name,
+                                "version": version,
+                                "success": success,
+                                "duration_seconds": fabric_duration,
+                                "created_at": fabric_create_start.isoformat(),
+                                "errors": task_errors if task_errors else None
+                            })
+                            
                             if success:
                                 # Log audit event for fabric creation in scheduled event
                                 try:
-                                    log_audit("fabric_created", details=f"host={host} template={template_name} version={version} event={event_name}", ip_address=None)
+                                    log_audit("fabric_created", details=f"host={host} template={template_name} version={version} event={event_name} duration_s={fabric_duration:.1f}", ip_address=None)
                                 except Exception:
                                     pass
                             else:
+                                # Mark host as failed - will skip this host for remaining templates and installation
+                                failed_hosts.add(host)
                                 if task_errors:
                                     msg = f"Failed to create template '{template_name}' v{version} on host {host}: " + "; ".join(task_errors)
                                 else:
@@ -2340,11 +2390,15 @@ def run_configuration(config_data: dict, event_name: str, event_id: Optional[int
                                 errors.append(msg)
                                 if task_errors:
                                     errors.extend(task_errors)
+                                # Continue to next host (this host will be skipped in future templates)
+                                continue
                         else:
                             msg = f"Template '{template_name}' v{version} not found on host {host}"
                             logger.error(f"Event '{event_name}': {msg}")
                             errors.append(msg)
                     except Exception as e:
+                        # Mark host as failed on exception
+                        failed_hosts.add(host)
                         msg = f"Error creating template '{template_name}' v{version} on host {host}: {e}"
                         logger.error(f"Event '{event_name}': {msg}")
                         errors.append(msg)
@@ -2424,8 +2478,13 @@ def run_configuration(config_data: dict, event_name: str, event_id: Optional[int
                                     try:
                                         private_key = decrypt_client_secret(encrypted_private_key, encryption_password)
                                         
-                                        # Execute SSH commands on each host
+                                        # Execute SSH commands on each host (skip failed hosts)
                                         for host in host_tokens.keys():
+                                            # Skip hosts that failed during template creation
+                                            if host in failed_hosts:
+                                                logger.info(f"Event '{event_name}': Skipping SSH execution on failed host {host}")
+                                                continue
+                                            
                                             host_result = {
                                                 "host": host,
                                                 "success": False,
@@ -2542,6 +2601,7 @@ def run_configuration(config_data: dict, event_name: str, event_id: Optional[int
                 errors.append(f"Error executing SSH profiles: {e}")
         
         # Step 5: Install selected workspace
+        installation_details = []  # Track installation details
         if install_select:
             template_name, version = install_select.split('|||')
             # Find repo_name from templates list
@@ -2552,37 +2612,69 @@ def run_configuration(config_data: dict, event_name: str, event_id: Optional[int
                     break
             
             if repo_name:
-                for host in host_tokens.keys():
-                    try:
-                        template_id = get_template(host, host_tokens[host], template_name, repo_name, version)
-                        if template_id:
-                            # install_fabric expects template name and version, not id
-                            result = install_fabric(host, host_tokens[host], template_name, version)
-                            if isinstance(result, tuple):
-                                success, task_errors = result
-                            else:
-                                success = result
-                                task_errors = []
-                            
-                            if success:
-                                pass
-                            else:
-                                if task_errors:
-                                    msg = f"Failed to install workspace '{template_name}' v{version} on host {host}: " + "; ".join(task_errors)
+                # Filter out failed hosts
+                available_hosts = [h for h in host_tokens.keys() if h not in failed_hosts]
+                
+                if not available_hosts:
+                    msg = f"All hosts failed during template creation. Skipping installation."
+                    logger.warning(f"Event '{event_name}': {msg}")
+                    errors.append(msg)
+                else:
+                    if failed_hosts:
+                        failed_host_names = ', '.join(failed_hosts)
+                        logger.info(f"Event '{event_name}': Skipping installation on failed hosts: {failed_host_names}. Installing on {len(available_hosts)} remaining host(s).")
+                    
+                    for host in available_hosts:
+                        try:
+                            template_id = get_template(host, host_tokens[host], template_name, repo_name, version)
+                            if template_id:
+                                # install_fabric expects template name and version, not id
+                                install_start = datetime.now(timezone.utc)
+                                result = install_fabric(host, host_tokens[host], template_name, version)
+                                install_end = datetime.now(timezone.utc)
+                                install_duration = (install_end - install_start).total_seconds()
+                                
+                                if isinstance(result, tuple):
+                                    success, task_errors = result
                                 else:
-                                    msg = f"Failed to install workspace '{template_name}' v{version} on host {host}: installation timed out or encountered an error"
+                                    success = result
+                                    task_errors = []
+                                
+                                # Track installation details
+                                installation_details.append({
+                                    "host": host,
+                                    "template_name": template_name,
+                                    "repo_name": repo_name,
+                                    "version": version,
+                                    "success": success,
+                                    "duration_seconds": install_duration,
+                                    "installed_at": install_start.isoformat(),
+                                    "errors": task_errors if task_errors else None
+                                })
+                                
+                                if success:
+                                    # Log audit with duration
+                                    try:
+                                        log_audit("fabric_installed", details=f"host={host} template={template_name} version={version} event={event_name} duration_s={install_duration:.1f}", ip_address=None)
+                                    except Exception:
+                                        pass
+                                else:
+                                    if task_errors:
+                                        msg = f"Failed to install workspace '{template_name}' v{version} on host {host}: " + "; ".join(task_errors)
+                                    else:
+                                        msg = f"Failed to install workspace '{template_name}' v{version} on host {host}: installation timed out or encountered an error"
+                                    logger.error(f"Event '{event_name}': {msg}")
+                                    errors.append(msg)
+                                    if task_errors:
+                                        errors.extend(task_errors)
+                            else:
+                                msg = f"Template '{template_name}' v{version} not found on host {host} for installation"
                                 logger.error(f"Event '{event_name}': {msg}")
                                 errors.append(msg)
-                                if task_errors:
-                                    errors.extend(task_errors)
-                        else:
-                            msg = f"Template '{template_name}' v{version} not found on host {host} for installation"
+                        except Exception as e:
+                            msg = f"Error installing workspace '{template_name}' v{version} on host {host}: {e}"
                             logger.error(f"Event '{event_name}': {msg}")
                             errors.append(msg)
-                    except Exception as e:
-                        msg = f"Error installing workspace '{template_name}' v{version} on host {host}: {e}"
-                        logger.error(f"Event '{event_name}': {msg}")
-                        errors.append(msg)
             else:
                 msg = f"Repository name not found for template '{template_name}' v{version}"
                 logger.warning(f"Event '{event_name}': {msg}")
@@ -2590,7 +2682,7 @@ def run_configuration(config_data: dict, event_name: str, event_id: Optional[int
         else:
             pass
         
-        completed_at = datetime.now()
+        completed_at = datetime.now(timezone.utc)
         
         # Update execution record in database
         if execution_record_id is not None:
@@ -2624,6 +2716,8 @@ def run_configuration(config_data: dict, event_name: str, event_id: Optional[int
                             } for t in (templates_list or []) if isinstance(t, dict)
                         ],
                         "templates_count": len(templates_list),
+                        "fabric_creations": fabric_creation_details,
+                        "fabric_creations_count": len(fabric_creation_details),
                         "installed": (
                             {
                                 "repo_name": repo_name if 'repo_name' in locals() else '',
@@ -2631,9 +2725,13 @@ def run_configuration(config_data: dict, event_name: str, event_id: Optional[int
                                 "version": version if 'version' in locals() else ''
                             } if install_select else None
                         ),
+                        "installations": installation_details,
+                        "installations_count": len(installation_details),
                         "install_select": install_select,
                         "ssh_profile": ssh_execution_details if ssh_execution_details else None,
-                        "duration_seconds": (completed_at - started_at).total_seconds()
+                        "duration_seconds": (completed_at - started_at).total_seconds(),
+                        "started_at": started_at.isoformat(),
+                        "completed_at": completed_at.isoformat()
                     }),
                     execution_record_id
                 ))
@@ -2668,7 +2766,7 @@ def run_configuration(config_data: dict, event_name: str, event_id: Optional[int
         logger.error(f"Error executing configuration for event '{event_name}': {e}", exc_info=True)
         
         # Update execution record with error
-        completed_at = datetime.now()
+        completed_at = datetime.now(timezone.utc)
         if execution_record_id is not None:
             conn = sqlite3.connect(DB_PATH)
             c = conn.cursor()
@@ -3882,33 +3980,27 @@ def export_audit_logs(action: Optional[str] = None, user: Optional[str] = None):
         conn.close()
 
 
-# Server Logs endpoints
+# Server Logs endpoints (now shows INFO level application logs)
 @app.get("/server-logs/list")
-def list_server_logs(method: Optional[str] = None, status: Optional[int] = None, path: Optional[str] = None, user: Optional[str] = None, ip: Optional[str] = None, limit: int = 1000):
+def list_server_logs(level: Optional[str] = None, logger_name: Optional[str] = None, message: Optional[str] = None, limit: int = 1000):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     try:
         query = '''
-            SELECT id, method, path, status, duration_ms, user, ip_address, created_at
-            FROM http_logs
+            SELECT id, level, logger_name, message, created_at
+            FROM app_logs
             WHERE 1=1
         '''
         params = []
-        if method:
-            query += ' AND method = ?'
-            params.append(method)
-        if status is not None:
-            query += ' AND status = ?'
-            params.append(int(status))
-        if path:
-            query += ' AND path LIKE ?'
-            params.append(f'%{path}%')
-        if user:
-            query += ' AND user LIKE ?'
-            params.append(f'%{user}%')
-        if ip:
-            query += ' AND ip_address LIKE ?'
-            params.append(f'%{ip}%')
+        if level:
+            query += ' AND level = ?'
+            params.append(level)
+        if logger_name:
+            query += ' AND logger_name LIKE ?'
+            params.append(f'%{logger_name}%')
+        if message:
+            query += ' AND message LIKE ?'
+            params.append(f'%{message}%')
         query += ' ORDER BY id DESC LIMIT ?'
         params.append(limit)
         c.execute(query, params)
@@ -3916,13 +4008,10 @@ def list_server_logs(method: Optional[str] = None, status: Optional[int] = None,
         logs = [
             {
                 "id": r[0],
-                "method": r[1],
-                "path": r[2],
-                "status": r[3],
-                "duration_ms": r[4],
-                "user": r[5],
-                "ip_address": r[6],
-                "created_at": r[7],
+                "level": r[1],
+                "logger_name": r[2],
+                "message": r[3],
+                "created_at": r[4],
             } for r in rows
         ]
         return {"logs": logs}
@@ -3932,37 +4021,31 @@ def list_server_logs(method: Optional[str] = None, status: Optional[int] = None,
         conn.close()
 
 @app.get("/server-logs/export")
-def export_server_logs(method: Optional[str] = None, status: Optional[int] = None, path: Optional[str] = None, user: Optional[str] = None, ip: Optional[str] = None):
+def export_server_logs(level: Optional[str] = None, logger_name: Optional[str] = None, message: Optional[str] = None):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     try:
         query = '''
-            SELECT created_at, method, path, status, duration_ms, user, ip_address
-            FROM http_logs WHERE 1=1
+            SELECT created_at, level, logger_name, message
+            FROM app_logs WHERE 1=1
         '''
         params = []
-        if method:
-            query += ' AND method = ?'
-            params.append(method)
-        if status is not None:
-            query += ' AND status = ?'
-            params.append(int(status))
-        if path:
-            query += ' AND path LIKE ?'
-            params.append(f'%{path}%')
-        if user:
-            query += ' AND user LIKE ?'
-            params.append(f'%{user}%')
-        if ip:
-            query += ' AND ip_address LIKE ?'
-            params.append(f'%{ip}%')
+        if level:
+            query += ' AND level = ?'
+            params.append(level)
+        if logger_name:
+            query += ' AND logger_name LIKE ?'
+            params.append(f'%{logger_name}%')
+        if message:
+            query += ' AND message LIKE ?'
+            params.append(f'%{message}%')
         query += ' ORDER BY id DESC'
         c.execute(query, params)
         rows = c.fetchall()
         import csv, io
         buf = io.StringIO()
         w = csv.writer(buf)
-        w.writerow(["Timestamp", "Method", "Path", "Status", "Duration(ms)", "User", "IP"])
+        w.writerow(["Timestamp", "Level", "Logger", "Message"])
         for r in rows:
             w.writerow(r)
         from fastapi.responses import Response

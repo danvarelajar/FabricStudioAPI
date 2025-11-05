@@ -1,29 +1,18 @@
 <div id="server-logs-section" class="content-section">
   <h3>Server Logs</h3>
   <div style="margin-bottom: 10px; display: grid; grid-template-columns: 60px 160px 60px 120px 60px 1fr; gap: 10px; align-items: center;">
-    <label>Status</label>
-    <select id="serverLogStatus" style="width: 160px;">
+    <label>Level</label>
+    <select id="serverLogLevel" style="width: 160px;">
       <option value="">All</option>
-      <option value="200">200</option>
-      <option value="400">400</option>
-      <option value="401">401</option>
-      <option value="403">403</option>
-      <option value="404">404</option>
-      <option value="500">500</option>
+      <option>INFO</option>
+      <option>WARNING</option>
+      <option>ERROR</option>
+      <option>DEBUG</option>
     </select>
-    <label>Method</label>
-    <select id="serverLogMethod" style="width: 120px;">
-      <option value="">All</option>
-      <option>GET</option>
-      <option>POST</option>
-      <option>PUT</option>
-      <option>DELETE</option>
-      <option>PATCH</option>
-    </select>
-    <label>Path</label>
-    <input id="serverLogPath" type="text" placeholder="/api/..." style="width: 100%;" />
-    <label>User/IP</label>
-    <input id="serverLogUser" type="text" placeholder="user or IP" style="width: 100%;" />
+    <label>Logger</label>
+    <input id="serverLogLogger" type="text" placeholder="logger name" style="width: 120px;" />
+    <label>Message</label>
+    <input id="serverLogMessage" type="text" placeholder="search message..." style="width: 100%;" />
   </div>
   <div style="margin-bottom: 16px; display: flex; gap: 8px;">
     <button id="btnServerLogsApply">Apply</button>
