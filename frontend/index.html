@@ -3,7 +3,7 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>FabricStudio UI</title>
+    <title>FabricStudio Assistant</title>
     <link rel="stylesheet" href="styles.css">
   </head>
   <body>
@@ -11,7 +11,7 @@
       <aside class="sidebar">
         <h2 class="sidebar-title">
           <img src="/frontend/images/Fortinet-logomark-rgb-red.svg" alt="Fortinet" style="height: 56px; width: auto; vertical-align: middle; margin-right: -8px; margin-left: -20px;" />
-          <span style="margin-left: -4px;">FabricStudio UI</span>
+          <span style="margin-left: 4px;">FabricStudio Assistant</span>
         </h2>
         <nav class="sidebar-nav">
           <button type="button" class="menu-item active" data-section="preparation">FabricStudio Preparation</button>
@@ -34,6 +34,16 @@
             <div class="submenu" id="nhi-management-submenu">
               <button type="button" class="menu-item submenu-item" data-section="nhi-management">NHI Credentials</button>
               <button type="button" class="menu-item submenu-item" data-section="ssh-keys">SSH Keys</button>
+            </div>
+          </div>
+          <div class="menu-group">
+            <button type="button" class="menu-item menu-parent" data-section="logs" id="logs-menu">
+              Logs
+              <span class="menu-arrow"></span>
+            </button>
+            <div class="submenu" id="logs-submenu">
+              <button type="button" class="menu-item submenu-item" data-section="audit-logs">Audit Logs</button>
+              <button type="button" class="menu-item submenu-item" data-section="server-logs">Server Logs</button>
             </div>
           </div>
         </nav>

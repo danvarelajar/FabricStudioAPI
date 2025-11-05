@@ -1,0 +1,45 @@
+<div id="audit-logs-section" class="content-section">
+  <h3>Audit Logs</h3>
+  <div style="margin-bottom: 20px;">
+    <div class="row" style="margin-bottom: 16px;">
+      <label style="width: 120px;">Filter by Action:</label>
+      <select id="filterAction" style="width: 200px;">
+        <option value="">All Actions</option>
+        <option value="configuration_saved">Configuration Saved</option>
+        <option value="configuration_loaded">Configuration Loaded</option>
+        <option value="configuration_deleted">Configuration Deleted</option>
+        <option value="event_created">Event Created</option>
+        <option value="event_updated">Event Updated</option>
+        <option value="event_deleted">Event Deleted</option>
+        <option value="event_executed">Event Executed</option>
+        <option value="nhi_credential_created">NHI Credential Created</option>
+        <option value="nhi_credential_updated">NHI Credential Updated</option>
+        <option value="nhi_credential_deleted">NHI Credential Deleted</option>
+        <option value="nhi_token_refreshed">NHI Token Refreshed</option>
+        <option value="ssh_key_created">SSH Key Created</option>
+        <option value="ssh_key_updated">SSH Key Updated</option>
+        <option value="ssh_key_deleted">SSH Key Deleted</option>
+        <option value="ssh_profile_created">SSH Profile Created</option>
+        <option value="ssh_profile_updated">SSH Profile Updated</option>
+        <option value="ssh_profile_deleted">SSH Profile Deleted</option>
+        <option value="fabric_created">Fabric Created</option>
+        <option value="fabric_installed">Fabric Installed</option>
+        <option value="hostname_changed">Hostname Changed</option>
+        <option value="password_changed">Password Changed</option>
+        <option value="fabric_reset">Fabric Reset</option>
+      </select>
+      <label style="width: 120px; margin-left: 20px;">Filter by User:</label>
+      <input id="filterUser" type="text" placeholder="Filter by user..." style="width: 200px;" />
+      <button id="btnApplyFilter" style="margin-left: 12px;">Apply Filters</button>
+      <button id="btnClearFilter" style="margin-left: 8px;">Clear</button>
+    </div>
+    <div class="row">
+      <button id="btnRefreshAuditLogs">Refresh</button>
+      <button id="btnExportLogs" style="margin-left: 8px;">Export CSV</button>
+    </div>
+  </div>
+  <div id="auditLogsList" style="margin-top: 16px;">
+    <p>Loading audit logs...</p>
+  </div>
+</div>
+

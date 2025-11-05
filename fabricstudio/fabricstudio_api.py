@@ -52,9 +52,10 @@ def check_tasks(fabric_host, access_token, display_progress=False):
             logger.error("Error parsing polling response as JSON")
             break
         current_count = data.get("page", {}).get("count", 0)
-        # Log progress when the count changes or every 10 seconds of waiting
+        # Reduce verbosity: only log start/finish at INFO level
+        # Keep progress as DEBUG (optional visibility without cluttering INFO logs)
         if current_count != previous_count or (waited - last_progress_log) >= 10:
-            logger.info("Tasks running: %d, waited %ds", current_count, waited)
+            logger.debug("Tasks running: %d, waited %ds", current_count, waited)
             previous_count = current_count
             last_progress_log = waited
         if display_progress:

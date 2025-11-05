@@ -50,6 +50,37 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = FastAPI()
 
+# HTTP request logging middleware (stores basic request/response info)
+@app.middleware("http")
+async def http_logging_middleware(request: Request, call_next):
+    start_time = time.time()
+    response = await call_next(request)
+    duration_ms = int((time.time() - start_time) * 1000)
+    # Avoid logging server log endpoints themselves to reduce noise
+    try:
+        path = request.url.path
+        if not path.startswith("/server-logs"):
+            method = request.method
+            status = response.status_code
+            ip = request.headers.get("X-Forwarded-For", "").split(",")[0].strip() or request.headers.get("X-Real-IP") or (request.client.host if request.client else "unknown")
+            user = None  # No auth users currently; reserved for future
+            # Insert into DB (best-effort; errors ignored)
+            conn = sqlite3.connect(DB_PATH)
+            c = conn.cursor()
+            try:
+                c.execute('''
+                    INSERT INTO http_logs (method, path, status, duration_ms, user, ip_address)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                ''', (method, path, status, duration_ms, user, ip))
+                conn.commit()
+            except Exception:
+                pass
+            finally:
+                conn.close()
+    except Exception:
+        pass
+    return response
+
 # Exception handler for request validation errors
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
@@ -343,6 +374,21 @@ def init_db():
         )
     ''')
     
+    # Create audit_logs table to track all application activities
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS audit_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            action TEXT NOT NULL,
+            user TEXT,
+            details TEXT,
+            ip_address TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    c.execute('CREATE INDEX IF NOT EXISTS idx_audit_logs_action ON audit_logs(action)')
+    c.execute('CREATE INDEX IF NOT EXISTS idx_audit_logs_created_at ON audit_logs(created_at)')
+    c.execute('CREATE INDEX IF NOT EXISTS idx_audit_logs_user ON audit_logs(user)')
+    
     # Create table to store execution records for scheduled events
     c.execute('''
         CREATE TABLE IF NOT EXISTS event_executions (
@@ -373,6 +419,23 @@ def init_db():
     ''')
     c.execute('CREATE INDEX IF NOT EXISTS idx_sessions_expires_at ON sessions(expires_at)')
     c.execute('CREATE INDEX IF NOT EXISTS idx_sessions_nhi_credential_id ON sessions(nhi_credential_id)')
+
+    # Create HTTP request logs table
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS http_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            method TEXT,
+            path TEXT,
+            status INTEGER,
+            duration_ms INTEGER,
+            user TEXT,
+            ip_address TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    c.execute('CREATE INDEX IF NOT EXISTS idx_http_logs_created_at ON http_logs(created_at)')
+    c.execute('CREATE INDEX IF NOT EXISTS idx_http_logs_status ON http_logs(status)')
+    c.execute('CREATE INDEX IF NOT EXISTS idx_http_logs_method ON http_logs(method)')
     
     conn.commit()
     conn.close()
@@ -431,6 +494,35 @@ def decrypt_with_server_secret(ciphertext_b64: str) -> str:
     enc_bytes = base64.urlsafe_b64decode(ciphertext_b64.encode())
     dec = f.decrypt(enc_bytes)
     return dec.decode()
+
+# Audit logging helper function
+def log_audit(action: str, user: str = None, details: str = None, ip_address: str = None):
+    """Log an audit event to the database"""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute('''
+            INSERT INTO audit_logs (action, user, details, ip_address, created_at)
+            VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+        ''', (action, user, details, ip_address))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logger.error(f"Failed to log audit event: {e}", exc_info=True)
+
+def get_client_ip(request: Request) -> str:
+    """Extract client IP address from request"""
+    # Check for forwarded IP first (for proxies/load balancers)
+    forwarded_for = request.headers.get("X-Forwarded-For")
+    if forwarded_for:
+        return forwarded_for.split(",")[0].strip()
+    real_ip = request.headers.get("X-Real-IP")
+    if real_ip:
+        return real_ip
+    # Fallback to direct client
+    if request.client:
+        return request.client.host
+    return "unknown"
 
 # Session Management Functions
 def generate_session_id() -> str:
@@ -834,6 +926,14 @@ def serve_ssh_keys():
 def serve_ssh_command_profiles():
     return FileResponse("frontend/ssh-command-profiles.html", media_type="text/html")
 
+@app.get("/frontend/server-logs.html")
+def serve_server_logs_page():
+    return FileResponse("frontend/server-logs.html", media_type="text/html")
+
+@app.get("/frontend/audit-logs.html")
+def serve_audit_logs():
+    return FileResponse("frontend/audit-logs.html", media_type="text/html")
+
 
 class TokenReq(BaseModel):
     client_id: str
@@ -968,12 +1068,20 @@ def model_fabric_create(request: Request, req: CreateFabricReq):
         errors = []
     
     if not success:
+        try:
+            log_audit("fabric_create_error", details=f"host={req.fabric_host} template={req.template_name} version={req.version} errors={' ; '.join(errors) if errors else 'unknown'}", ip_address=get_client_ip(request))
+        except Exception:
+            pass
         error_msg = "Failed to create fabric"
         if errors:
             error_msg += ": " + "; ".join(errors)
         else:
             error_msg += ": creation timed out or encountered an error"
         raise HTTPException(500, error_msg)
+    try:
+        log_audit("fabric_created", details=f"host={req.fabric_host} template={req.template_name} version={req.version}", ip_address=get_client_ip(request))
+    except Exception:
+        pass
     return {"status": "ok", "message": "Fabric created successfully"}
 
 
@@ -991,12 +1099,20 @@ def model_fabric_install(request: Request, req: InstallFabricReq):
         errors = []
     
     if not success:
+        try:
+            log_audit("fabric_install_error", details=f"host={req.fabric_host} template={req.template_name} version={req.version} errors={' ; '.join(errors) if errors else 'unknown'}", ip_address=get_client_ip(request))
+        except Exception:
+            pass
         error_msg = "Failed to install fabric"
         if errors:
             error_msg += ": " + "; ".join(errors)
         else:
             error_msg += ": installation timed out or encountered an error"
         raise HTTPException(500, error_msg)
+    try:
+        log_audit("fabric_installed", details=f"host={req.fabric_host} template={req.template_name} version={req.version}", ip_address=get_client_ip(request))
+    except Exception:
+        pass
     return {"status": "ok", "message": "Fabric installed successfully"}
 
 
@@ -1403,7 +1519,7 @@ class ConfigListItem(BaseModel):
 
 
 @app.post("/config/save")
-def save_config(req: SaveConfigReq):
+def save_config(req: SaveConfigReq, request: Request):
     """Save a configuration with a name, using ID for updates"""
     if not req.name or not req.name.strip():
         raise HTTPException(400, "Name is required")
@@ -1426,6 +1542,7 @@ def save_config(req: SaveConfigReq):
                 WHERE id = ?
             ''', (req.name.strip(), json.dumps(req.config_data), req.id))
             action = "updated"
+            log_action = "configuration_updated"
         else:
             # Insert new configuration
             c.execute('''
@@ -1433,9 +1550,14 @@ def save_config(req: SaveConfigReq):
                 VALUES (?, ?, CURRENT_TIMESTAMP)
             ''', (req.name.strip(), json.dumps(req.config_data)))
             action = "saved"
+            log_action = "configuration_saved"
         
         conn.commit()
         config_id = req.id if req.id is not None else c.lastrowid
+        
+        # Log audit event
+        log_audit(log_action, details=f"Configuration '{req.name}' (ID: {config_id})", ip_address=get_client_ip(request))
+        
         return {
             "status": "ok", 
             "message": f"Configuration '{req.name}' {action} successfully",
@@ -1511,17 +1633,25 @@ def get_config(config_id: int):
 
 
 @app.delete("/config/delete/{config_id}")
-def delete_config(config_id: int):
+def delete_config(config_id: int, request: Request):
     """Delete a configuration by ID"""
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     
     try:
+        # Get config name before deleting for audit log
+        c.execute('SELECT name FROM configurations WHERE id = ?', (config_id,))
+        config_row = c.fetchone()
+        config_name = config_row[0] if config_row else f"ID {config_id}"
+        
         c.execute('DELETE FROM configurations WHERE id = ?', (config_id,))
         conn.commit()
         
         if c.rowcount == 0:
             raise HTTPException(404, f"Configuration with id {config_id} not found")
+        
+        # Log audit event
+        log_audit("configuration_deleted", details=f"Configuration '{config_name}' (ID: {config_id})", ip_address=get_client_ip(request))
         
         return {"status": "ok", "message": f"Configuration {config_id} deleted successfully"}
     except sqlite3.Error as e:
@@ -1553,7 +1683,7 @@ class EventListItem(BaseModel):
 
 
 @app.post("/event/save")
-def save_event(req: CreateEventReq):
+def save_event(req: CreateEventReq, request: Request):
     """Save an event schedule"""
     if not req.name or not req.name.strip():
         raise HTTPException(400, "Event name is required")
@@ -1640,6 +1770,12 @@ def save_event(req: CreateEventReq):
             logger.error(f"Error storing NHI password for event {event_id}: {e}", exc_info=True)
         
         conn.commit()
+        
+        # Log audit event
+        log_action = "event_created" if action == "saved" else "event_updated"
+        config_name = config[1] if config else f"ID {req.configuration_id}"
+        log_audit(log_action, details=f"Event '{req.name}' (ID: {event_id}) - Configuration: {config_name}", ip_address=get_client_ip(request))
+        
         return {"status": "ok", "message": f"Event '{req.name}' {action} successfully", "id": event_id}
     except sqlite3.Error as e:
         conn.rollback()
@@ -1741,17 +1877,25 @@ def get_event(event_id: int):
 
 
 @app.delete("/event/delete/{event_id}")
-def delete_event(event_id: int):
+def delete_event(event_id: int, request: Request):
     """Delete an event by ID"""
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     
     try:
+        # Get event name before deleting for audit log
+        c.execute('SELECT name FROM event_schedules WHERE id = ?', (event_id,))
+        event_row = c.fetchone()
+        event_name = event_row[0] if event_row else f"ID {event_id}"
+        
         c.execute('DELETE FROM event_schedules WHERE id = ?', (event_id,))
         conn.commit()
         
         if c.rowcount == 0:
             raise HTTPException(404, f"Event with id {event_id} not found")
+        
+        # Log audit event
+        log_audit("event_deleted", details=f"Event '{event_name}' (ID: {event_id})", ip_address=get_client_ip(request))
         
         return {"status": "ok", "message": f"Event {event_id} deleted successfully"}
     except sqlite3.Error as e:
@@ -1875,6 +2019,15 @@ def run_configuration(config_data: dict, event_name: str, event_id: Optional[int
                 ''', (event_id, 'running', started_at.isoformat()))
                 execution_record_id = c.lastrowid
                 conn.commit()
+                # Audit: event run started
+                try:
+                    log_audit(
+                        "event_run_started",
+                        details=f"event_id={event_id} event_name={event_name}",
+                        ip_address=None
+                    )
+                except Exception:
+                    pass
             except sqlite3.Error as e:
                 logger.error(f"Failed to create execution record: {e}")
             finally:
@@ -2465,6 +2618,23 @@ def run_configuration(config_data: dict, event_name: str, event_id: Optional[int
                     execution_record_id
                 ))
                 conn.commit()
+                # Audit: event run finished
+                try:
+                    duration = int((completed_at - started_at).total_seconds())
+                    if errors:
+                        log_audit(
+                            "event_run_failed",
+                            details=f"event_id={event_id} event_name={event_name} duration_s={duration} errors_count={len(errors)}",
+                            ip_address=None
+                        )
+                    else:
+                        log_audit(
+                            "event_run_succeeded",
+                            details=f"event_id={event_id} event_name={event_name} duration_s={duration} hosts_count={len(hosts)}",
+                            ip_address=None
+                        )
+                except Exception:
+                    pass
             except sqlite3.Error as e:
                 logger.error(f"Failed to update execution record: {e}")
             finally:
@@ -2508,6 +2678,16 @@ def run_configuration(config_data: dict, event_name: str, event_id: Optional[int
                     execution_record_id
                 ))
                 conn.commit()
+                # Audit: event run failed (exception path)
+                try:
+                    duration = int((completed_at - started_at).total_seconds())
+                    log_audit(
+                        "event_run_failed",
+                        details=f"event_id={event_id} event_name={event_name} duration_s={duration} error={str(e)}",
+                        ip_address=None
+                    )
+                except Exception:
+                    pass
             except sqlite3.Error as db_err:
                 logger.error(f"Failed to update execution record with error: {db_err}")
             finally:
@@ -2600,6 +2780,14 @@ def save_ssh_key(req: SaveSshKeyReq):
             ssh_key_id = c.lastrowid
         
         conn.commit()
+        # Audit
+        try:
+            log_audit(
+                "ssh_key_created" if action == "saved" else "ssh_key_updated",
+                details=f"ssh_key_id={ssh_key_id} name={name_stripped}"
+            )
+        except Exception:
+            pass
         return {"status": "ok", "message": f"SSH key {action} successfully", "id": ssh_key_id}
     except sqlite3.IntegrityError as e:
         conn.rollback()
@@ -2701,6 +2889,11 @@ def delete_ssh_key(ssh_key_id: int):
         
         c.execute('DELETE FROM ssh_keys WHERE id = ?', (ssh_key_id,))
         conn.commit()
+        # Audit
+        try:
+            log_audit("ssh_key_deleted", details=f"ssh_key_id={ssh_key_id}")
+        except Exception:
+            pass
         return {"status": "ok", "message": "SSH key deleted successfully"}
     except HTTPException:
         raise
@@ -2772,6 +2965,14 @@ def save_ssh_command_profile(req: SaveSshCommandProfileReq):
             profile_id = c.lastrowid
         
         conn.commit()
+        # Audit
+        try:
+            log_audit(
+                "ssh_profile_created" if action == "saved" else "ssh_profile_updated",
+                details=f"profile_id={profile_id} name={name_stripped} ssh_key_id={req.ssh_key_id or ''}"
+            )
+        except Exception:
+            pass
         return {"status": "ok", "message": f"SSH command profile {action} successfully", "id": profile_id}
     except sqlite3.IntegrityError as e:
         conn.rollback()
@@ -2873,6 +3074,11 @@ def delete_ssh_command_profile(profile_id: int):
         
         c.execute('DELETE FROM ssh_command_profiles WHERE id = ?', (profile_id,))
         conn.commit()
+        # Audit
+        try:
+            log_audit("ssh_profile_deleted", details=f"profile_id={profile_id}")
+        except Exception:
+            pass
         return {"status": "ok", "message": "SSH command profile deleted successfully"}
     except HTTPException:
         raise
@@ -3041,6 +3247,15 @@ async def execute_ssh_profile(req: ExecuteSshProfileReq):
             if errors:
                 success = False
             
+            # Audit SSH execution
+            try:
+                log_audit(
+                    "ssh_profile_executed",
+                    details=f"host={req.fabric_host} profile_id={req.ssh_profile_id} key_name={key_name} success={success}"
+                )
+            except Exception:
+                pass
+            
             return {
                 "success": success,
                 "output": output,
@@ -3094,7 +3309,7 @@ class GetNhiReq(BaseModel):
 
 
 @app.post("/nhi/save")
-def save_nhi(req: SaveNhiReq):
+def save_nhi(req: SaveNhiReq, request: Request):
     """Save or update an NHI credential"""
     import re
     
@@ -3241,6 +3456,10 @@ def save_nhi(req: SaveNhiReq):
             message += f" ({tokens_stored} token(s) stored for {tokens_stored} host(s))"
         elif hosts_to_process:
             message += " (No tokens stored - check hosts and credentials)"
+        
+        # Log audit event
+        log_action = "nhi_credential_created" if action == "saved" else "nhi_credential_updated"
+        log_audit(log_action, details=f"NHI credential '{name_stripped}' (ID: {nhi_id})", ip_address=get_client_ip(request))
         
         # Include errors in response if any occurred
         response = {"status": "ok", "message": message, "id": nhi_id}
@@ -3542,6 +3761,197 @@ def delete_nhi(nhi_id: int):
         conn.close()
 
 
+# Audit Logs endpoints
+@app.get("/audit-logs/list")
+def list_audit_logs(action: Optional[str] = None, user: Optional[str] = None, limit: int = 1000):
+    """List audit logs with optional filtering"""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    
+    try:
+        query = '''
+            SELECT id, action, user, details, ip_address, created_at
+            FROM audit_logs
+            WHERE 1=1
+        '''
+        params = []
+        
+        if action:
+            query += ' AND action = ?'
+            params.append(action)
+        
+        if user:
+            query += ' AND user LIKE ?'
+            params.append(f'%{user}%')
+        
+        query += ' ORDER BY created_at DESC LIMIT ?'
+        params.append(limit)
+        
+        c.execute(query, params)
+        rows = c.fetchall()
+        
+        logs = []
+        for row in rows:
+            logs.append({
+                "id": row[0],
+                "action": row[1],
+                "user": row[2],
+                "details": row[3],
+                "ip_address": row[4],
+                "created_at": row[5]
+            })
+        
+        return {"logs": logs}
+    except sqlite3.Error as e:
+        raise HTTPException(500, f"Database error: {str(e)}")
+    finally:
+        conn.close()
+
+@app.post("/audit-logs/create")
+def create_audit_log(request: Request, action: str, user: Optional[str] = None, details: Optional[str] = None):
+    """Create an audit log entry"""
+    ip_address = get_client_ip(request)
+    log_audit(action, user, details, ip_address)
+    return {"status": "ok", "message": "Audit log created"}
+
+@app.get("/audit-logs/export")
+def export_audit_logs(action: Optional[str] = None, user: Optional[str] = None):
+    """Export audit logs as CSV"""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    
+    try:
+        query = '''
+            SELECT action, user, details, ip_address, created_at
+            FROM audit_logs
+            WHERE 1=1
+        '''
+        params = []
+        
+        if action:
+            query += ' AND action = ?'
+            params.append(action)
+        
+        if user:
+            query += ' AND user LIKE ?'
+            params.append(f'%{user}%')
+        
+        query += ' ORDER BY created_at DESC'
+        
+        c.execute(query, params)
+        rows = c.fetchall()
+        
+        import csv
+        import io
+        output = io.StringIO()
+        writer = csv.writer(output)
+        writer.writerow(['Action', 'User', 'Details', 'IP Address', 'Created At'])
+        
+        for row in rows:
+            writer.writerow(row)
+        
+        from fastapi.responses import Response
+        return Response(
+            content=output.getvalue(),
+            media_type="text/csv",
+            headers={"Content-Disposition": "attachment; filename=audit_logs.csv"}
+        )
+    except sqlite3.Error as e:
+        raise HTTPException(500, f"Database error: {str(e)}")
+    finally:
+        conn.close()
+
+
+# Server Logs endpoints
+@app.get("/server-logs/list")
+def list_server_logs(method: Optional[str] = None, status: Optional[int] = None, path: Optional[str] = None, user: Optional[str] = None, ip: Optional[str] = None, limit: int = 1000):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    try:
+        query = '''
+            SELECT id, method, path, status, duration_ms, user, ip_address, created_at
+            FROM http_logs
+            WHERE 1=1
+        '''
+        params = []
+        if method:
+            query += ' AND method = ?'
+            params.append(method)
+        if status is not None:
+            query += ' AND status = ?'
+            params.append(int(status))
+        if path:
+            query += ' AND path LIKE ?'
+            params.append(f'%{path}%')
+        if user:
+            query += ' AND user LIKE ?'
+            params.append(f'%{user}%')
+        if ip:
+            query += ' AND ip_address LIKE ?'
+            params.append(f'%{ip}%')
+        query += ' ORDER BY id DESC LIMIT ?'
+        params.append(limit)
+        c.execute(query, params)
+        rows = c.fetchall()
+        logs = [
+            {
+                "id": r[0],
+                "method": r[1],
+                "path": r[2],
+                "status": r[3],
+                "duration_ms": r[4],
+                "user": r[5],
+                "ip_address": r[6],
+                "created_at": r[7],
+            } for r in rows
+        ]
+        return {"logs": logs}
+    except sqlite3.Error as e:
+        raise HTTPException(500, f"Database error: {str(e)}")
+    finally:
+        conn.close()
+
+@app.get("/server-logs/export")
+def export_server_logs(method: Optional[str] = None, status: Optional[int] = None, path: Optional[str] = None, user: Optional[str] = None, ip: Optional[str] = None):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    try:
+        query = '''
+            SELECT created_at, method, path, status, duration_ms, user, ip_address
+            FROM http_logs WHERE 1=1
+        '''
+        params = []
+        if method:
+            query += ' AND method = ?'
+            params.append(method)
+        if status is not None:
+            query += ' AND status = ?'
+            params.append(int(status))
+        if path:
+            query += ' AND path LIKE ?'
+            params.append(f'%{path}%')
+        if user:
+            query += ' AND user LIKE ?'
+            params.append(f'%{user}%')
+        if ip:
+            query += ' AND ip_address LIKE ?'
+            params.append(f'%{ip}%')
+        query += ' ORDER BY id DESC'
+        c.execute(query, params)
+        rows = c.fetchall()
+        import csv, io
+        buf = io.StringIO()
+        w = csv.writer(buf)
+        w.writerow(["Timestamp", "Method", "Path", "Status", "Duration(ms)", "User", "IP"])
+        for r in rows:
+            w.writerow(r)
+        from fastapi.responses import Response
+        return Response(content=buf.getvalue(), media_type="text/csv", headers={"Content-Disposition": "attachment; filename=server_logs.csv"})
+    except sqlite3.Error as e:
+        raise HTTPException(500, f"Database error: {str(e)}")
+    finally:
+        conn.close()
+
 @app.delete("/nhi/delete/{nhi_id}")
 def delete_nhi(nhi_id: int):
     """Delete an NHI credential by ID"""
@@ -3736,9 +4146,121 @@ def revoke_session_endpoint(request: Request):
     
     return response
 
+def refresh_nhi_tokens():
+    """Refresh NHI tokens from nhi_tokens table for credentials with stored event passwords"""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        try:
+            now = datetime.now()
+            # Check tokens expiring within 5 minutes (or already expired)
+            threshold_time = now + timedelta(minutes=5)
+            
+            # Get all NHI tokens that are expiring soon or already expired
+            c.execute('''
+                SELECT nhi_credential_id, fabric_host, token_expires_at
+                FROM nhi_tokens
+                WHERE token_expires_at <= ?
+            ''', (threshold_time.isoformat(),))
+            
+            expiring_tokens = c.fetchall()
+            
+            if not expiring_tokens:
+                return 0  # No tokens to refresh
+            
+            refreshed_count = 0
+            
+            # Group tokens by credential ID to batch password lookups
+            tokens_by_credential = {}
+            for nhi_cred_id, fabric_host, token_expires_at in expiring_tokens:
+                if nhi_cred_id not in tokens_by_credential:
+                    tokens_by_credential[nhi_cred_id] = []
+                tokens_by_credential[nhi_cred_id].append((fabric_host, token_expires_at))
+            
+            # For each credential, find events with stored passwords
+            for nhi_cred_id, tokens in tokens_by_credential.items():
+                # Get stored password from any event using this credential
+                c.execute('''
+                    SELECT password_encrypted
+                    FROM event_nhi_passwords
+                    WHERE nhi_credential_id = ?
+                    LIMIT 1
+                ''', (nhi_cred_id,))
+                pwd_row = c.fetchone()
+                
+                if not pwd_row:
+                    # No stored password for this credential, skip
+                    continue
+                
+                try:
+                    nhi_password = decrypt_with_server_secret(pwd_row[0])
+                except Exception as e:
+                    logger.warning(f"Failed to decrypt password for NHI credential {nhi_cred_id}: {e}")
+                    continue
+                
+                # Get client credentials
+                c.execute('''
+                    SELECT client_id, client_secret_encrypted
+                    FROM nhi_credentials
+                    WHERE id = ?
+                ''', (nhi_cred_id,))
+                cred_row = c.fetchone()
+                
+                if not cred_row:
+                    continue
+                
+                client_id, client_secret_encrypted = cred_row
+                
+                try:
+                    client_secret = decrypt_client_secret(client_secret_encrypted, nhi_password)
+                except Exception as e:
+                    logger.warning(f"Failed to decrypt client secret for NHI credential {nhi_cred_id}: {e}")
+                    continue
+                
+                # Refresh each token for this credential
+                for fabric_host, token_expires_at in tokens:
+                    try:
+                        # Get new token
+                        token_data = get_access_token(client_id, client_secret, fabric_host)
+                        if token_data and token_data.get("access_token"):
+                            expires_in = token_data.get("expires_in")
+                            if expires_in:
+                                expires_at = datetime.now() + timedelta(seconds=expires_in)
+                                token_expires_at_new = expires_at.isoformat()
+                                token_encrypted = encrypt_client_secret(token_data.get("access_token"), nhi_password)
+                                
+                                # Update token in nhi_tokens
+                                c.execute('''
+                                    UPDATE nhi_tokens 
+                                    SET token_encrypted = ?, token_expires_at = ?, updated_at = CURRENT_TIMESTAMP
+                                    WHERE nhi_credential_id = ? AND fabric_host = ?
+                                ''', (token_encrypted, token_expires_at_new, nhi_cred_id, fabric_host))
+                                conn.commit()
+                                refreshed_count += 1
+                                logger.info(f"Refreshed NHI token for credential {nhi_cred_id}, host {fabric_host}")
+                                # Log audit event
+                                log_audit("nhi_token_refreshed", details=f"NHI credential {nhi_cred_id}, host {fabric_host}")
+                            else:
+                                logger.warning(f"No expiration time in token response for credential {nhi_cred_id}, host {fabric_host}")
+                        else:
+                            logger.warning(f"Failed to get new token for credential {nhi_cred_id}, host {fabric_host}")
+                    except Exception as e:
+                        logger.warning(f"Error refreshing NHI token for credential {nhi_cred_id}, host {fabric_host}: {e}")
+                        continue
+            
+            return refreshed_count
+        finally:
+            conn.close()
+    except Exception as e:
+        logger.error(f"Error in NHI token refresh task: {e}", exc_info=True)
+        return 0
+
 # Background task to refresh expiring tokens proactively
 def refresh_expiring_tokens():
     """Background task to refresh tokens that are expiring soon"""
+    session_refreshed_count = 0
+    nhi_refreshed_count = 0
+    
     try:
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
@@ -3752,7 +4274,6 @@ def refresh_expiring_tokens():
             ''', (now.isoformat(),))
             sessions = c.fetchall()
             
-            refreshed_count = 0
             for session_row in sessions:
                 session_id = session_row[0]
                 tokens_encrypted = session_row[2]
@@ -3774,17 +4295,23 @@ def refresh_expiring_tokens():
                         if token_info and is_token_expiring_soon(token_info, minutes=5):
                             # Refresh this token
                             if refresh_token_for_host(session_id, host):
-                                refreshed_count += 1
+                                session_refreshed_count += 1
                 except Exception as e:
                     logger.warning(f"Error processing session {session_id} for token refresh: {e}")
                     continue
-                    
-            if refreshed_count > 0:
-                pass
         finally:
             conn.close()
     except Exception as e:
         logger.error(f"Error in proactive token refresh task: {e}", exc_info=True)
+    
+    # Also refresh NHI tokens from nhi_tokens table
+    try:
+        nhi_refreshed_count = refresh_nhi_tokens()
+    except Exception as e:
+        logger.error(f"Error refreshing NHI tokens: {e}", exc_info=True)
+    
+    if session_refreshed_count > 0 or nhi_refreshed_count > 0:
+        logger.debug(f"Token refresh completed: {session_refreshed_count} session tokens, {nhi_refreshed_count} NHI tokens refreshed")
 
 def check_and_run_token_refresh():
     """Background thread to periodically refresh expiring tokens"""

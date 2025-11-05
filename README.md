@@ -200,6 +200,28 @@ The database and logs are stored in the `./data` and `./logs` directories, which
 
 For more detailed Docker documentation, see [DOCKER.md](DOCKER.md).
 
+## Registering a FabricStudio OAuth Application (Client ID/Secret)
+
+To use FabricStudio APIs from this app, you need a Client ID and Client Secret.
+
+1) Using the FabricStudio web interface, register an application
+- Open your browser and go to the application creation page:
+  - `https://[YOUR_FabricStudio]/oauth2/applications/register/`
+
+2) Fill the registration form
+- Name: any descriptive name (e.g., "FabricStudio Assistant")
+- Client type: Confidential
+- Authorization grant type: Client credentials
+- Algorithm: HMAC with SHA-2 256
+- Save the application. Copy the generated Client ID and Client Secret.
+
+3) Where the Client ID and Client Secret are used in this app
+- NHI Management > NHI Credentials: When you save a credential, enter the Client ID and Client Secret. The secret is encrypted and stored; tokens are retrieved per host using these values.
+- Token acquisition: The app calls FabricStudio to get access tokens with the client credentials flow. Tokens are stored server-side and refreshed automatically.
+- Event schedules: When an auto-run event executes, the stored NHI credential (backed by your Client ID/Secret) is used to fetch/refresh tokens to run tasks.
+
+If you rotate your Client Secret, update the corresponding NHI credential in the app so token acquisition continues to work.
+
 ## Database
 
 The application uses SQLite for data storage. The database file `fabricstudio_ui.db` is created automatically when the application starts, or you can initialize it manually using `init_empty_db.py`.

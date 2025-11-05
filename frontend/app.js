@@ -2366,6 +2366,14 @@ function initializeSection(sectionName) {
   } else if (sectionName === 'preparation') {
     // Initialize preparation section
     initializePreparationSection();
+  } else if (sectionName === 'audit-logs') {
+    // Audit Logs section initialization
+    setupAuditLogsButtons();
+    loadAuditLogs();
+  } else if (sectionName === 'server-logs') {
+    // Server Logs initialization
+    setupServerLogsButtons();
+    loadServerLogs();
   }
 }
 
@@ -2848,6 +2856,15 @@ function initMenu() {
     const activeSubmenuItem = configurationsGroup.querySelector('.submenu-item.active');
     if (activeSubmenuItem) {
       configurationsGroup.classList.add('expanded');
+    }
+  }
+  
+  // Expand Logs menu by default if it's the active section
+  const logsGroup = document.querySelector('#logs-menu')?.closest('.menu-group');
+  if (logsGroup) {
+    const activeSubmenuItem = logsGroup.querySelector('.submenu-item.active');
+    if (activeSubmenuItem) {
+      logsGroup.classList.add('expanded');
     }
   }
   
@@ -8674,4 +8691,264 @@ async function executeSshProfiles(hosts, sshProfileId, encryptionPassword, waitT
   }
   
   return results;
+}
+
+// Audit Logs Management functions
+let currentFilters = { action: '', user: '' };
+
+function setupAuditLogsButtons() {
+  const refreshBtn = el('btnRefreshAuditLogs');
+  const exportBtn = el('btnExportLogs');
+  const applyFilterBtn = el('btnApplyFilter');
+  const clearFilterBtn = el('btnClearFilter');
+  
+  if (refreshBtn) {
+    refreshBtn.addEventListener('click', () => {
+      loadAuditLogs();
+    });
+  }
+  
+  if (exportBtn) {
+    exportBtn.addEventListener('click', () => {
+      exportAuditLogs();
+    });
+  }
+  
+  if (applyFilterBtn) {
+    applyFilterBtn.addEventListener('click', () => {
+      applyFilters();
+    });
+  }
+  
+  if (clearFilterBtn) {
+    clearFilterBtn.addEventListener('click', () => {
+      clearFilters();
+    });
+  }
+}
+
+// Server Logs functions
+let currentServerLogFilters = { method: '', status: '', path: '', user: '', ip: '' };
+
+function setupServerLogsButtons() {
+  const refreshBtn = el('btnServerLogsRefresh');
+  const exportBtn = el('btnServerLogsExport');
+  const applyBtn = el('btnServerLogsApply');
+  const clearBtn = el('btnServerLogsClear');
+  if (refreshBtn) refreshBtn.addEventListener('click', () => loadServerLogs());
+  if (exportBtn) exportBtn.addEventListener('click', () => exportServerLogs());
+  if (applyBtn) applyBtn.addEventListener('click', () => applyServerLogFilters());
+  if (clearBtn) clearBtn.addEventListener('click', () => clearServerLogFilters());
+}
+
+function applyServerLogFilters() {
+  currentServerLogFilters.method = (el('serverLogMethod')?.value || '');
+  currentServerLogFilters.status = (el('serverLogStatus')?.value || '');
+  currentServerLogFilters.path = (el('serverLogPath')?.value || '').trim();
+  currentServerLogFilters.user = (el('serverLogUser')?.value || '').trim();
+  currentServerLogFilters.ip = currentServerLogFilters.user;
+  loadServerLogs();
+}
+
+function clearServerLogFilters() {
+  if (el('serverLogMethod')) el('serverLogMethod').value = '';
+  if (el('serverLogStatus')) el('serverLogStatus').value = '';
+  if (el('serverLogPath')) el('serverLogPath').value = '';
+  if (el('serverLogUser')) el('serverLogUser').value = '';
+  currentServerLogFilters = { method: '', status: '', path: '', user: '', ip: '' };
+  loadServerLogs();
+}
+
+async function loadServerLogs() {
+  const listEl = el('serverLogsList');
+  if (!listEl) return;
+  try {
+    listEl.innerHTML = '<p>Loading server logs...</p>';
+    let url = '/server-logs/list?limit=1000';
+    const { method, status, path, user, ip } = currentServerLogFilters;
+    if (method) url += `&method=${encodeURIComponent(method)}`;
+    if (status) url += `&status=${encodeURIComponent(status)}`;
+    if (path) url += `&path=${encodeURIComponent(path)}`;
+    if (user) url += `&user=${encodeURIComponent(user)}`;
+    if (ip) url += `&ip=${encodeURIComponent(ip)}`;
+    const res = await api(url);
+    if (!res.ok) {
+      listEl.innerHTML = `<p style="color: #f87171;">Error loading server logs: ${res.statusText}</p>`;
+      return;
+    }
+    const data = await res.json();
+    const logs = data.logs || [];
+    if (logs.length === 0) {
+      listEl.innerHTML = '<p>No server logs found.</p>';
+      return;
+    }
+    let html = '<table style="width: 100%; border-collapse: collapse; background: white; border: 1px solid #d2d2d7;">';
+    html += '<thead><tr style="background: #f5f5f7; border-bottom: 2px solid #d2d2d7;">';
+    html += '<th style="padding: 10px; text-align: left;">Time</th>';
+    html += '<th style="padding: 10px; text-align: left;">Method</th>';
+    html += '<th style="padding: 10px; text-align: left;">Path</th>';
+    html += '<th style="padding: 10px; text-align: left;">Status</th>';
+    html += '<th style="padding: 10px; text-align: left;">Duration</th>';
+    html += '<th style="padding: 10px; text-align: left;">IP</th>';
+    html += '</tr></thead><tbody>';
+    logs.forEach(l => {
+      const ts = new Date(l.created_at).toLocaleString();
+      html += '<tr style="border-bottom: 1px solid #eee;">';
+      html += `<td style="padding: 8px; font-size: 12px;">${ts}</td>`;
+      html += `<td style="padding: 8px; font-size: 12px;">${l.method}</td>`;
+      html += `<td style="padding: 8px; font-size: 12px;">${l.path}</td>`;
+      html += `<td style="padding: 8px; font-size: 12px;">${l.status}</td>`;
+      html += `<td style="padding: 8px; font-size: 12px;">${l.duration_ms} ms</td>`;
+      html += `<td style="padding: 8px; font-size: 12px;">${l.ip_address || '-'}</td>`;
+      html += '</tr>';
+    });
+    html += '</tbody></table>';
+    listEl.innerHTML = html;
+  } catch (e) {
+    listEl.innerHTML = `<p style="color: #f87171;">Error loading server logs: ${e.message || e}</p>`;
+  }
+}
+
+async function exportServerLogs() {
+  let url = '/server-logs/export';
+  const { method, status, path, user, ip } = currentServerLogFilters;
+  const params = [];
+  if (method) params.push(`method=${encodeURIComponent(method)}`);
+  if (status) params.push(`status=${encodeURIComponent(status)}`);
+  if (path) params.push(`path=${encodeURIComponent(path)}`);
+  if (user) params.push(`user=${encodeURIComponent(user)}`);
+  if (ip) params.push(`ip=${encodeURIComponent(ip)}`);
+  if (params.length) url += '?' + params.join('&');
+  const res = await fetch(url);
+  if (!res.ok) {
+    showStatus(`Failed to export server logs: ${res.statusText}`);
+    return;
+  }
+  const blob = await res.blob();
+  const dl = window.URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = dl;
+  a.download = 'server_logs.csv';
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  window.URL.revokeObjectURL(dl);
+}
+
+function applyFilters() {
+  const actionFilter = el('filterAction');
+  const userFilter = el('filterUser');
+  
+  currentFilters.action = actionFilter ? actionFilter.value : '';
+  currentFilters.user = userFilter ? userFilter.value.trim() : '';
+  
+  loadAuditLogs();
+}
+
+function clearFilters() {
+  const actionFilter = el('filterAction');
+  const userFilter = el('filterUser');
+  
+  if (actionFilter) actionFilter.value = '';
+  if (userFilter) userFilter.value = '';
+  
+  currentFilters = { action: '', user: '' };
+  loadAuditLogs();
+}
+
+async function loadAuditLogs() {
+  const logsList = el('auditLogsList');
+  if (!logsList) return;
+  
+  try {
+    logsList.innerHTML = '<p>Loading audit logs...</p>';
+    
+    let url = '/audit-logs/list?limit=1000';
+    if (currentFilters.action) {
+      url += `&action=${encodeURIComponent(currentFilters.action)}`;
+    }
+    if (currentFilters.user) {
+      url += `&user=${encodeURIComponent(currentFilters.user)}`;
+    }
+    
+    const res = await api(url);
+    if (!res.ok) {
+      logsList.innerHTML = `<p style="color: #f87171;">Error loading audit logs: ${res.statusText}</p>`;
+      return;
+    }
+    
+    const data = await res.json();
+    const logs = data.logs || [];
+    
+    if (logs.length === 0) {
+      logsList.innerHTML = '<p>No audit logs found.</p>';
+      return;
+    }
+    
+    // Create table for logs
+    let html = '<table style="width: 100%; border-collapse: collapse; background: white; border: 1px solid #d2d2d7;">';
+    html += '<thead><tr style="background: #f5f5f7; border-bottom: 2px solid #d2d2d7;">';
+    html += '<th style="padding: 12px; text-align: left; font-weight: 600; border-right: 1px solid #d2d2d7;">Timestamp</th>';
+    html += '<th style="padding: 12px; text-align: left; font-weight: 600; border-right: 1px solid #d2d2d7;">Action</th>';
+    html += '<th style="padding: 12px; text-align: left; font-weight: 600; border-right: 1px solid #d2d2d7;">User</th>';
+    html += '<th style="padding: 12px; text-align: left; font-weight: 600; border-right: 1px solid #d2d2d7;">IP Address</th>';
+    html += '<th style="padding: 12px; text-align: left; font-weight: 600;">Details</th>';
+    html += '</tr></thead><tbody>';
+    
+    logs.forEach(log => {
+      const timestamp = new Date(log.created_at).toLocaleString();
+      const actionDisplay = log.action.replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase());
+      
+      html += '<tr style="border-bottom: 1px solid #e5e5e7;">';
+      html += `<td style="padding: 10px; border-right: 1px solid #e5e5e7; font-size: 13px;">${timestamp}</td>`;
+      html += `<td style="padding: 10px; border-right: 1px solid #e5e5e7; font-size: 13px; font-weight: 500;">${actionDisplay}</td>`;
+      html += `<td style="padding: 10px; border-right: 1px solid #e5e5e7; font-size: 13px;">${log.user || '-'}</td>`;
+      html += `<td style="padding: 10px; border-right: 1px solid #e5e5e7; font-size: 13px; font-family: monospace;">${log.ip_address || '-'}</td>`;
+      html += `<td style="padding: 10px; font-size: 13px; max-width: 400px; overflow-wrap: break-word;">${log.details || '-'}</td>`;
+      html += '</tr>';
+    });
+    
+    html += '</tbody></table>';
+    logsList.innerHTML = html;
+  } catch (error) {
+    logsList.innerHTML = `<p style="color: #f87171;">Error loading audit logs: ${error.message || error}</p>`;
+    console.error('Error loading audit logs:', error);
+  }
+}
+
+async function exportAuditLogs() {
+  try {
+    let url = '/audit-logs/export';
+    const params = [];
+    if (currentFilters.action) {
+      params.push(`action=${encodeURIComponent(currentFilters.action)}`);
+    }
+    if (currentFilters.user) {
+      params.push(`user=${encodeURIComponent(currentFilters.user)}`);
+    }
+    if (params.length > 0) {
+      url += '?' + params.join('&');
+    }
+    
+    const res = await fetch(url);
+    if (!res.ok) {
+      showStatus(`Failed to export audit logs: ${res.statusText}`);
+      return;
+    }
+    
+    const blob = await res.blob();
+    const downloadUrl = window.URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = downloadUrl;
+    a.download = 'audit_logs.csv';
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    window.URL.revokeObjectURL(downloadUrl);
+    
+    showStatus('Audit logs exported successfully');
+  } catch (error) {
+    showStatus(`Error exporting audit logs: ${error.message || error}`);
+    console.error('Error exporting audit logs:', error);
+  }
 }
