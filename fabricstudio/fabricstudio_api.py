@@ -141,6 +141,77 @@ def get_recent_task_errors(fabric_host, access_token, limit=50):
     errors = []
     tasks = data.get("object", [])
     
+    def extract_error_from_task(task):
+        """Extract error message from task, checking multiple possible locations."""
+        error_msg = None
+        
+        # Check result field for nested error structures first (most detailed)
+        result = task.get("result")
+        if result:
+            # If result is a dict, check for error indicators
+            if isinstance(result, dict):
+                # Check for status='error' in result
+                if result.get("status", "").lower() == "error":
+                    # Extract error messages from nested errors dict
+                    errors_dict = result.get("errors", {})
+                    if errors_dict:
+                        # Collect all error messages
+                        error_parts = []
+                        if "global" in errors_dict:
+                            if isinstance(errors_dict["global"], list):
+                                error_parts.extend(errors_dict["global"])
+                            else:
+                                error_parts.append(str(errors_dict["global"]))
+                        # Collect other error keys
+                        for key, value in errors_dict.items():
+                            if key != "global":
+                                if isinstance(value, list):
+                                    error_parts.extend([f"{key}: {v}" for v in value])
+                                else:
+                                    error_parts.append(f"{key}: {value}")
+                        if error_parts:
+                            error_msg = "; ".join(error_parts)
+                    # Fallback to result message or error field
+                    if not error_msg:
+                        error_msg = result.get("message", "") or result.get("error", "")
+                    # Check rcode - if it's an error code, include it
+                    rcode = result.get("rcode")
+                    if rcode and str(rcode) != "0":
+                        rcode_str = f" (rcode: {rcode})"
+                        error_msg = error_msg + rcode_str if error_msg else f"Error rcode: {rcode}"
+                # Check for errors dict directly in result (even if status is not 'error')
+                elif "errors" in result and result.get("errors"):
+                    errors_dict = result.get("errors", {})
+                    if isinstance(errors_dict, dict):
+                        error_parts = []
+                        if "global" in errors_dict:
+                            if isinstance(errors_dict["global"], list):
+                                error_parts.extend(errors_dict["global"])
+                            else:
+                                error_parts.append(str(errors_dict["global"]))
+                        for key, value in errors_dict.items():
+                            if key != "global":
+                                if isinstance(value, list):
+                                    error_parts.extend([f"{key}: {v}" for v in value])
+                                else:
+                                    error_parts.append(f"{key}: {value}")
+                        if error_parts:
+                            error_msg = "; ".join(error_parts)
+        
+        # If no error found in result, check top-level error fields
+        if not error_msg:
+            error_msg = task.get("error", "") or task.get("message", "") or task.get("description", "")
+        
+        # Check rcode at task level
+        rcode = task.get("rcode")
+        if rcode and str(rcode) != "0":
+            if error_msg:
+                error_msg = f"{error_msg} (rcode: {rcode})"
+            else:
+                error_msg = f"Error rcode: {rcode}"
+        
+        return error_msg
+    
     # Filter for failed or error tasks
     for task in tasks:
         status = task.get("status", "").lower()
@@ -149,7 +220,7 @@ def get_recent_task_errors(fabric_host, access_token, limit=50):
         
         # Check for failed status or error messages
         if status in ["failed", "error", "exception"]:
-            error_msg = task.get("error", "") or task.get("message", "") or task.get("description", "")
+            error_msg = extract_error_from_task(task)
             if error_msg:
                 errors.append({
                     "task_id": task_id,
@@ -159,6 +230,18 @@ def get_recent_task_errors(fabric_host, access_token, limit=50):
                     "timestamp": task.get("created_at") or task.get("updated_at")
                 })
                 logger.warning("Found failed task: %s (id: %s) - %s", task_name, task_id, error_msg)
+        # Also check completed tasks for errors in result field
+        elif status == "completed":
+            error_msg = extract_error_from_task(task)
+            if error_msg:
+                errors.append({
+                    "task_id": task_id,
+                    "task_name": task_name,
+                    "status": status,
+                    "error": error_msg,
+                    "timestamp": task.get("created_at") or task.get("updated_at")
+                })
+                logger.warning("Found completed task with errors: %s (id: %s) - %s", task_name, task_id, error_msg)
     
     return errors
 
