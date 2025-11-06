@@ -1,8 +1,8 @@
 <div id="audit-logs-section" class="content-section">
   <h3>Audit Logs</h3>
-  <div style="margin-bottom: 20px;">
-    <div class="row" style="margin-bottom: 16px;">
-      <label style="width: 120px;">Filter by Action:</label>
+  <div style="margin-bottom: 20px; padding: 12px; background: #f5f5f7; border: 1px solid #d2d2d7;">
+    <div class="row" style="margin-bottom: 12px;">
+      <label style="width: 120px; font-weight: 500; color: #424245;">Filter by Action:</label>
       <select id="filterAction" style="width: 200px;">
         <option value="">All Actions</option>
         <option value="configuration_saved">Configuration Saved</option>
@@ -28,12 +28,18 @@
         <option value="password_changed">Password Changed</option>
         <option value="fabric_reset">Fabric Reset</option>
       </select>
-      <label style="width: 120px; margin-left: 20px;">Filter by User:</label>
+      <label style="width: 120px; margin-left: 20px; font-weight: 500; color: #424245;">Filter by User:</label>
       <input id="filterUser" type="text" placeholder="Filter by user..." style="width: 200px;" />
       <button id="btnApplyFilter" style="margin-left: 12px;">Apply Filters</button>
       <button id="btnClearFilter" style="margin-left: 8px;">Clear</button>
     </div>
-    <div class="row">
+    <div class="row" style="margin-bottom: 12px; padding-top: 12px; border-top: 1px solid #d2d2d7;">
+      <label style="width: 120px; font-weight: 500; color: #424245;">From:</label>
+      <input id="filterDateFrom" type="datetime-local" style="width: 200px;" />
+      <label style="width: 120px; margin-left: 20px; font-weight: 500; color: #424245;">To:</label>
+      <input id="filterDateTo" type="datetime-local" style="width: 200px;" />
+    </div>
+    <div class="row" style="padding-top: 8px; border-top: 1px solid #d2d2d7;">
       <button id="btnRefreshAuditLogs">Refresh</button>
       <button id="btnExportLogs" style="margin-left: 8px;">Export CSV</button>
     </div>

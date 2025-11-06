@@ -4,7 +4,7 @@ A FastAPI-based web application for managing FabricStudio configurations, NHI cr
 
 ## Features
 
-- **FabricStudio Preparation**: Configure and manage FabricStudio hosts, authenticate, and create/run workspaces
+- **FabricStudio Runs**: Configure and manage FabricStudio hosts, authenticate, and create/run workspaces
 - **SSH Profile Execution**: Execute SSH commands on fabric hosts before workspace installation, with configurable wait times between commands
 - **NHI Management**: Store and manage NHI credentials with encrypted client secrets
 - **SSH Key Management**: Securely store and manage SSH key pairs (public and encrypted private keys)
@@ -250,7 +250,7 @@ FabricStudioAPI/
 │   ├── index.html        # Main HTML file
 │   ├── app.js            # Frontend JavaScript
 │   ├── styles.css        # Stylesheet
-│   ├── preparation.html  # FabricStudio Preparation section
+│   ├── preparation.html  # FabricStudio Runs section
 │   ├── configurations.html # Configurations section
 │   ├── event-schedule.html # Event Schedule section
 │   ├── nhi-management.html # NHI Management section

@@ -303,7 +303,7 @@ hr { border: none; border-top: 1px solid #d2d2d7; margin: 18px 0; }
 
 label { display: inline-block; width: 140px; font-weight: 500; color: #424245; flex-shrink: 0; }
 
-input[type="text"], input[type="password"], input[type="number"], input[type="date"], input[type="time"], select, textarea {
+input[type="text"], input[type="password"], input[type="number"], input[type="date"], input[type="time"], input[type="datetime-local"], select, textarea {
   margin: 0;
   padding: 6px 10px;
   border: 1px solid #d2d2d7;
@@ -325,13 +325,13 @@ textarea {
   line-height: 1.4;
 }
 
-input[type="text"]:focus, input[type="password"]:focus, input[type="number"]:focus, input[type="date"]:focus, input[type="time"]:focus, select:focus, textarea:focus {
+input[type="text"]:focus, input[type="password"]:focus, input[type="number"]:focus, input[type="date"]:focus, input[type="time"]:focus, input[type="datetime-local"]:focus, select:focus, textarea:focus {
   outline: none;
   border-color: #da291c;
   box-shadow: 0 0 0 4px rgba(218, 41, 28, 0.2);
 }
 
-input[type="text"]:disabled, input[type="password"]:disabled, input[type="number"]:disabled, input[type="date"]:disabled, input[type="time"]:disabled, select:disabled, textarea:disabled {
+input[type="text"]:disabled, input[type="password"]:disabled, input[type="number"]:disabled, input[type="date"]:disabled, input[type="time"]:disabled, input[type="datetime-local"]:disabled, select:disabled, textarea:disabled {
   background: #f5f5f7;
   color: #86868b;
   cursor: not-allowed;
@@ -405,6 +405,17 @@ pre {
 .progress .ind:not(.determinate) { background: linear-gradient(90deg, #da291c, #c92216, #da291c); background-size: 200% 100%; animation: progress-flow 1.35s ease-in-out infinite; }
 .progress .ind.determinate { background: linear-gradient(90deg, #34d399, #10b981); animation: none; box-shadow: 0 1px 4px rgba(16,185,129,0.35); }
 #runProgressBar { 
+  --progress: 0%;
+  background: linear-gradient(90deg, #34d399, #10b981);
+  width: var(--progress);
+  height: 100%;
+  transition: width 0.8s cubic-bezier(0.4, 0, 0.2, 1);
+  position: relative;
+  display: block;
+  box-shadow: 0 2px 8px rgba(16, 185, 129, 0.4);
+}
+
+#actionStatusProgressBar {
   --progress: 0%;
   background: linear-gradient(90deg, #34d399, #10b981);
   width: var(--progress);

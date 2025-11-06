@@ -4,6 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>FabricStudio Assistant</title>
+    <link rel="icon" type="image/x-icon" href="/frontend/images/favicon.ico">
     <link rel="stylesheet" href="styles.css">
   </head>
   <body>
@@ -14,18 +15,19 @@
           <span style="margin-left: 4px;">FabricStudio Assistant</span>
         </h2>
         <nav class="sidebar-nav">
-          <button type="button" class="menu-item active" data-section="preparation">FabricStudio Preparation</button>
-          <button type="button" class="menu-item" data-section="event-schedule">Event Schedule</button>
           <div class="menu-group">
-            <button type="button" class="menu-item menu-parent" data-section="configurations" id="configurations-menu">
-              Configurations
+            <button type="button" class="menu-item menu-parent active" data-section="preparation" id="preparation-menu">
+              FabricStudio Runs
               <span class="menu-arrow"></span>
             </button>
-            <div class="submenu" id="configurations-submenu">
+            <div class="submenu" id="preparation-submenu">
+              <button type="button" class="menu-item submenu-item active" data-section="preparation">Run Configuration</button>
               <button type="button" class="menu-item submenu-item" data-section="configurations">Saved Configurations</button>
-              <button type="button" class="menu-item submenu-item" data-section="ssh-command-profiles">SSH Commands Profile</button>
+              <button type="button" class="menu-item submenu-item" data-section="ssh-command-profiles">SSH Commands Profiles</button>
+              <button type="button" class="menu-item submenu-item" data-section="reports">Reports</button>
             </div>
           </div>
+          <button type="button" class="menu-item" data-section="event-schedule">Event Schedule</button>
           <div class="menu-group">
             <button type="button" class="menu-item menu-parent" data-section="nhi-management" id="nhi-management-menu">
               NHI Management

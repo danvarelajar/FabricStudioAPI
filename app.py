@@ -8,6 +8,7 @@ from typing import Optional, List
 from pydantic import BaseModel
 import sqlite3
 import json
+import random
 from datetime import datetime, date, time as dt_time, timedelta, timezone
 import paramiko
 import io
@@ -128,6 +129,24 @@ def get_access_token_from_request(request: Request, fabric_host: str = None) -> 
 # Database setup - use environment variable or default to current directory
 DB_PATH = os.environ.get("DB_PATH", "fabricstudio_ui.db")
 
+# Thread lock for database operations to prevent SQLite locking issues
+_db_lock = threading.Lock()
+
+def db_connect_with_retry(timeout=5.0, max_retries=3, retry_delay=0.1):
+    """Connect to SQLite database with retry logic and timeout"""
+    for attempt in range(max_retries):
+        try:
+            conn = sqlite3.connect(DB_PATH, timeout=timeout)
+            # Enable WAL mode for better concurrency
+            conn.execute('PRAGMA journal_mode=WAL')
+            return conn
+        except sqlite3.OperationalError as e:
+            if "database is locked" in str(e).lower() and attempt < max_retries - 1:
+                time.sleep(retry_delay * (2 ** attempt))  # Exponential backoff
+                continue
+            raise
+    return None
+
 # Custom logging handler to capture INFO logs to database
 class DatabaseLogHandler(logging.Handler):
     """Custom logging handler that writes INFO level logs to database"""
@@ -136,24 +155,38 @@ class DatabaseLogHandler(logging.Handler):
         try:
             # Only log INFO level messages
             if record.levelno == logging.INFO:
-                conn = sqlite3.connect(DB_PATH)
-                c = conn.cursor()
-                try:
-                    # Format log message
-                    message = self.format(record)
-                    logger_name = record.name
-                    level = record.levelname
-                    created_at = datetime.now(timezone.utc).isoformat()
-                    
-                    c.execute('''
-                        INSERT INTO app_logs (level, logger_name, message, created_at)
-                        VALUES (?, ?, ?, ?)
-                    ''', (level, logger_name, message, created_at))
-                    conn.commit()
-                except Exception:
-                    pass
-                finally:
-                    conn.close()
+                # Use lock to prevent concurrent database access
+                with _db_lock:
+                    conn = None
+                    try:
+                        conn = db_connect_with_retry(timeout=10.0, max_retries=5, retry_delay=0.05)
+                        if not conn:
+                            return  # Silently fail if can't connect
+                        
+                        c = conn.cursor()
+                        # Format log message
+                        message = self.format(record)
+                        logger_name = record.name
+                        level = record.levelname
+                        created_at = datetime.now(timezone.utc).isoformat()
+                        
+                        c.execute('''
+                            INSERT INTO app_logs (level, logger_name, message, created_at)
+                            VALUES (?, ?, ?, ?)
+                        ''', (level, logger_name, message, created_at))
+                        conn.commit()
+                    except sqlite3.OperationalError as e:
+                        if "database is locked" not in str(e).lower():
+                            # Only log non-locking errors
+                            pass
+                    except Exception:
+                        pass
+                    finally:
+                        if conn:
+                            try:
+                                conn.close()
+                            except Exception:
+                                pass
         except Exception:
             pass
 
@@ -404,6 +437,22 @@ def init_db():
         )
     ''')
     
+    # Create table to store execution records for manual runs (from FabricStudio Runs)
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS manual_runs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            configuration_name TEXT,
+            status TEXT NOT NULL,
+            message TEXT,
+            errors TEXT,
+            started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            completed_at TIMESTAMP,
+            execution_details TEXT
+        )
+    ''')
+    c.execute('CREATE INDEX IF NOT EXISTS idx_manual_runs_started_at ON manual_runs(started_at DESC)')
+    c.execute('CREATE INDEX IF NOT EXISTS idx_manual_runs_status ON manual_runs(status)')
+    
     # Create sessions table for session-based token management
     c.execute('''
         CREATE TABLE IF NOT EXISTS sessions (
@@ -498,35 +547,56 @@ def decrypt_with_server_secret(ciphertext_b64: str) -> str:
 # Audit logging helper function
 def log_audit(action: str, user: str = None, details: str = None, ip_address: str = None):
     """Log an audit event to the database, with deduplication for fabric creation"""
-    try:
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        
-        # Check for duplicate entries within the last 5 seconds for fabric_created action
-        if action == "fabric_created" and details:
-            # Extract host, template, and version from details string
-            # Format: "host=X template=Y version=Z" or "host=X template=Y version=Z event=W"
-            c.execute('''
-                SELECT id FROM audit_logs
-                WHERE action = ? AND details = ?
-                AND created_at > datetime('now', '-5 seconds')
-                LIMIT 1
-            ''', (action, details))
-            if c.fetchone():
-                # Duplicate found within 5 seconds, skip logging
-                conn.close()
+    # Use lock to prevent concurrent database access
+    with _db_lock:
+        conn = None
+        try:
+            conn = db_connect_with_retry(timeout=10.0, max_retries=5, retry_delay=0.05)
+            if not conn:
+                logger.error("Failed to connect to database for audit log after retries")
                 return
-        
-        # Use timezone-aware timestamp
-        now_utc = datetime.now(timezone.utc)
-        c.execute('''
-            INSERT INTO audit_logs (action, user, details, ip_address, created_at)
-            VALUES (?, ?, ?, ?, ?)
-        ''', (action, user, details, ip_address, now_utc.isoformat()))
-        conn.commit()
-        conn.close()
-    except Exception as e:
-        logger.error(f"Failed to log audit event: {e}", exc_info=True)
+            
+            c = conn.cursor()
+            
+            # Use timezone-aware timestamp
+            now_utc = datetime.now(timezone.utc)
+            
+            # Check for duplicate entries within the last 5 seconds for fabric_created action
+            if action == "fabric_created" and details:
+                five_seconds_ago = (now_utc - timedelta(seconds=5)).isoformat()
+                
+                # Extract host, template, and version from details string
+                # Format: "host=X template=Y version=Z" or "host=X template=Y version=Z event=W"
+                c.execute('''
+                    SELECT id FROM audit_logs
+                    WHERE action = ? AND details = ?
+                    AND created_at > ?
+                    LIMIT 1
+                ''', (action, details, five_seconds_ago))
+                if c.fetchone():
+                    # Duplicate found within 5 seconds, skip logging
+                    conn.close()
+                    return
+            
+            # Insert audit log
+            c.execute('''
+                INSERT INTO audit_logs (action, user, details, ip_address, created_at)
+                VALUES (?, ?, ?, ?, ?)
+            ''', (action, user, details, ip_address, now_utc.isoformat()))
+            conn.commit()
+        except sqlite3.OperationalError as e:
+            if "database is locked" in str(e).lower():
+                logger.warning(f"Database locked when logging audit event '{action}', skipping")
+            else:
+                logger.error(f"Failed to log audit event: {e}", exc_info=True)
+        except Exception as e:
+            logger.error(f"Failed to log audit event: {e}", exc_info=True)
+        finally:
+            if conn:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
 
 def get_client_ip(request: Request) -> str:
     """Extract client IP address from request"""
@@ -958,6 +1028,14 @@ def serve_server_logs_page():
 @app.get("/frontend/audit-logs.html")
 def serve_audit_logs():
     return FileResponse("frontend/audit-logs.html", media_type="text/html")
+
+@app.get("/frontend/reports.html")
+def serve_reports():
+    return FileResponse("frontend/reports.html", media_type="text/html")
+
+@app.get("/favicon.ico")
+def serve_favicon():
+    return FileResponse("frontend/images/favicon.ico", media_type="image/x-icon")
 
 
 class TokenReq(BaseModel):
@@ -1735,15 +1813,24 @@ def save_event(req: CreateEventReq, request: Request):
         raise HTTPException(400, "Configuration is required")
     
     # Validate that event date/time is not in the past
+    # Frontend sends date/time in UTC (converted from user's local timezone)
     try:
         event_time_str = req.event_time if req.event_time else "00:00:00"
         # Normalize time format: HTML5 time input returns HH:MM, but we need HH:MM:SS
         if event_time_str and len(event_time_str.split(':')) == 2:
             event_time_str = event_time_str + ":00"
+        
+        # Parse date/time as UTC (frontend sends UTC)
         event_datetime_str = f"{req.event_date} {event_time_str}"
-        event_datetime = datetime.strptime(event_datetime_str, "%Y-%m-%d %H:%M:%S")
-        now = datetime.now()
-        if event_datetime < now:
+        event_datetime = datetime.strptime(event_datetime_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+        
+        # Store date and time in UTC
+        utc_date = event_datetime.date()
+        utc_time = event_datetime.time().replace(second=0, microsecond=0)
+        
+        # Validate not in past (compare UTC times)
+        now_utc = datetime.now(timezone.utc)
+        if event_datetime < now_utc:
             raise HTTPException(400, "Event date and time cannot be in the past")
     except ValueError as e:
         raise HTTPException(400, f"Invalid date/time format: {str(e)}")
@@ -1766,11 +1853,12 @@ def save_event(req: CreateEventReq, request: Request):
             if not existing:
                 raise HTTPException(404, f"Event with id {req.id} not found")
             
+            # Store UTC date and time
             c.execute('''
                 UPDATE event_schedules 
                 SET name = ?, event_date = ?, event_time = ?, configuration_id = ?, auto_run = ?, updated_at = CURRENT_TIMESTAMP
                 WHERE id = ?
-            ''', (req.name.strip(), req.event_date, req.event_time, req.configuration_id, 1 if req.auto_run else 0, req.id))
+            ''', (req.name.strip(), utc_date.strftime('%Y-%m-%d'), utc_time.strftime('%H:%M'), req.configuration_id, 1 if req.auto_run else 0, req.id))
             
             # Clear execution records when event is updated so badge returns to green
             c.execute('DELETE FROM event_executions WHERE event_id = ?', (req.id,))
@@ -1778,11 +1866,11 @@ def save_event(req: CreateEventReq, request: Request):
             action = "updated"
             event_id = req.id
         else:
-            # Insert new event
+            # Insert new event - store UTC date and time
             c.execute('''
                 INSERT INTO event_schedules (name, event_date, event_time, configuration_id, auto_run, updated_at)
                 VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-            ''', (req.name.strip(), req.event_date, req.event_time, req.configuration_id, 1 if req.auto_run else 0))
+            ''', (req.name.strip(), utc_date.strftime('%Y-%m-%d'), utc_time.strftime('%H:%M'), req.configuration_id, 1 if req.auto_run else 0))
             action = "saved"
             event_id = c.lastrowid
         
@@ -2006,6 +2094,163 @@ def get_event_executions(event_id: int):
 
 
 # Auto-run execution endpoint
+@app.get("/run/reports")
+def list_manual_runs():
+    """List all manual run reports"""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    
+    try:
+        c.execute('''
+            SELECT id, configuration_name, status, message, started_at, completed_at, execution_details
+            FROM manual_runs
+            ORDER BY started_at DESC
+            LIMIT 100
+        ''')
+        rows = c.fetchall()
+        
+        runs = []
+        for row in rows:
+            run_id, config_name, status, message, started_at, completed_at, details_json = row
+            duration = None
+            if started_at and completed_at:
+                try:
+                    start_dt = datetime.fromisoformat(started_at.replace('Z', '+00:00'))
+                    end_dt = datetime.fromisoformat(completed_at.replace('Z', '+00:00'))
+                    duration = int((end_dt - start_dt).total_seconds())
+                except:
+                    pass
+            
+            runs.append({
+                "id": run_id,
+                "configuration_name": config_name or "Manual Run",
+                "status": status,
+                "message": message,
+                "started_at": started_at,
+                "completed_at": completed_at,
+                "duration_seconds": duration
+            })
+        
+        return {"runs": runs}
+    except sqlite3.Error as e:
+        raise HTTPException(500, f"Database error: {str(e)}")
+    finally:
+        conn.close()
+
+
+@app.get("/run/reports/{run_id}")
+def get_manual_run_report(run_id: int):
+    """Get detailed report for a manual run"""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    
+    try:
+        c.execute('''
+            SELECT id, configuration_name, status, message, errors, started_at, completed_at, execution_details
+            FROM manual_runs
+            WHERE id = ?
+        ''', (run_id,))
+        row = c.fetchone()
+        
+        if not row:
+            raise HTTPException(404, f"Run with id {run_id} not found")
+        
+        run_id_db, config_name, status, message, errors_json, started_at, completed_at, details_json = row
+        errors = json.loads(errors_json) if errors_json else []
+        details = json.loads(details_json) if details_json else {}
+        
+        return {
+            "id": run_id_db,
+            "configuration_name": config_name or "Manual Run",
+            "status": status,
+            "message": message,
+            "errors": errors,
+            "started_at": started_at,
+            "completed_at": completed_at,
+            "execution_details": details
+        }
+    except sqlite3.Error as e:
+        raise HTTPException(500, f"Database error: {str(e)}")
+    finally:
+        conn.close()
+
+
+@app.post("/run/create")
+def create_manual_run(req: dict):
+    """Create a manual run record"""
+    try:
+        configuration_name = req.get('configuration_name', 'Manual Run')
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        try:
+            started_at = datetime.now(timezone.utc).isoformat()
+            c.execute('''
+                INSERT INTO manual_runs (configuration_name, status, started_at)
+                VALUES (?, ?, ?)
+            ''', (configuration_name, 'running', started_at))
+            run_id = c.lastrowid
+            conn.commit()
+            return {"run_id": run_id, "started_at": started_at}
+        except sqlite3.Error as e:
+            raise HTTPException(500, f"Database error: {str(e)}")
+        finally:
+            conn.close()
+    except Exception as e:
+        logger.error(f"Error creating manual run: {e}", exc_info=True)
+        raise HTTPException(500, f"Error creating manual run: {str(e)}")
+
+@app.put("/run/update/{run_id}")
+def update_manual_run(run_id: int, req: dict):
+    """Update a manual run record"""
+    try:
+        status = req.get('status', 'running')
+        message = req.get('message')
+        errors = req.get('errors', [])
+        execution_details = req.get('execution_details', {})
+        
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        try:
+            completed_at = datetime.now(timezone.utc).isoformat() if status in ['success', 'error'] else None
+            c.execute('''
+                UPDATE manual_runs
+                SET status = ?, message = ?, errors = ?, completed_at = ?, execution_details = ?
+                WHERE id = ?
+            ''', (
+                status,
+                message,
+                json.dumps(errors) if errors else None,
+                completed_at,
+                json.dumps(execution_details) if execution_details else None,
+                run_id
+            ))
+            conn.commit()
+            return {"status": "ok", "run_id": run_id}
+        except sqlite3.Error as e:
+            raise HTTPException(500, f"Database error: {str(e)}")
+        finally:
+            conn.close()
+    except Exception as e:
+        logger.error(f"Error updating manual run: {e}", exc_info=True)
+        raise HTTPException(500, f"Error updating manual run: {str(e)}")
+
+@app.post("/run/execute")
+def execute_run(req: dict, request: Request):
+    """Execute a configuration run and track it"""
+    try:
+        # Extract configuration data from request
+        config_data = req.get('config_data', {})
+        if not config_data:
+            raise HTTPException(400, "config_data is required")
+        
+        # Execute the configuration (event_id=None means manual run)
+        result = run_configuration(config_data, "Manual Run", event_id=None)
+        return result
+    except Exception as e:
+        logger.error(f"Error executing run: {e}", exc_info=True)
+        raise HTTPException(500, f"Error executing run: {str(e)}")
+
+
 @app.post("/event/execute/{event_id}")
 def execute_event(event_id: int, background_tasks: BackgroundTasks):
     """Execute an event's configuration automatically"""
@@ -2051,6 +2296,7 @@ def run_configuration(config_data: dict, event_name: str, event_id: Optional[int
         errors = []
         
         # Create execution record in database
+        is_manual_run = (event_id is None)
         if event_id is not None:
             conn = sqlite3.connect(DB_PATH)
             c = conn.cursor()
@@ -2072,6 +2318,22 @@ def run_configuration(config_data: dict, event_name: str, event_id: Optional[int
                     pass
             except sqlite3.Error as e:
                 logger.error(f"Failed to create execution record: {e}")
+            finally:
+                conn.close()
+        elif is_manual_run:
+            # Create manual run record
+            configuration_name = config_data.get('configName', 'Manual Run')
+            conn = sqlite3.connect(DB_PATH)
+            c = conn.cursor()
+            try:
+                c.execute('''
+                    INSERT INTO manual_runs (configuration_name, status, started_at)
+                    VALUES (?, ?, ?)
+                ''', (configuration_name, 'running', started_at.isoformat()))
+                execution_record_id = c.lastrowid
+                conn.commit()
+            except sqlite3.Error as e:
+                logger.error(f"Failed to create manual run record: {e}")
             finally:
                 conn.close()
         # Extract configuration data
@@ -2108,29 +2370,45 @@ def run_configuration(config_data: dict, event_name: str, event_id: Optional[int
         templates_list = config_data.get('templates', [])
         install_select = config_data.get('installSelect', '')
         
-        # If client_secret missing, try retrieving from stored NHI password and credential
-        if not client_secret and event_id is not None:
+        # If client_secret missing, try retrieving from NHI sources
+        # 1) For scheduled events: from event_nhi_passwords
+        # 2) For manual runs: from provided nhiCredentialId + nhiDecryptPassword
+        if not client_secret:
             try:
                 conn = sqlite3.connect(DB_PATH)
                 c = conn.cursor()
-                # Get stored password and related credential id
-                c.execute('SELECT nhi_credential_id, password_encrypted FROM event_nhi_passwords WHERE event_id = ?', (event_id,))
-                row = c.fetchone()
-                if row:
-                    nhi_cred_id, pwd_enc = row
-                    nhi_password = decrypt_with_server_secret(pwd_enc)
-                    # Fetch encrypted client secret and client_id
-                    c.execute('SELECT client_id, client_secret_encrypted FROM nhi_credentials WHERE id = ?', (nhi_cred_id,))
-                    cred = c.fetchone()
-                    if cred:
-                        client_id_db, client_secret_encrypted = cred
-                        if not client_id:
-                            client_id = client_id_db or client_id
-                        if client_secret_encrypted:
-                            client_secret = decrypt_client_secret(client_secret_encrypted, nhi_password)
+                if event_id is not None:
+                    # Get stored password and related credential id for event
+                    c.execute('SELECT nhi_credential_id, password_encrypted FROM event_nhi_passwords WHERE event_id = ?', (event_id,))
+                    row = c.fetchone()
+                    if row:
+                        nhi_cred_id, pwd_enc = row
+                        nhi_password = decrypt_with_server_secret(pwd_enc)
+                        # Fetch encrypted client secret and client_id
+                        c.execute('SELECT client_id, client_secret_encrypted FROM nhi_credentials WHERE id = ?', (nhi_cred_id,))
+                        cred = c.fetchone()
+                        if cred:
+                            client_id_db, client_secret_encrypted = cred
+                            if not client_id:
+                                client_id = client_id_db or client_id
+                            if client_secret_encrypted:
+                                client_secret = decrypt_client_secret(client_secret_encrypted, nhi_password)
+                else:
+                    # Manual run: accept NHI credential + decrypt password from payload
+                    nhi_cred_id_payload = config_data.get('nhiCredentialId')
+                    nhi_decrypt_password = config_data.get('nhiDecryptPassword')
+                    if nhi_cred_id_payload and nhi_decrypt_password:
+                        c.execute('SELECT client_id, client_secret_encrypted FROM nhi_credentials WHERE id = ?', (int(nhi_cred_id_payload),))
+                        cred = c.fetchone()
+                        if cred:
+                            client_id_db, client_secret_encrypted = cred
+                            if not client_id:
+                                client_id = client_id_db or client_id
+                            if client_secret_encrypted:
+                                client_secret = decrypt_client_secret(client_secret_encrypted, nhi_decrypt_password)
                 conn.close()
             except Exception as e:
-                logger.error(f"Event '{event_name}': Failed to retrieve/decrypt client secret for event {event_id}: {e}", exc_info=True)
+                logger.error(f"Event '{event_name}': Failed to retrieve/decrypt client secret: {e}", exc_info=True)
 
         # Step 1: Get tokens for all hosts (reuse stored if valid, otherwise fetch new)
         host_tokens = {}
@@ -2420,6 +2698,15 @@ def run_configuration(config_data: dict, event_name: str, event_id: Optional[int
         
         # Step 4: Execute SSH Profiles (if selected) BEFORE Install Workspace
         ssh_profile_id = config_data.get('sshProfileId', '')
+        # Convert empty string to None for proper checking
+        if isinstance(ssh_profile_id, str) and not ssh_profile_id.strip():
+            ssh_profile_id = None
+        elif ssh_profile_id:
+            try:
+                ssh_profile_id = int(ssh_profile_id)
+            except (ValueError, TypeError):
+                ssh_profile_id = None
+        
         ssh_wait_time = config_data.get('sshWaitTime', 0)  # Get wait time from config (default: 0)
         ssh_execution_details = None  # Track SSH execution details
         if ssh_profile_id:
@@ -2430,21 +2717,23 @@ def run_configuration(config_data: dict, event_name: str, event_id: Optional[int
                 
                 try:
                     # Get SSH profile
+                    logger.info(f"Event '{event_name}': Loading SSH profile with id {ssh_profile_id}")
                     c.execute('''
                         SELECT name, commands, ssh_key_id
                         FROM ssh_command_profiles
                         WHERE id = ?
-                    ''', (int(ssh_profile_id),))
+                    ''', (ssh_profile_id,))
                     profile_row = c.fetchone()
                     
                     if profile_row:
                         profile_name = profile_row[0]
                         commands = profile_row[1]
                         ssh_key_id = profile_row[2]
+                        logger.info(f"Event '{event_name}': SSH profile '{profile_name}' loaded, ssh_key_id={ssh_key_id}")
                         
                         # Initialize SSH execution tracking
                         ssh_execution_details = {
-                            "profile_id": int(ssh_profile_id),
+                            "profile_id": ssh_profile_id,
                             "profile_name": profile_name,
                             "wait_time_seconds": ssh_wait_time,
                             "commands": [cmd.strip() for cmd in commands.split('\n') if cmd.strip()],
@@ -2462,7 +2751,8 @@ def run_configuration(config_data: dict, event_name: str, event_id: Optional[int
                             
                             if key_row:
                                 encrypted_private_key = key_row[0]
-                                # Get encryption password from event_nhi_passwords if available
+                                # Get encryption password from event_nhi_passwords if available (for scheduled events)
+                                # or from config_data.nhiDecryptPassword (for manual runs)
                                 encryption_password = None
                                 if event_id:
                                     c.execute('''
@@ -2473,8 +2763,16 @@ def run_configuration(config_data: dict, event_name: str, event_id: Optional[int
                                     pwd_row = c.fetchone()
                                     if pwd_row:
                                         encryption_password = decrypt_with_server_secret(pwd_row[0])
+                                elif is_manual_run:
+                                    # For manual runs, use the decrypt password from config_data
+                                    encryption_password = config_data.get('nhiDecryptPassword')
+                                    if not encryption_password:
+                                        logger.warning(f"Event '{event_name}': nhiDecryptPassword not found in config_data for manual run")
+                                    else:
+                                        logger.info(f"Event '{event_name}': Using nhiDecryptPassword from config_data for SSH key decryption")
                                 
                                 if encryption_password:
+                                    logger.info(f"Event '{event_name}': Decrypting SSH key and executing commands")
                                     try:
                                         private_key = decrypt_client_secret(encrypted_private_key, encryption_password)
                                         
@@ -2557,6 +2855,10 @@ def run_configuration(config_data: dict, event_name: str, event_id: Optional[int
                                                                     time.sleep(ssh_wait_time)
                                                             
                                                             host_result["success"] = host_result["commands_failed"] == 0
+                                                            if host_result["success"]:
+                                                                logger.info(f"Event '{event_name}': SSH commands executed successfully on {host}")
+                                                            else:
+                                                                logger.warning(f"Event '{event_name}': SSH commands failed on {host}: {host_result['commands_failed']} command(s) failed")
                                                     except Exception as e:
                                                         msg = f"Error executing SSH commands on {host}: {e}"
                                                         host_result["error"] = str(e)
@@ -2624,7 +2926,11 @@ def run_configuration(config_data: dict, event_name: str, event_id: Optional[int
                         failed_host_names = ', '.join(failed_hosts)
                         logger.info(f"Event '{event_name}': Skipping installation on failed hosts: {failed_host_names}. Installing on {len(available_hosts)} remaining host(s).")
                     
-                    for host in available_hosts:
+                    # Install in parallel on all available hosts
+                    installation_lock = threading.Lock()
+                    
+                    def install_on_host(host):
+                        """Install fabric on a single host"""
                         try:
                             template_id = get_template(host, host_tokens[host], template_name, repo_name, version)
                             if template_id:
@@ -2640,17 +2946,18 @@ def run_configuration(config_data: dict, event_name: str, event_id: Optional[int
                                     success = result
                                     task_errors = []
                                 
-                                # Track installation details
-                                installation_details.append({
-                                    "host": host,
-                                    "template_name": template_name,
-                                    "repo_name": repo_name,
-                                    "version": version,
-                                    "success": success,
-                                    "duration_seconds": install_duration,
-                                    "installed_at": install_start.isoformat(),
-                                    "errors": task_errors if task_errors else None
-                                })
+                                # Track installation details (thread-safe)
+                                with installation_lock:
+                                    installation_details.append({
+                                        "host": host,
+                                        "template_name": template_name,
+                                        "repo_name": repo_name,
+                                        "version": version,
+                                        "success": success,
+                                        "duration_seconds": install_duration,
+                                        "installed_at": install_start.isoformat(),
+                                        "errors": task_errors if task_errors else None
+                                    })
                                 
                                 if success:
                                     # Log audit with duration
@@ -2658,23 +2965,73 @@ def run_configuration(config_data: dict, event_name: str, event_id: Optional[int
                                         log_audit("fabric_installed", details=f"host={host} template={template_name} version={version} event={event_name} duration_s={install_duration:.1f}", ip_address=None)
                                     except Exception:
                                         pass
+                                    logger.info(f"Event '{event_name}': Installation successful on host {host}: {template_name} v{version}")
                                 else:
+                                    # Mark host as failed - stop processing for this host
+                                    with installation_lock:
+                                        failed_hosts.add(host)
+                                    
+                                    # Build detailed error message per host
                                     if task_errors:
-                                        msg = f"Failed to install workspace '{template_name}' v{version} on host {host}: " + "; ".join(task_errors)
+                                        error_details = "; ".join(task_errors)
+                                        msg = f"Host {host}: Installation FAILED - {error_details}"
                                     else:
-                                        msg = f"Failed to install workspace '{template_name}' v{version} on host {host}: installation timed out or encountered an error"
+                                        msg = f"Host {host}: Installation FAILED - installation timed out or encountered an error"
+                                    
                                     logger.error(f"Event '{event_name}': {msg}")
-                                    errors.append(msg)
-                                    if task_errors:
-                                        errors.extend(task_errors)
+                                    with installation_lock:
+                                        errors.append(msg)
                             else:
-                                msg = f"Template '{template_name}' v{version} not found on host {host} for installation"
+                                # Mark host as failed - template not found
+                                with installation_lock:
+                                    failed_hosts.add(host)
+                                
+                                msg = f"Host {host}: Installation FAILED - Template '{template_name}' v{version} not found"
                                 logger.error(f"Event '{event_name}': {msg}")
-                                errors.append(msg)
+                                with installation_lock:
+                                    errors.append(msg)
                         except Exception as e:
-                            msg = f"Error installing workspace '{template_name}' v{version} on host {host}: {e}"
+                            # Mark host as failed on exception
+                            with installation_lock:
+                                failed_hosts.add(host)
+                            
+                            msg = f"Host {host}: Installation FAILED - Error: {e}"
                             logger.error(f"Event '{event_name}': {msg}")
-                            errors.append(msg)
+                            with installation_lock:
+                                errors.append(msg)
+                    
+                    # Start installation threads for all available hosts
+                    install_threads = []
+                    for host in available_hosts:
+                        thread = threading.Thread(target=install_on_host, args=(host,))
+                        thread.daemon = False
+                        thread.start()
+                        install_threads.append(thread)
+                    
+                    # Wait for all installation threads to complete
+                    for thread in install_threads:
+                        thread.join()
+                    
+                    # Generate per-host installation summary
+                    successful_hosts = []
+                    failed_hosts_for_install = []
+                    for detail in installation_details:
+                        if detail["success"]:
+                            successful_hosts.append(detail["host"])
+                        else:
+                            failed_hosts_for_install.append(detail["host"])
+                            # failed_hosts already updated in install_on_host
+                    
+                    # Log summary per host
+                    if successful_hosts:
+                        success_msg = f"Event '{event_name}': Installation completed successfully on {len(successful_hosts)} host(s): {', '.join(successful_hosts)}"
+                        logger.info(success_msg)
+                        # Don't add success messages to errors list - they're informational only
+                        # Success details are already tracked in installation_details
+                    
+                    if failed_hosts_for_install:
+                        logger.warning(f"Event '{event_name}': Installation failed on {len(failed_hosts_for_install)} host(s): {', '.join(failed_hosts_for_install)}")
+                        # Per-host failure messages already added in install_on_host function
             else:
                 msg = f"Repository name not found for template '{template_name}' v{version}"
                 logger.warning(f"Event '{event_name}': {msg}")
@@ -2696,63 +3053,82 @@ def run_configuration(config_data: dict, event_name: str, event_id: Optional[int
                     status = 'success'
                     message = "Auto-run execution completed successfully"
                 
-                c.execute('''
-                    UPDATE event_executions
-                    SET status = ?, message = ?, errors = ?, completed_at = ?, execution_details = ?
-                    WHERE id = ?
-                ''', (
-                    status,
-                    message,
-                    json.dumps(errors) if errors else None,
-                    completed_at.isoformat(),
-                    json.dumps({
-                        "hosts": [h.get('host') for h in hosts if isinstance(h, dict)] if isinstance(hosts, list) else [],
-                        "hosts_count": len(hosts),
-                        "templates": [
-                            {
-                                "repo_name": t.get('repo_name'),
-                                "template_name": t.get('template_name'),
-                                "version": t.get('version')
-                            } for t in (templates_list or []) if isinstance(t, dict)
-                        ],
-                        "templates_count": len(templates_list),
-                        "fabric_creations": fabric_creation_details,
-                        "fabric_creations_count": len(fabric_creation_details),
-                        "installed": (
-                            {
-                                "repo_name": repo_name if 'repo_name' in locals() else '',
-                                "template_name": template_name if 'template_name' in locals() else '',
-                                "version": version if 'version' in locals() else ''
-                            } if install_select else None
-                        ),
-                        "installations": installation_details,
-                        "installations_count": len(installation_details),
-                        "install_select": install_select,
-                        "ssh_profile": ssh_execution_details if ssh_execution_details else None,
-                        "duration_seconds": (completed_at - started_at).total_seconds(),
-                        "started_at": started_at.isoformat(),
-                        "completed_at": completed_at.isoformat()
-                    }),
-                    execution_record_id
-                ))
+                execution_details_json = json.dumps({
+                    "hosts": [h.get('host') for h in hosts if isinstance(h, dict)] if isinstance(hosts, list) else [],
+                    "hosts_count": len(hosts),
+                    "templates": [
+                        {
+                            "repo_name": t.get('repo_name'),
+                            "template_name": t.get('template_name'),
+                            "version": t.get('version')
+                        } for t in (templates_list or []) if isinstance(t, dict)
+                    ],
+                    "templates_count": len(templates_list),
+                    "fabric_creations": fabric_creation_details,
+                    "fabric_creations_count": len(fabric_creation_details),
+                    "installed": (
+                        {
+                            "repo_name": repo_name if 'repo_name' in locals() else '',
+                            "template_name": template_name if 'template_name' in locals() else '',
+                            "version": version if 'version' in locals() else ''
+                        } if install_select else None
+                    ),
+                    "installations": installation_details,
+                    "installations_count": len(installation_details),
+                    "install_select": install_select,
+                    "ssh_profile": ssh_execution_details if ssh_execution_details else None,
+                    "duration_seconds": (completed_at - started_at).total_seconds(),
+                    "started_at": started_at.isoformat(),
+                    "completed_at": completed_at.isoformat()
+                })
+                
+                if is_manual_run:
+                    # Update manual_runs table
+                    c.execute('''
+                        UPDATE manual_runs
+                        SET status = ?, message = ?, errors = ?, completed_at = ?, execution_details = ?
+                        WHERE id = ?
+                    ''', (
+                        status,
+                        message,
+                        json.dumps(errors) if errors else None,
+                        completed_at.isoformat(),
+                        execution_details_json,
+                        execution_record_id
+                    ))
+                else:
+                    # Update event_executions table
+                    c.execute('''
+                        UPDATE event_executions
+                        SET status = ?, message = ?, errors = ?, completed_at = ?, execution_details = ?
+                        WHERE id = ?
+                    ''', (
+                        status,
+                        message,
+                        json.dumps(errors) if errors else None,
+                        completed_at.isoformat(),
+                        execution_details_json,
+                        execution_record_id
+                    ))
+                    # Audit: event run finished
+                    try:
+                        duration = int((completed_at - started_at).total_seconds())
+                        if errors:
+                            log_audit(
+                                "event_run_failed",
+                                details=f"event_id={event_id} event_name={event_name} duration_s={duration} errors_count={len(errors)}",
+                                ip_address=None
+                            )
+                        else:
+                            log_audit(
+                                "event_run_succeeded",
+                                details=f"event_id={event_id} event_name={event_name} duration_s={duration} hosts_count={len(hosts)}",
+                                ip_address=None
+                            )
+                    except Exception:
+                        pass
+                
                 conn.commit()
-                # Audit: event run finished
-                try:
-                    duration = int((completed_at - started_at).total_seconds())
-                    if errors:
-                        log_audit(
-                            "event_run_failed",
-                            details=f"event_id={event_id} event_name={event_name} duration_s={duration} errors_count={len(errors)}",
-                            ip_address=None
-                        )
-                    else:
-                        log_audit(
-                            "event_run_succeeded",
-                            details=f"event_id={event_id} event_name={event_name} duration_s={duration} hosts_count={len(hosts)}",
-                            ip_address=None
-                        )
-                except Exception:
-                    pass
             except sqlite3.Error as e:
                 logger.error(f"Failed to update execution record: {e}")
             finally:
@@ -3215,6 +3591,72 @@ class ExecuteSshProfileReq(BaseModel):
     ssh_port: int = 22
     encryption_password: str
     wait_time_seconds: int = 0  # Wait time between commands (default: 0)
+    nhi_credential_id: Optional[int] = None  # Optional NHI credential ID for password validation
+
+@app.post("/ssh-profiles/validate-password")
+async def validate_ssh_password(req: dict):
+    """Validate that password matches both NHI credential (if provided) and SSH key"""
+    try:
+        nhi_credential_id = req.get('nhi_credential_id')
+        ssh_profile_id = req.get('ssh_profile_id')
+        encryption_password = req.get('encryption_password', '').strip()
+        
+        if not encryption_password:
+            return {"valid": False, "error": "Password is required"}
+        
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        
+        try:
+            # Validate SSH key password
+            if ssh_profile_id:
+                c.execute('''
+                    SELECT ssh_key_id
+                    FROM ssh_command_profiles
+                    WHERE id = ?
+                ''', (ssh_profile_id,))
+                profile_row = c.fetchone()
+                
+                if profile_row and profile_row[0]:
+                    ssh_key_id = profile_row[0]
+                    c.execute('''
+                        SELECT private_key_encrypted
+                        FROM ssh_keys
+                        WHERE id = ?
+                    ''', (ssh_key_id,))
+                    key_row = c.fetchone()
+                    
+                    if key_row:
+                        encrypted_private_key = key_row[0]
+                        try:
+                            decrypt_client_secret(encrypted_private_key, encryption_password)
+                        except ValueError:
+                            return {"valid": False, "error": "Password does not match SSH key password"}
+            
+            # Validate NHI credential password (if provided)
+            if nhi_credential_id:
+                c.execute('''
+                    SELECT client_secret_encrypted
+                    FROM nhi_credentials
+                    WHERE id = ?
+                ''', (nhi_credential_id,))
+                nhi_row = c.fetchone()
+                
+                if nhi_row:
+                    encrypted_client_secret = nhi_row[0]
+                    try:
+                        decrypt_client_secret(encrypted_client_secret, encryption_password)
+                    except ValueError:
+                        return {"valid": False, "error": "Password does not match NHI credential password"}
+                else:
+                    return {"valid": False, "error": "NHI credential not found"}
+            
+            return {"valid": True}
+        finally:
+            conn.close()
+    except Exception as e:
+        logger.error(f"Error validating password: {e}", exc_info=True)
+        return {"valid": False, "error": str(e)}
 
 @app.post("/ssh-profiles/execute")
 async def execute_ssh_profile(req: ExecuteSshProfileReq):
@@ -3881,12 +4323,16 @@ def delete_nhi(nhi_id: int):
 
 # Audit Logs endpoints
 @app.get("/audit-logs/list")
-def list_audit_logs(action: Optional[str] = None, user: Optional[str] = None, limit: int = 1000):
+def list_audit_logs(action: Optional[str] = None, user: Optional[str] = None, date_from: Optional[str] = None, date_to: Optional[str] = None, limit: int = 1000):
     """List audit logs with optional filtering"""
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    
+    conn = None
     try:
+        conn = db_connect_with_retry(timeout=10.0, max_retries=5, retry_delay=0.05)
+        if not conn:
+            raise HTTPException(500, "Failed to connect to database")
+        
+        c = conn.cursor()
+        
         query = '''
             SELECT id, action, user, details, ip_address, created_at
             FROM audit_logs
@@ -3901,6 +4347,33 @@ def list_audit_logs(action: Optional[str] = None, user: Optional[str] = None, li
         if user:
             query += ' AND user LIKE ?'
             params.append(f'%{user}%')
+        
+        # Add date range filters
+        if date_from:
+            try:
+                # Convert ISO format (with or without Z) to datetime
+                if date_from.endswith('Z'):
+                    from_dt = datetime.fromisoformat(date_from.replace('Z', '+00:00'))
+                else:
+                    from_dt = datetime.fromisoformat(date_from)
+                query += ' AND created_at >= ?'
+                params.append(from_dt.isoformat())
+            except ValueError:
+                pass  # Ignore invalid date format
+        
+        if date_to:
+            try:
+                # Convert ISO format (with or without Z) to datetime
+                if date_to.endswith('Z'):
+                    to_dt = datetime.fromisoformat(date_to.replace('Z', '+00:00'))
+                else:
+                    to_dt = datetime.fromisoformat(date_to)
+                # Add 1 day and subtract 1 second to include the entire end day
+                to_dt = to_dt + timedelta(days=1) - timedelta(seconds=1)
+                query += ' AND created_at <= ?'
+                params.append(to_dt.isoformat())
+            except ValueError:
+                pass  # Ignore invalid date format
         
         query += ' ORDER BY created_at DESC LIMIT ?'
         params.append(limit)
@@ -3923,7 +4396,8 @@ def list_audit_logs(action: Optional[str] = None, user: Optional[str] = None, li
     except sqlite3.Error as e:
         raise HTTPException(500, f"Database error: {str(e)}")
     finally:
-        conn.close()
+        if conn:
+            conn.close()
 
 @app.post("/audit-logs/create")
 def create_audit_log(request: Request, action: str, user: Optional[str] = None, details: Optional[str] = None):
@@ -3933,12 +4407,16 @@ def create_audit_log(request: Request, action: str, user: Optional[str] = None, 
     return {"status": "ok", "message": "Audit log created"}
 
 @app.get("/audit-logs/export")
-def export_audit_logs(action: Optional[str] = None, user: Optional[str] = None):
+def export_audit_logs(action: Optional[str] = None, user: Optional[str] = None, date_from: Optional[str] = None, date_to: Optional[str] = None):
     """Export audit logs as CSV"""
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    
+    conn = None
     try:
+        conn = db_connect_with_retry(timeout=10.0, max_retries=5, retry_delay=0.05)
+        if not conn:
+            raise HTTPException(500, "Failed to connect to database")
+        
+        c = conn.cursor()
+        
         query = '''
             SELECT action, user, details, ip_address, created_at
             FROM audit_logs
@@ -3953,6 +4431,24 @@ def export_audit_logs(action: Optional[str] = None, user: Optional[str] = None):
         if user:
             query += ' AND user LIKE ?'
             params.append(f'%{user}%')
+        
+        # Add date range filters
+        if date_from:
+            try:
+                from_dt = datetime.fromisoformat(date_from.replace('Z', '+00:00'))
+                query += ' AND created_at >= ?'
+                params.append(from_dt.isoformat())
+            except ValueError:
+                pass
+        
+        if date_to:
+            try:
+                to_dt = datetime.fromisoformat(date_to.replace('Z', '+00:00'))
+                to_dt = to_dt + timedelta(days=1) - timedelta(seconds=1)
+                query += ' AND created_at <= ?'
+                params.append(to_dt.isoformat())
+            except ValueError:
+                pass
         
         query += ' ORDER BY created_at DESC'
         
@@ -3977,15 +4473,20 @@ def export_audit_logs(action: Optional[str] = None, user: Optional[str] = None):
     except sqlite3.Error as e:
         raise HTTPException(500, f"Database error: {str(e)}")
     finally:
-        conn.close()
+        if conn:
+            conn.close()
 
 
 # Server Logs endpoints (now shows INFO level application logs)
 @app.get("/server-logs/list")
-def list_server_logs(level: Optional[str] = None, logger_name: Optional[str] = None, message: Optional[str] = None, limit: int = 1000):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
+def list_server_logs(level: Optional[str] = None, logger_name: Optional[str] = None, message: Optional[str] = None, date_from: Optional[str] = None, date_to: Optional[str] = None, limit: int = 1000):
+    conn = None
     try:
+        conn = db_connect_with_retry(timeout=10.0, max_retries=5, retry_delay=0.05)
+        if not conn:
+            raise HTTPException(500, "Failed to connect to database")
+        
+        c = conn.cursor()
         query = '''
             SELECT id, level, logger_name, message, created_at
             FROM app_logs
@@ -4001,6 +4502,25 @@ def list_server_logs(level: Optional[str] = None, logger_name: Optional[str] = N
         if message:
             query += ' AND message LIKE ?'
             params.append(f'%{message}%')
+        
+        # Add date range filters
+        if date_from:
+            try:
+                from_dt = datetime.fromisoformat(date_from.replace('Z', '+00:00'))
+                query += ' AND created_at >= ?'
+                params.append(from_dt.isoformat())
+            except ValueError:
+                pass
+        
+        if date_to:
+            try:
+                to_dt = datetime.fromisoformat(date_to.replace('Z', '+00:00'))
+                to_dt = to_dt + timedelta(days=1) - timedelta(seconds=1)
+                query += ' AND created_at <= ?'
+                params.append(to_dt.isoformat())
+            except ValueError:
+                pass
+        
         query += ' ORDER BY id DESC LIMIT ?'
         params.append(limit)
         c.execute(query, params)
@@ -4018,13 +4538,18 @@ def list_server_logs(level: Optional[str] = None, logger_name: Optional[str] = N
     except sqlite3.Error as e:
         raise HTTPException(500, f"Database error: {str(e)}")
     finally:
-        conn.close()
+        if conn:
+            conn.close()
 
 @app.get("/server-logs/export")
-def export_server_logs(level: Optional[str] = None, logger_name: Optional[str] = None, message: Optional[str] = None):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
+def export_server_logs(level: Optional[str] = None, logger_name: Optional[str] = None, message: Optional[str] = None, date_from: Optional[str] = None, date_to: Optional[str] = None):
+    conn = None
     try:
+        conn = db_connect_with_retry(timeout=10.0, max_retries=5, retry_delay=0.05)
+        if not conn:
+            raise HTTPException(500, "Failed to connect to database")
+        
+        c = conn.cursor()
         query = '''
             SELECT created_at, level, logger_name, message
             FROM app_logs WHERE 1=1
@@ -4039,6 +4564,25 @@ def export_server_logs(level: Optional[str] = None, logger_name: Optional[str] =
         if message:
             query += ' AND message LIKE ?'
             params.append(f'%{message}%')
+        
+        # Add date range filters
+        if date_from:
+            try:
+                from_dt = datetime.fromisoformat(date_from.replace('Z', '+00:00'))
+                query += ' AND created_at >= ?'
+                params.append(from_dt.isoformat())
+            except ValueError:
+                pass
+        
+        if date_to:
+            try:
+                to_dt = datetime.fromisoformat(date_to.replace('Z', '+00:00'))
+                to_dt = to_dt + timedelta(days=1) - timedelta(seconds=1)
+                query += ' AND created_at <= ?'
+                params.append(to_dt.isoformat())
+            except ValueError:
+                pass
+        
         query += ' ORDER BY id DESC'
         c.execute(query, params)
         rows = c.fetchall()
@@ -4053,7 +4597,8 @@ def export_server_logs(level: Optional[str] = None, logger_name: Optional[str] =
     except sqlite3.Error as e:
         raise HTTPException(500, f"Database error: {str(e)}")
     finally:
-        conn.close()
+        if conn:
+            conn.close()
 
 @app.delete("/nhi/delete/{nhi_id}")
 def delete_nhi(nhi_id: int):
@@ -4434,9 +4979,12 @@ def check_and_run_events():
     """Check for events that should run now and execute them"""
     global executed_events
     
+    logger.info("Event scheduler started")
+    
     while True:
         try:
-            now = datetime.now()
+            # Use UTC time for all date/time matching (backend stores everything in UTC)
+            now = datetime.now(timezone.utc)
             current_date = now.date()
             current_time = now.time().replace(second=0, microsecond=0)  # Round to minute
             
@@ -4444,28 +4992,63 @@ def check_and_run_events():
             c = conn.cursor()
             
             # Find events that should run now (auto_run enabled, date matches, time matches or no time specified)
-            # Compare times by converting to string format HH:MM:SS or HH:MM
-            current_time_str = current_time.strftime('%H:%M:%S') if current_time else None
+            # Compare dates as strings (YYYY-MM-DD format) - stored in UTC
+            current_date_str = current_date.strftime('%Y-%m-%d')
+            current_time_str = current_time.strftime('%H:%M:%S')
+            current_time_short = current_time.strftime('%H:%M')
             
+            # Log scheduler check periodically (every 10 checks = ~5 minutes)
+            if random.randint(1, 10) == 1:
+                logger.debug(f"Scheduler checking: date={current_date_str}, time={current_time_str} (UTC)")
+            
+            # First, let's see what events exist in the database
+            c.execute('''
+                SELECT id, name, event_date, event_time, auto_run
+                FROM event_schedules
+                WHERE auto_run = 1
+            ''')
+            all_events = c.fetchall()
+            if all_events:
+                logger.debug(f"Found {len(all_events)} auto-run event(s) in database:")
+                for evt_id, evt_name, evt_date, evt_time, evt_auto_run in all_events:
+                    logger.debug(f"  - Event {evt_id}: {evt_name}, date={evt_date!r}, time={evt_time!r}, auto_run={evt_auto_run}")
+            
+            # Query for events - dates are stored as YYYY-MM-DD format
+            # Times are stored as HH:MM format (e.g., "10:25" or "19:00"), not HH:MM:SS
+            # We check every 30 seconds, so match events if current time (rounded to minute) matches event time
+            # Event time might be stored as "HH:MM" (5 chars) or "HH:MM:SS" (8 chars)
+            # We compare the first 5 characters (HH:MM) of both
+            
+            # Compare times - normalize both to HH:MM for comparison
             c.execute('''
                 SELECT id, name, event_date, event_time
                 FROM event_schedules
                 WHERE auto_run = 1
                 AND event_date = ?
-                AND (event_time IS NULL OR event_time = ? OR SUBSTR(event_time, 1, 5) = ?)
-            ''', (str(current_date), current_time_str, current_time.strftime('%H:%M') if current_time else None))
+                AND (
+                    event_time IS NULL 
+                    OR SUBSTR(event_time, 1, 5) = ?
+                )
+            ''', (current_date_str, current_time_short))
             
             events_to_run = c.fetchall()
             
             if events_to_run:
-                # Only log if there are events to run
-                if len(events_to_run) > 0:
-                    pass
+                logger.info(f"Found {len(events_to_run)} event(s) to run at {current_date_str} {current_time_str} (UTC)")
+                for event_id, event_name, event_date, event_time in events_to_run:
+                    logger.info(f"  - Event ID {event_id}: {event_name} (date={event_date}, time={event_time}, UTC)")
+            else:
+                # Log why no events matched (for debugging) - only log every 10th check to avoid spam
+                if random.randint(1, 10) == 1:
+                    logger.debug(f"No events matched: date={current_date_str}, time={current_time_short} (UTC)")
+                    # Also show what events exist
+                    if all_events:
+                        logger.debug(f"  Available events: {[(evt_id, evt_name, evt_date, evt_time) for evt_id, evt_name, evt_date, evt_time, _ in all_events]}")
             
             # Clean up executed events from previous days
             if events_to_run:
-                today_str = str(current_date)
-                executed_events = {e for e in executed_events if str(e).startswith(today_str)}
+                # Clean up based on date format
+                executed_events = {e for e in executed_events if str(e).startswith(current_date_str)}
             
             for event_id, event_name, event_date, event_time in events_to_run:
                 # Create unique key for this event execution
@@ -4473,10 +5056,12 @@ def check_and_run_events():
                 
                 # Skip if already executed
                 if event_key in executed_events:
+                    logger.debug(f"Skipping event {event_id} - already executed (key: {event_key})")
                     continue
                 
                 # Mark as executed before starting (to prevent duplicate if scheduler runs again)
                 executed_events.add(event_key)
+                logger.info(f"Executing event {event_id}: {event_name} (key: {event_key})")
                 
                 try:
                     # Execute in background thread
@@ -4646,17 +5231,17 @@ def start_scheduler():
         scheduler_thread = threading.Thread(target=check_and_run_events)
         scheduler_thread.daemon = True  # Allow main process to exit
         scheduler_thread.start()
-        pass
+        logger.info("Event scheduler thread started")
     else:
-        pass
+        logger.warning("Event scheduler thread already running")
     
     # Start token refresh background task
     if token_refresh_thread is None or not token_refresh_thread.is_alive():
         token_refresh_thread = threading.Thread(target=check_and_run_token_refresh)
         token_refresh_thread.daemon = True
         token_refresh_thread.start()
-        pass
+        logger.info("Token refresh thread started")
     else:
-        pass
+        logger.warning("Token refresh thread already running")
 
 

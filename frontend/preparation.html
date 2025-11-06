@@ -123,7 +123,18 @@
     <ul id="tplList"></ul>
   </div>
 
-  <div id="actionStatus" class="notice" role="status" style="display:none;"></div>
+  <div id="actionStatus" class="notice" role="status" style="display:none;">
+    <div id="actionStatusMessage" style="margin-bottom: 8px;"></div>
+    <div id="actionStatusProgress" style="display: none; margin-top: 8px;">
+      <div style="display: flex; align-items: center; gap: 12px; margin-bottom: 4px;">
+        <div class="progress" style="width: 400px; height: 20px; margin: 0;">
+          <span id="actionStatusProgressBar" class="ind determinate" style="width: 0%;"></span>
+        </div>
+        <span id="actionStatusProgressText" style="font-weight: 600; min-width: 45px;">0%</span>
+        <span id="actionStatusTimer" style="font-size: 12px; color: #424245; font-weight: 500; min-width: 60px;">00:00</span>
+      </div>
+    </div>
+  </div>
   <pre id="out" style="display:none;"></pre>
 </div>
 

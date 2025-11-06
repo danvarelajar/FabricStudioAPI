@@ -1081,6 +1081,10 @@ async function loadSelectedNhiCredential() {
     const confirmBtn = el('btnConfirmHosts');
     if (confirmBtn) confirmBtn.disabled = false;
     
+    // Ensure Run button is disabled until hosts are confirmed
+    const runBtn = el('btnInstallSelected');
+    if (runBtn) runBtn.disabled = true;
+    
     // Show final success message if no specific message was already shown above
     if (nhiHosts.length === 0) {
       showStatus(`NHI credential '${nhiData.name}' loaded successfully (no hosts in credential)`);
@@ -1099,6 +1103,10 @@ async function loadSelectedNhiCredential() {
     currentNhiId = null;
       sessionExpiresAt = null;
       // Session-based: tokens are managed server-side
+    
+    // Disable Run button on credential load error
+    const runBtnError = el('btnInstallSelected');
+    if (runBtnError) runBtnError.disabled = true;
     
     // Disable the NHI credential input and radio button on error
     const fabricHostFromNhiInput = el('fabricHostFromNhi');
@@ -1127,6 +1135,10 @@ async function loadSelectedNhiCredential() {
     // Keep Confirm button disabled on error
     const confirmBtn = el('btnConfirmHosts');
     if (confirmBtn) confirmBtn.disabled = true;
+    
+    // Disable Run button when credentials are cleared
+    const runBtnCleared = el('btnInstallSelected');
+    if (runBtnCleared) runBtnCleared.disabled = true;
   }
 }
 
@@ -1139,12 +1151,7 @@ if (!window.validatedNhiHosts) window.validatedNhiHosts = [];
 // which is called when the preparation section is loaded
 
 function logMsg(msg) {
-  // Expert Mode logging - only log when Expert Mode is enabled
-  const expertMode = el('expertMode');
-  if (!expertMode || !expertMode.checked) {
-    return; // Don't log if Expert Mode is disabled
-  }
-  
+  // Always log messages regardless of Expert Mode toggle status
   const out = el('out');
   if (out) {
     const now = new Date();
@@ -1157,10 +1164,25 @@ function logMsg(msg) {
 
 function showStatus(msg, opts = {}) {
   const box = el('actionStatus');
-  if (!box) return;
-  // Replace newlines with <br> tags for HTML display
-  box.innerHTML = msg.replace(/\n/g, '<br>');
+  const messageEl = el('actionStatusMessage');
+  if (!box || !messageEl) return;
+  
+  // Update message
+  messageEl.innerHTML = msg.replace(/\n/g, '<br>');
   box.style.display = '';
+  
+  // Show/hide progress section based on opts
+  // If showProgress is not specified, preserve current visibility state
+  const progressSection = el('actionStatusProgress');
+  if (progressSection) {
+    if (opts.showProgress === true) {
+      progressSection.style.display = '';
+    } else if (opts.showProgress === false) {
+      progressSection.style.display = 'none';
+    }
+    // If showProgress is undefined, don't change the visibility (preserve current state)
+  }
+  
   // Add error styling if it's an error message
   if (opts.error || msg.toLowerCase().includes('error') || msg.toLowerCase().includes('failed')) {
     box.style.color = '#d32f2f';
@@ -1174,7 +1196,12 @@ function showStatus(msg, opts = {}) {
   logMsg(msg);
   if (opts.hideAfterMs) {
     const ms = opts.hideAfterMs;
-    setTimeout(() => { if (box.innerHTML === msg.replace(/\n/g, '<br>')) box.style.display = 'none'; }, ms);
+    setTimeout(() => { 
+      if (messageEl.innerHTML === msg.replace(/\n/g, '<br>')) {
+        box.style.display = 'none';
+        if (progressSection) progressSection.style.display = 'none';
+      }
+    }, ms);
   }
 }
 
@@ -1841,6 +1868,16 @@ function updateCreateEnabled() {
     return;
   }
   
+  // Check if NHI credentials are loaded and hosts are confirmed
+  const nhiLoaded = currentNhiId && decryptedClientId;
+  const hostsConfirmed = confirmedHosts && confirmedHosts.length > 0;
+  
+  // Both conditions must be met
+  if (!nhiLoaded || !hostsConfirmed) {
+    runBtn.disabled = true;
+    return;
+  }
+  
   const rows = Array.from(document.querySelectorAll('.tpl-row'));
   const allNonEmpty = rows.length > 0 && rows.every(r => {
     const selects = r.querySelectorAll('select');
@@ -1853,7 +1890,7 @@ function updateCreateEnabled() {
     const version = versionSelect?.value || '';
     return Boolean(repo_name && template_name && version);
   });
-  // Enable Run button if all rows are filled (even if templates aren't created yet)
+  // Enable Run button if all rows are filled AND credentials loaded AND hosts confirmed
   // The Run button will handle Install Workspace first
   runBtn.disabled = !allNonEmpty;
 }
@@ -2327,6 +2364,10 @@ function initializeSection(sectionName) {
     // Server Logs initialization
     setupServerLogsButtons();
     loadServerLogs();
+  } else if (sectionName === 'reports') {
+    // Reports section initialization
+    setupReportsButtons();
+    loadReports();
   }
 }
 
@@ -2672,8 +2713,14 @@ function initializePreparationSection() {
         
         // Cache all templates from all repositories for all confirmed hosts
         await cacheAllTemplates();
+        
+        // Now that hosts are confirmed AND credentials are loaded, update Run button state
+        updateCreateEnabled();
       } else {
         showStatus('Hosts confirmed but token acquisition failed. Please check credentials.');
+        // Keep Run button disabled if token acquisition failed
+        const runBtn = el('btnInstallSelected');
+        if (runBtn) runBtn.disabled = true;
       }
     };
   }
@@ -2737,8 +2784,8 @@ function initMenu() {
         const isExpanded = group.classList.contains('expanded');
         group.classList.toggle('expanded');
         
-        // If expanding and no submenu item is active, load the first submenu item
         if (!isExpanded) {
+          // Expanding: load the first submenu item
           const firstSubmenuItem = group.querySelector('.submenu-item');
           if (firstSubmenuItem) {
             // Remove active class from all items
@@ -2752,6 +2799,7 @@ function initMenu() {
             }
           }
         }
+        // If collapsing, do nothing - just let the menu collapse
       });
     }
   });
@@ -2799,21 +2847,32 @@ function initMenu() {
     }
   }
   
-  // Expand Configurations menu by default if it's the active section
-  const configurationsGroup = document.querySelector('#configurations-menu')?.closest('.menu-group');
-  if (configurationsGroup) {
-    const activeSubmenuItem = configurationsGroup.querySelector('.submenu-item.active');
-    if (activeSubmenuItem) {
-      configurationsGroup.classList.add('expanded');
-    }
-  }
-  
   // Expand Logs menu by default if it's the active section
   const logsGroup = document.querySelector('#logs-menu')?.closest('.menu-group');
   if (logsGroup) {
     const activeSubmenuItem = logsGroup.querySelector('.submenu-item.active');
     if (activeSubmenuItem) {
       logsGroup.classList.add('expanded');
+    }
+  }
+  
+  // Expand Preparation menu by default if it's the active section
+  // This now includes: Run Configuration, Saved Configurations, SSH Commands Profile, Reports
+  const preparationGroup = document.querySelector('#preparation-menu')?.closest('.menu-group');
+  if (preparationGroup) {
+    const activeSubmenuItem = preparationGroup.querySelector('.submenu-item.active');
+    if (activeSubmenuItem) {
+      preparationGroup.classList.add('expanded');
+    }
+    // If the parent is active but no submenu item is active, activate the first one
+    const parentButton = preparationGroup.querySelector('.menu-parent');
+    if (parentButton && parentButton.classList.contains('active')) {
+      const firstSubmenuItem = preparationGroup.querySelector('.submenu-item');
+      if (firstSubmenuItem && !firstSubmenuItem.classList.contains('active')) {
+        firstSubmenuItem.classList.add('active');
+        parentButton.classList.remove('active');
+        preparationGroup.classList.add('expanded');
+      }
     }
   }
   
@@ -2849,7 +2908,7 @@ function clearConfigName() {
   displayConfigName(null);
 }
 
-// Reset all inputs in FabricStudio Preparation section
+// Reset all inputs in FabricStudio Runs section
 function resetPreparationSection() {
   // Reset bypass flag when resetting section
   bypassGatingConditions = false;
@@ -2998,9 +3057,61 @@ async function loadEventConfigs() {
   }
 }
 
+// Helper functions for UTC/local timezone conversion
+function localToUTC(dateStr, timeStr) {
+  // Convert local date/time to UTC
+  // dateStr: YYYY-MM-DD, timeStr: HH:MM
+  if (!dateStr) return { date: null, time: null };
+  
+  // Create a Date object from local date/time (JavaScript interprets as local time)
+  const localDateTime = new Date(dateStr + (timeStr ? 'T' + timeStr + ':00' : 'T00:00:00'));
+  
+  // Get UTC equivalent
+  const utcDate = localDateTime.toISOString().split('T')[0]; // YYYY-MM-DD
+  const utcTime = localDateTime.toISOString().split('T')[1].substring(0, 5); // HH:MM
+  
+  return { date: utcDate, time: timeStr ? utcTime : null };
+}
+
+function utcToLocal(dateStr, timeStr) {
+  // Convert UTC date/time to local
+  // dateStr: YYYY-MM-DD, timeStr: HH:MM (UTC)
+  if (!dateStr) return { date: null, time: null };
+  
+  try {
+    // Create UTC datetime string with Z suffix
+    // If timeStr is provided, use it; otherwise use midnight UTC
+    const timePart = (timeStr && timeStr.trim()) ? timeStr.trim() + ':00:00' : '00:00:00';
+    const utcDateTimeStr = dateStr + 'T' + timePart + 'Z';
+    
+    // Create Date object from UTC string - JavaScript will automatically convert to local timezone
+    const utcDateTime = new Date(utcDateTimeStr);
+    
+    // Check if date is valid
+    if (isNaN(utcDateTime.getTime())) {
+      return { date: dateStr, time: timeStr || null };
+    }
+    
+    // Use getFullYear, getMonth, getDate, getHours, getMinutes - these return LOCAL time values
+    // when the Date object is created from a UTC string
+    const year = utcDateTime.getFullYear();
+    const month = String(utcDateTime.getMonth() + 1).padStart(2, '0');
+    const day = String(utcDateTime.getDate()).padStart(2, '0');
+    const hours = String(utcDateTime.getHours()).padStart(2, '0');
+    const minutes = String(utcDateTime.getMinutes()).padStart(2, '0');
+    
+    return { 
+      date: `${year}-${month}-${day}`, 
+      time: (timeStr && timeStr.trim()) ? `${hours}:${minutes}` : null 
+    };
+  } catch (e) {
+    // Return original values if conversion fails
+    return { date: dateStr, time: timeStr || null };
+  }
+}
+
 // Load and display events
 async function loadEvents() {
-  const eventsList = el('eventsList');
   if (!eventsList) return;
   
   eventsList.innerHTML = '<p>Loading events...</p>';
@@ -3048,17 +3159,47 @@ async function loadEvents() {
     `;
     html += '<div style="display: flex; flex-direction: column; gap: 12px;">';
     enrichedEvents.forEach(event => {
-      const eventDate = new Date(event.event_date + 'T00:00:00').toLocaleDateString();
-      let dateTimeDisplay = eventDate;
-      if (event.event_time) {
-        // Format time (HH:MM) to a readable format
-        const timeParts = event.event_time.split(':');
-        const hours = parseInt(timeParts[0]);
-        const minutes = timeParts[1];
-        const ampm = hours >= 12 ? 'PM' : 'AM';
-        const displayHours = hours % 12 || 12;
-        dateTimeDisplay = `${eventDate} at ${displayHours}:${minutes} ${ampm}`;
+      // Convert UTC date/time from backend to local time for display
+      let dateTimeDisplay;
+      try {
+        if (event.event_date) {
+          // Backend stores date/time in UTC, convert to local for display
+          // Create UTC datetime string
+          const utcTimePart = (event.event_time && event.event_time.trim()) ? event.event_time.trim() + ':00' : '00:00:00';
+          const utcDateTimeStr = event.event_date + 'T' + utcTimePart + 'Z';
+          
+          // Create Date object from UTC string - JavaScript handles timezone conversion
+          const utcDateObj = new Date(utcDateTimeStr);
+          
+          if (!isNaN(utcDateObj.getTime())) {
+            // Format date as dd/mm/yyyy to match input field format
+            const day = String(utcDateObj.getDate()).padStart(2, '0');
+            const month = String(utcDateObj.getMonth() + 1).padStart(2, '0');
+            const year = utcDateObj.getFullYear();
+            const localDate = `${day}/${month}/${year}`;
+            
+            if (event.event_time && event.event_time.trim()) {
+              // Format time in 12-hour format
+              const hours = utcDateObj.getHours(); // Returns local hours
+              const minutes = utcDateObj.getMinutes(); // Returns local minutes
+              const ampm = hours >= 12 ? 'PM' : 'AM';
+              const displayHours = hours % 12 || 12;
+              dateTimeDisplay = `${localDate} at ${displayHours}:${String(minutes).padStart(2, '0')} ${ampm}`;
+            } else {
+              dateTimeDisplay = localDate;
+            }
+          } else {
+            // Fallback: show UTC time if conversion fails
+            dateTimeDisplay = event.event_date + (event.event_time ? ` ${event.event_time} UTC` : '');
+          }
+        } else {
+          dateTimeDisplay = 'No date set';
+        }
+      } catch (e) {
+        // Fallback to raw values if conversion fails
+        dateTimeDisplay = event.event_date + (event.event_time ? ` ${event.event_time} UTC` : '');
       }
+      
       const createdDate = new Date(event.created_at).toLocaleString();
       const updatedDate = new Date(event.updated_at).toLocaleString();
       
@@ -3268,11 +3409,21 @@ function showExecutionModal(data) {
               ? `<div>Hosts: ${exec.execution_details.hosts.map(h => `<code>${h}</code>`).join(', ')}</div>` 
               : (exec.execution_details?.hosts_count !== undefined ? `<div>Hosts: ${exec.execution_details.hosts_count}</div>` : '')}
             ${Array.isArray(exec.execution_details?.templates) && exec.execution_details.templates.length > 0 
-              ? `<div>Templates:<ul style=\"margin: 4px 0 0 16px;\">${exec.execution_details.templates.map(t => `<li>${t.repo_name ? `<code>${t.repo_name}</code>/` : ''}<strong>${t.template_name || ''}</strong> v${t.version || ''}</li>`).join('')}</ul></div>`
-              : (exec.execution_details?.templates_count !== undefined ? `<div>Templates: ${exec.execution_details.templates_count}</div>` : '')}
+              ? `<div style="margin-top: 8px; padding: 8px; background: #f0fdf4; border-left: 3px solid #10b981; border-radius: 4px;">
+                  <div style="font-weight: 600; color: #047857; margin-bottom: 4px; font-size: 13px;">Templates:</div>
+                  <ul style="margin: 4px 0 0 16px; font-size: 11px; color: #047857;">
+                    ${exec.execution_details.templates.map(t => `<li>${t.repo_name ? `<code>${t.repo_name}</code>/` : ''}<strong>${t.template_name || ''}</strong> v${t.version || ''}</li>`).join('')}
+                  </ul>
+                </div>`
+              : (exec.execution_details?.templates_count !== undefined ? `<div style="margin-top: 8px; padding: 8px; background: #f0fdf4; border-left: 3px solid #10b981; border-radius: 4px; font-size: 11px; color: #047857;">Templates: ${exec.execution_details.templates_count}</div>` : '')}
             ${exec.execution_details?.installed 
-              ? `<div>Installed: ${exec.execution_details.installed.repo_name ? `<code>${exec.execution_details.installed.repo_name}</code>/` : ''}<strong>${exec.execution_details.installed.template_name || ''}</strong> v${exec.execution_details.installed.version || ''}</div>`
-              : (exec.execution_details?.install_select ? `<div>Installed: ${exec.execution_details.install_select}</div>` : '')}
+              ? `<div style="margin-top: 8px; padding: 8px; background: #f0fdf4; border-left: 3px solid #10b981; border-radius: 4px;">
+                  <div style="font-weight: 600; color: #047857; margin-bottom: 4px; font-size: 13px;">Installed:</div>
+                  <div style="font-size: 11px; color: #047857; margin-left: 8px;">
+                    ${exec.execution_details.installed.repo_name ? `<code>${exec.execution_details.installed.repo_name}</code>/` : ''}<strong>${exec.execution_details.installed.template_name || ''}</strong> v${exec.execution_details.installed.version || ''}
+                  </div>
+                </div>`
+              : (exec.execution_details?.install_select ? `<div style="margin-top: 8px; padding: 8px; background: #f0fdf4; border-left: 3px solid #10b981; border-radius: 4px; font-size: 11px; color: #047857;">Installed: ${exec.execution_details.install_select}</div>` : '')}
             ${exec.execution_details?.ssh_profile 
               ? `<div style="margin-top: 8px; padding: 8px; background: #f0f9ff; border-left: 3px solid #3b82f6; border-radius: 4px;">
                   <div style="font-weight: 600; color: #1e40af; margin-bottom: 4px; font-size: 13px;">SSH Profile Execution:</div>
@@ -3360,7 +3511,7 @@ async function loadConfigurations() {
     const configs = data.configurations || [];
     
     if (configs.length === 0) {
-      configsList.innerHTML = '<p>No saved configurations found. Save configurations in FabricStudio Preparation</p>';
+      configsList.innerHTML = '<p>No saved configurations found. Save configurations in FabricStudio Runs</p>';
       return;
     }
     
@@ -3565,13 +3716,21 @@ async function loadConfigurationById(configId) {
     displayConfigName(configName);
     
     // Switch to preparation section
-    const prepItem = document.querySelector('.menu-item[data-section="preparation"]');
+    // Find the submenu item for "Run Configuration" (preparation section)
+    const prepItem = document.querySelector('.submenu-item[data-section="preparation"]') || 
+                     document.querySelector('.menu-item[data-section="preparation"]');
     if (prepItem) {
       // Check if we're already on the preparation section
       const currentSection = document.querySelector('.menu-item.active');
       const isAlreadyOnPrep = currentSection && currentSection.getAttribute('data-section') === 'preparation';
       
       if (!isAlreadyOnPrep) {
+        // Expand the parent menu group if it's a submenu item
+        const menuGroup = prepItem.closest('.menu-group');
+        if (menuGroup && prepItem.classList.contains('submenu-item')) {
+          menuGroup.classList.add('expanded');
+        }
+        
         // Click to switch to preparation section
         prepItem.click();
         
@@ -3588,7 +3747,7 @@ async function loadConfigurationById(configId) {
       }
       
       if (!el('apiBase')) {
-        showStatus('Error: Preparation section not loaded. Please try clicking on FabricStudio Preparation manually.');
+        showStatus('Error: Preparation section not loaded. Please try clicking on FabricStudio Runs manually.');
         hideLoadingScreen();
         return;
       }
@@ -4761,13 +4920,15 @@ function formatTime(seconds) {
 function startRunTimer() {
   runStartTime = Date.now();
   const timerEl = el('runProgressTimer');
-  if (!timerEl) return;
+  const actionStatusTimer = el('actionStatusTimer');
   
   if (runTimerInterval) clearInterval(runTimerInterval);
   runTimerInterval = setInterval(() => {
     if (runStartTime) {
       const elapsed = Math.floor((Date.now() - runStartTime) / 1000);
-      timerEl.textContent = formatTime(elapsed);
+      const formatted = formatTime(elapsed);
+      if (timerEl) timerEl.textContent = formatted;
+      if (actionStatusTimer) actionStatusTimer.textContent = formatted;
     }
   }, 1000);
 }
@@ -4785,6 +4946,12 @@ function updateRunProgress(percent, status) {
   const text = el('runProgressText');
   const statusEl = el('runProgressStatus');
   
+  // Also update actionStatus progress if it exists
+  const actionStatusProgressBar = el('actionStatusProgressBar');
+  const actionStatusProgressText = el('actionStatusProgressText');
+  const actionStatusProgress = el('actionStatusProgress');
+  const actionStatusBox = el('actionStatus');
+  
   if (container) container.style.display = '';
   if (bar) {
     const clampedPercent = Math.max(0, Math.min(100, percent));
@@ -4795,16 +4962,52 @@ function updateRunProgress(percent, status) {
   }
   if (text) text.textContent = Math.round(Math.max(0, Math.min(100, percent))) + '%';
   if (statusEl) statusEl.textContent = status || '';
+  
+  // Update actionStatus progress bar
+  if (actionStatusProgressBar) {
+    const clampedPercent = Math.max(0, Math.min(100, percent));
+    actionStatusProgressBar.style.width = clampedPercent + '%';
+    actionStatusProgressBar.style.setProperty('--progress', clampedPercent + '%');
+  }
+  if (actionStatusProgressText) {
+    actionStatusProgressText.textContent = Math.round(Math.max(0, Math.min(100, percent))) + '%';
+  }
+  
+  // Always show actionStatus and progress section when updateRunProgress is called
+  if (actionStatusBox) {
+    actionStatusBox.style.display = '';
+  }
+  if (actionStatusProgress) {
+    actionStatusProgress.style.display = '';
+  }
+  
+  // Update status message if provided
+  if (status) {
+    const messageEl = el('actionStatusMessage');
+    if (messageEl) {
+      messageEl.innerHTML = status.replace(/\n/g, '<br>');
+    }
+  }
 }
 
 function hideRunProgress() {
   const container = el('runProgressContainer');
   const bar = el('runProgressBar');
+  const actionStatusProgress = el('actionStatusProgress');
+  const actionStatusProgressBar = el('actionStatusProgressBar');
+  
   if (container) container.style.display = 'none';
   if (bar) {
     // Reset progress when hiding
     bar.style.setProperty('--progress', '0%');
     bar.style.width = '0%';
+  }
+  if (actionStatusProgress) {
+    actionStatusProgress.style.display = 'none';
+  }
+  if (actionStatusProgressBar) {
+    actionStatusProgressBar.style.width = '0%';
+    actionStatusProgressBar.style.setProperty('--progress', '0%');
   }
   stopRunTimer();
   runStartTime = null;
@@ -6376,27 +6579,13 @@ async function restoreConfiguration(config) {
       logMsg(`Warning: Error updating install select: ${err.message || err}`);
     }
     
-    // Bypass all gating conditions - enable all buttons and inputs
+    // Don't bypass gating conditions - user must still click "Load Credentials" and "Confirm Hosts"
+    // Keep bypassGatingConditions = false so run button requires both conditions
     
-    // Set flag to bypass gating conditions
-    bypassGatingConditions = true;
-    
-    // Enable Confirm button (normally disabled until NHI credential is loaded)
-    const btnConfirmHosts = el('btnConfirmHosts');
-    if (btnConfirmHosts) {
-      btnConfirmHosts.disabled = false;
-    }
-    
-    // Enable Add Row button (normally disabled until hosts are confirmed)
+    // Enable Add Row button (allowed even before hosts are confirmed when loading config)
     const btnAddRow = el('btnAddRow');
     if (btnAddRow) {
       btnAddRow.disabled = false;
-    }
-    
-    // Enable Run button (normally disabled based on template rows being filled)
-    const btnRun = el('btnInstallSelected');
-    if (btnRun) {
-      btnRun.disabled = false;
     }
     
     // Enable Install Select dropdown (normally disabled initially)
@@ -6405,34 +6594,24 @@ async function restoreConfiguration(config) {
       installSelect.disabled = false;
     }
     
-    // Enable all other buttons that might be disabled by setActionsEnabled
-    // Call setActionsEnabled(true) to ensure all buttons are enabled
-    setActionsEnabled(true);
-    
-    // Call updateCreateEnabled to ensure it respects the bypass flag
+    // Call updateCreateEnabled to check if run button should be enabled
+    // This will disable the run button until both NHI credentials are loaded and hosts are confirmed
     updateCreateEnabled();
     
-    showStatus('Configuration restored successfully - all gating conditions bypassed');
-    logMsg('Configuration restored - all gating conditions bypassed, all buttons enabled');
+    showStatus('Configuration restored successfully. Please load credentials and confirm hosts before running.');
+    logMsg('Configuration restored - run button requires Load Credentials and Confirm Hosts');
   } catch (error) {
-    // Catch any unexpected errors and still enable buttons
+    // Catch any unexpected errors
     logMsg(`Error during restore: ${error.message || error}`);
-    showStatus('Configuration partially restored - some errors occurred, but buttons are enabled');
+    showStatus('Configuration partially restored - some errors occurred');
     
-    // Still enable buttons even if restore had errors
-    const btnConfirmHosts = el('btnConfirmHosts');
-    if (btnConfirmHosts) btnConfirmHosts.disabled = false;
-    
+    // Enable Add Row button even if restore had errors
     const btnAddRow = el('btnAddRow');
     if (btnAddRow) btnAddRow.disabled = false;
     
-    const btnRun = el('btnInstallSelected');
-    if (btnRun) btnRun.disabled = false;
-    
-    const installSelect = el('installSelect');
-    if (installSelect) installSelect.disabled = false;
-    
-    setActionsEnabled(true);
+    // Call updateCreateEnabled to check if run button should be enabled
+    // This will disable the run button until both NHI credentials are loaded and hosts are confirmed
+    updateCreateEnabled();
   }
 }
 
@@ -6529,10 +6708,11 @@ async function editEvent(eventId) {
     // Set edit mode
     editingEventId = eventId;
     
-    // Populate form with event data
+    // Populate form with event data - convert UTC to local time for display/editing
+    const localEvent = utcToLocal(eventData.event_date, eventData.event_time);
     el('eventName').value = eventData.name || '';
-    el('eventDate').value = eventData.event_date || '';
-    el('eventTime').value = eventData.event_time || '';
+    el('eventDate').value = localEvent.date || '';
+    el('eventTime').value = localEvent.time || '';
     el('eventAutoRun').checked = eventData.auto_run || false;
     
     // Load configurations and set selected one
@@ -6601,7 +6781,7 @@ function setupEventButtons() {
     return;
   }
   
-  // Validate that date/time is not in the past
+  // Validate that date/time is not in the past (using local time)
   const eventDateTime = new Date(date + (time ? 'T' + time : 'T00:00:00'));
   const now = new Date();
   if (eventDateTime < now) {
@@ -6609,6 +6789,9 @@ function setupEventButtons() {
     updateCreateEventButton(); // Update to show error messages
     return;
   }
+  
+  // Convert local date/time to UTC before sending to backend
+  const utcEvent = localToUTC(date, time);
   
   try {
     // If auto-run is enabled, ask for NHI credential password (hidden input)
@@ -6626,8 +6809,8 @@ function setupEventButtons() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         name: name,
-        event_date: date,
-        event_time: time || null,
+        event_date: utcEvent.date,
+        event_time: utcEvent.time || null,
         configuration_id: configId,
         auto_run: autoRun,
         nhi_password: nhiPassword || null
@@ -6687,7 +6870,7 @@ function setupEventButtons() {
         return;
       }
       
-      // Validate that date/time is not in the past
+      // Validate that date/time is not in the past (using local time)
       const eventDateTime = new Date(date + (time ? 'T' + time : 'T00:00:00'));
       const now = new Date();
       if (eventDateTime < now) {
@@ -6695,6 +6878,9 @@ function setupEventButtons() {
         updateCreateEventButton(); // Update to show error messages
         return;
       }
+      
+      // Convert local date/time to UTC before sending to backend
+      const utcEvent = localToUTC(date, time);
       
       try {
         // If auto-run is enabled, ask for NHI credential password (hidden input)
@@ -6713,8 +6899,8 @@ function setupEventButtons() {
           body: JSON.stringify({
             id: editingEventId,
             name: name,
-            event_date: date,
-            event_time: time || null,
+            event_date: utcEvent.date,
+            event_time: utcEvent.time || null,
             configuration_id: configId,
             auto_run: autoRun,
             nhi_password: nhiPassword || null
@@ -6953,7 +7139,1222 @@ function initEventFormValidation() {
 function attachRunButtonHandler() {
   const runBtn = el('btnInstallSelected');
   if (runBtn) {
-    runBtn.onclick = handleRunButton;
+    runBtn.onclick = handleTrackedRunButton;
+  }
+}
+
+// Tracked Run: execute step-by-step with detailed logging and track in Reports
+async function handleTrackedRunButton() {
+  let runId = null;
+  const errors = [];
+  const executionDetails = {
+    fabric_creations: [],
+    installations: [],
+    ssh_executions: []
+  };
+  let hosts = []; // Declare hosts at function scope so it's accessible in catch block
+  
+  try {
+    const runBtn = el('btnInstallSelected');
+    if (runBtn) runBtn.disabled = true;
+    
+    // Show expert mode output during run
+    const expertModeCheckbox = el('expertMode');
+    const out = el('out');
+    if (out && expertModeCheckbox) {
+      out.style.display = '';
+      if (!expertModeCheckbox.checked) {
+        expertModeCheckbox.checked = true;
+      }
+    }
+    
+    // Create manual run record
+    const configPayload = collectConfiguration();
+    const configurationName = configPayload.configName || 'Manual Run';
+    try {
+      const createRes = await api('/run/create', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ configuration_name: configurationName })
+      });
+      if (createRes.ok) {
+        const createData = await createRes.json();
+        runId = createData.run_id;
+        logMsg(`Run tracking started (ID: ${runId})`);
+      }
+    } catch (err) {
+      logMsg(`Warning: Could not create run record: ${err.message || err}`);
+    }
+    
+    // Show progress bar and start timer
+    updateRunProgress(0, 'Starting tracked run...');
+    startRunTimer();
+    logMsg('Starting tracked run...');
+    
+    hosts = getAllConfirmedHosts();
+    if (hosts.length === 0) {
+      showStatus('No hosts configured. Please confirm hosts first.');
+      if (runId) {
+        await api(`/run/update/${runId}`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ status: 'error', message: 'No hosts configured', errors: ['No hosts configured'] })
+        });
+      }
+      hideRunProgress();
+      stopRunTimer();
+      if (runBtn) runBtn.disabled = false;
+      return;
+    }
+    
+    // Show Running Tasks section
+    const runningTasksContainer = el('runningTasksContainer');
+    if (runningTasksContainer) {
+      runningTasksContainer.style.display = '';
+    }
+    
+    // Check session status - tokens are managed server-side
+    const session = await checkSessionStatus();
+    if (!session) {
+      showStatus('No active session. Please reload NHI credential.');
+      if (runId) {
+        await api(`/run/update/${runId}`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ status: 'error', message: 'No active session', errors: ['No active session'] })
+        });
+      }
+      hideRunProgress();
+      stopRunTimer();
+      if (runBtn) runBtn.disabled = false;
+      return;
+    }
+    
+    // Build templates list from ALL rows
+    updateRunProgress(5, 'Collecting workspace templates from rows...');
+    logMsg('Collecting workspace templates from rows...');
+    const allRowTemplates = [];
+    document.querySelectorAll('.tpl-row').forEach(row => {
+      const selects = row.querySelectorAll('select');
+      const repoSelect = selects[0];
+      const templateFiltered = row._templateFiltered;
+      const versionSelect = selects.length > 2 ? selects[selects.length - 1] : (selects[1] || null);
+      const repo_name = repoSelect?.value || '';
+      const template_name = templateFiltered ? templateFiltered.getValue() : '';
+      const version = versionSelect?.value || '';
+      if (template_name && repo_name && version) {
+        allRowTemplates.push({ template_name, repo_name, version });
+      }
+    });
+    
+    if (allRowTemplates.length === 0) {
+      showStatus('No workspace templates found in rows. Please add and fill template rows.');
+      if (runId) {
+        await api(`/run/update/${runId}`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ status: 'error', message: 'No templates found', errors: ['No workspace templates found in rows'] })
+        });
+      }
+      hideRunProgress();
+      stopRunTimer();
+      if (runBtn) runBtn.disabled = false;
+      return;
+    }
+    
+    // Sort templates alphabetically
+    allRowTemplates.sort((a, b) => {
+      const nameCompare = a.template_name.localeCompare(b.template_name);
+      if (nameCompare !== 0) return nameCompare;
+      return a.version.localeCompare(b.version);
+    });
+    
+    // Ensure ALL templates from rows are in the templates array for tracking
+    allRowTemplates.forEach(({template_name, repo_name, version}) => {
+      const exists = templates.find(t => t.template_name === template_name && t.version === version);
+      if (!exists) {
+        templates.push({ template_name, repo_name, version, status: '', createProgress: 0, hosts: [] });
+      }
+    });
+    
+    // Check which templates need to be created
+    const existingTemplates = templates.filter(t => t.status === 'created' || t.status === 'installed');
+    const existingKeys = new Set(existingTemplates.map(t => `${t.template_name}|||${t.version}`));
+    const templatesToCreate = allRowTemplates.filter(({template_name, version}) => 
+      !existingKeys.has(`${template_name}|||${version}`)
+    );
+    
+    // Track failed hosts across all operations
+    const failedHosts = new Set();
+    
+    // Track start time for duration calculation
+    const runStartTime = Date.now();
+    
+    // If we need to create templates, run preparation steps first
+    if (templatesToCreate.length > 0) {
+      // Execute preparation steps (5-20%)
+      updateRunProgress(7, 'Executing preparation steps...');
+      showStatus('Executing preparation steps...');
+      logMsg('Executing preparation steps...');
+      
+      // Refresh repositories
+      updateRunProgress(9, 'Refreshing repositories...');
+      logMsg('Refreshing repositories...');
+      await executeOnAllHosts('Refresh Repositories', async (fabric_host) => {
+        const res = await api('/repo/refresh', { method: 'POST', params: { fabric_host } });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      });
+      logMsg('Refresh Repositories completed successfully on all host(s)');
+      
+      // Uninstall workspaces (reset)
+      updateRunProgress(11, 'Uninstalling workspaces...');
+      logMsg('Uninstalling workspaces...');
+      await executeOnAllHosts('Uninstall Workspaces', async (fabric_host) => {
+        const res = await api('/runtime/reset', { method: 'POST', params: { fabric_host } });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      });
+      logMsg('Uninstall Workspaces completed successfully on all host(s)');
+      
+      // Remove workspaces (batch delete)
+      updateRunProgress(13, 'Removing workspaces...');
+      logMsg('Removing workspaces...');
+      await executeOnAllHosts('Remove Workspaces', async (fabric_host) => {
+        const res = await api('/model/fabric/batch', { method: 'DELETE', params: { fabric_host } });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      });
+      logMsg('Remove Workspaces completed successfully on all host(s)');
+      
+      // Change hostname (if provided)
+      const hostnameBase = el('newHostname').value.trim();
+      if (hostnameBase) {
+        updateRunProgress(15, 'Changing hostnames...');
+        logMsg('Changing hostnames...');
+        await waitForNoRunningTasks(hosts, 'Change Hostname');
+        const hostnamePromises = hosts.map(async ({host}, index) => {
+          try {
+            const hostname = hostnameBase + (index + 1);
+            const res = await api('/system/hostname', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ fabric_host: host, hostname })
+            });
+            if (!res.ok) throw new Error(`HTTP ${res.status}`);
+            logMsg(`Hostname changed to ${hostname} for ${host}`);
+          } catch (error) {
+            logMsg(`Change hostname failed on ${host}: ${error.message || error}`);
+          }
+        });
+        await Promise.all(hostnamePromises);
+      }
+      
+      // Change password (if provided)
+      const new_password = el('chgPass').value.trim();
+      if (new_password) {
+        updateRunProgress(17, 'Changing guest user password...');
+        logMsg('Changing guest user password...');
+        await executeOnAllHosts('Change password', async (fabric_host) => {
+          const res = await api('/user/password', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ fabric_host, username: 'guest', new_password })
+          });
+          if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        });
+        logMsg('Change password completed successfully on all host(s)');
+      }
+      
+      // Add templates to create to the templates array
+      updateRunProgress(20, 'Preparing templates...');
+      logMsg('Preparing templates...');
+      templatesToCreate.forEach(({template_name, repo_name, version}) => {
+        const exists = templates.find(t => t.template_name === template_name && t.version === version);
+        if (!exists) {
+          templates.push({ template_name, repo_name, version, status: 'spin', createProgress: 0, hosts: [] });
+        }
+      });
+      renderTemplates();
+      
+      updateRunProgress(22, `Creating ${templatesToCreate.length} workspace template(s)...`);
+      showStatus(`Creating ${templatesToCreate.length} workspace template(s)...`);
+      logMsg(`Creating ${templatesToCreate.length} workspace template(s): ${templatesToCreate.map(t => t.template_name).join(', ')}`);
+      
+      // Check for running tasks before creating templates
+      await waitForNoRunningTasks(hosts, 'Create Templates');
+      
+      // Process templates sequentially (one at a time)
+      const totalTemplates = templatesToCreate.length;
+      logMsg(`Starting sequential creation of ${totalTemplates} templates: ${templatesToCreate.map(t => t.template_name).join(', ')}`);
+      
+      let createdCount = 0;
+      
+      // Process each template one at a time
+      for (let i = 0; i < templatesToCreate.length; i++) {
+        const rowTemplate = templatesToCreate[i];
+        logMsg(`[${i + 1}/${totalTemplates}] Starting creation process for ${rowTemplate.template_name} v${rowTemplate.version}`);
+        
+        // Check if all hosts have failed before processing this template
+        const availableHostsBeforeTemplate = hosts.filter(({host}) => !failedHosts.has(host));
+        if (availableHostsBeforeTemplate.length === 0) {
+          const errorMsg = `All hosts have failed. Stopping execution before processing template '${rowTemplate.template_name}'.`;
+          showStatus(errorMsg);
+          logMsg(errorMsg);
+          updateRunProgress(100, `Execution stopped - all hosts failed`);
+          renderTemplates();
+          stopRunTimer();
+          if (runId) {
+            await api(`/run/update/${runId}`, {
+              method: 'PUT',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ 
+                status: 'error', 
+                message: 'Execution stopped - all hosts failed',
+                errors: errors,
+                execution_details: executionDetails
+              })
+            });
+          }
+          if (runBtn) runBtn.disabled = false;
+          return;
+        }
+        
+        // Check for running tasks before creating this template
+        await waitForNoRunningTasks(hosts, `Create Template ${rowTemplate.template_name}`);
+        
+        // Create separate template entry for each host
+        hosts.forEach(({host}) => {
+          let t = templates.find(t => 
+            t.template_name === rowTemplate.template_name && 
+            t.version === rowTemplate.version && 
+            t.host === host
+          );
+          if (!t) {
+            t = { 
+              template_name: rowTemplate.template_name,
+              repo_name: rowTemplate.repo_name,
+              version: rowTemplate.version,
+              host: host,
+              status: 'spin', 
+              createProgress: 0, 
+              hosts: [host] 
+            };
+            templates.push(t);
+          } else {
+            t.status = 'spin';
+            t.createProgress = 0;
+            t.hosts = [host];
+            if (!t.host || t.host === 'host' || t.host === 'Host') {
+              t.host = host;
+            }
+          }
+        });
+        renderTemplates();
+        
+        // Update progress for starting this template
+        const templateProgress = 20 + (i / totalTemplates) * 40;
+        updateRunProgress(templateProgress, `Creating template ${i + 1}/${totalTemplates}: ${rowTemplate.template_name}`);
+        
+        // Process all hosts for this template in parallel
+        const hostPromises = hosts.map(async ({host}) => {
+          if (failedHosts.has(host)) {
+            return {host, success: false, error: 'Host failed during previous template creation', skipped: true};
+          }
+          
+          let t = templates.find(t => 
+            t.template_name === rowTemplate.template_name && 
+            t.version === rowTemplate.version && 
+            t.host === host
+          );
+          if (!t) {
+            t = { 
+              template_name: rowTemplate.template_name,
+              repo_name: rowTemplate.repo_name,
+              version: rowTemplate.version,
+              host: host,
+              status: 'spin', 
+              createProgress: 0, 
+              hosts: [host] 
+            };
+            templates.push(t);
+          } else {
+            if (!t.host || t.host === 'host' || t.host === 'Host') {
+              t.host = host;
+            }
+          }
+          
+          const creationStart = Date.now();
+          try {
+            // Get template id
+            const { template_id } = await apiJson('/repo/template', {
+              params: {
+                fabric_host: host,
+                template_name: t.template_name,
+                repo_name: t.repo_name,
+                version: t.version,
+              }
+            });
+            logMsg(`Template located on ${host}`);
+
+            // Create fabric
+            logMsg(`Creating fabric ${t.template_name} v${t.version} on ${host} (template_id: ${template_id})`);
+            
+            let res = await api('/model/fabric', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                fabric_host: host,
+                template_id,
+                template_name: t.template_name,
+                version: t.version,
+              }),
+            });
+            
+            if (!res.ok) {
+              const errorText = await res.text().catch(() => `HTTP ${res.status}`);
+              let errorDetail = errorText;
+              try {
+                const errorJson = JSON.parse(errorText);
+                if (errorJson.detail) {
+                  errorDetail = errorJson.detail;
+                }
+              } catch (e) {}
+              const errorMsg = `Failed to create fabric '${t.template_name}' v${t.version} on ${host}: ${errorDetail}`;
+              showStatus(errorMsg);
+              logMsg(errorMsg);
+              t.status = 'err';
+              t.createProgress = 0;
+              renderTemplates();
+              const creationDuration = (Date.now() - creationStart) / 1000;
+              executionDetails.fabric_creations.push({
+                host: host,
+                template_name: t.template_name,
+                version: t.version,
+                success: false,
+                duration_seconds: creationDuration,
+                errors: [errorDetail]
+              });
+              return {host, success: false, error: errorDetail || 'Create failed'};
+            }
+            
+            const responseData = await res.json().catch(() => ({}));
+            logMsg(`Fabric creation request submitted on ${host} for ${t.template_name} v${t.version} (template_id: ${template_id})`);
+
+            // Poll running task count until zero or timeout
+            const timeoutMs = 15 * 60 * 1000;
+            t.createProgress = 5;
+            renderTemplates();
+            
+            const progressInterval = setInterval(() => {
+              const elapsed = Date.now() - creationStart;
+              const pct = Math.min(95, Math.max(5, Math.floor((elapsed / timeoutMs) * 100)));
+              if (t.createProgress !== pct) {
+                t.createProgress = pct;
+                renderTemplates();
+              }
+            }, 500);
+
+            while (Date.now() - creationStart < timeoutMs) {
+              const sres = await api('/tasks/status', { params: { fabric_host: host } });
+              if (!sres.ok) { clearInterval(progressInterval); break; }
+              const sdata = await sres.json();
+              const cnt = sdata.running_count ?? 0;
+              if (cnt === 0) { clearInterval(progressInterval); break; }
+              await new Promise(r => setTimeout(r, 2000));
+            }
+            clearInterval(progressInterval);
+
+            // Check status
+            const done = await api('/tasks/status', { params: { fabric_host: host } });
+            if (done.ok) {
+              const d = await done.json();
+              if ((d.running_count ?? 0) === 0) {
+                // Check for task errors
+                try {
+                  const createStartTime = new Date(creationStart).toISOString();
+                  const errorsRes = await api('/tasks/errors', { 
+                    params: { 
+                      fabric_host: host, 
+                      limit: 20,
+                      fabric_name: t.template_name,
+                      since_timestamp: createStartTime
+                    } 
+                  });
+                  if (errorsRes.ok) {
+                    const errorsData = await errorsRes.json();
+                    if (errorsData.errors && errorsData.errors.length > 0) {
+                      const errorMessages = errorsData.errors.map(err => `Task '${err.task_name}': ${err.error}`).join('; ');
+                      const errorMsg = `Template '${t.template_name}' v${t.version} creation completed on ${host} but with errors: ${errorMessages}`;
+                      showStatus(errorMsg);
+                      logMsg(errorMsg);
+                      t.status = 'err';
+                      t.createProgress = 0;
+                      renderTemplates();
+                      const creationDuration = (Date.now() - creationStart) / 1000;
+                      executionDetails.fabric_creations.push({
+                        host: host,
+                        template_name: t.template_name,
+                        version: t.version,
+                        success: false,
+                        duration_seconds: creationDuration,
+                        errors: [errorMessages]
+                      });
+                      return {host, success: false, error: errorMessages};
+                    }
+                  }
+                } catch (error) {}
+                
+                showStatus(`Template '${t.template_name}' v${t.version} created successfully on ${host}`);
+                logMsg(`Template '${t.template_name}' v${t.version} created successfully on ${host}`);
+                t.status = 'created';
+                t.createProgress = 100;
+                renderTemplates();
+                const creationDuration = (Date.now() - creationStart) / 1000;
+                executionDetails.fabric_creations.push({
+                  host: host,
+                  template_name: t.template_name,
+                  version: t.version,
+                  success: true,
+                  duration_seconds: creationDuration
+                });
+                return {host, success: true};
+              } else {
+                const errorMsg = `Template '${t.template_name}' v${t.version} creation timeout on ${host} - tasks still running`;
+                showStatus(errorMsg);
+                logMsg(errorMsg);
+                t.status = 'err';
+                t.createProgress = 0;
+                renderTemplates();
+                const creationDuration = (Date.now() - creationStart) / 1000;
+                executionDetails.fabric_creations.push({
+                  host: host,
+                  template_name: t.template_name,
+                  version: t.version,
+                  success: false,
+                  duration_seconds: creationDuration,
+                  errors: ['Timeout - tasks still running']
+                });
+                return {host, success: false, error: 'Timeout - tasks still running'};
+              }
+            } else {
+              const errorText = await done.text().catch(() => 'Unknown error');
+              const errorMsg = `Failed to check task status on ${host} for '${t.template_name}' v${t.version}: ${errorText}`;
+              showStatus(errorMsg);
+              logMsg(errorMsg);
+              t.status = 'err';
+              t.createProgress = 0;
+              renderTemplates();
+              const creationDuration = (Date.now() - creationStart) / 1000;
+              executionDetails.fabric_creations.push({
+                host: host,
+                template_name: t.template_name,
+                version: t.version,
+                success: false,
+                duration_seconds: creationDuration,
+                errors: ['Status check failed']
+              });
+              return {host, success: false, error: 'Status check failed'};
+            }
+          } catch (error) {
+            const errorMsg = `Error processing template '${rowTemplate.template_name}' v${rowTemplate.version} on ${host}: ${error.message || error}`;
+            showStatus(errorMsg);
+            logMsg(errorMsg);
+            if (t) {
+              t.status = 'err';
+              t.createProgress = 0;
+              renderTemplates();
+            }
+            const creationDuration = (Date.now() - creationStart) / 1000;
+            executionDetails.fabric_creations.push({
+              host: host,
+              template_name: rowTemplate.template_name,
+              version: rowTemplate.version,
+              success: false,
+              duration_seconds: creationDuration,
+              errors: [error.message || String(error)]
+            });
+            return {host, success: false, error: error.message || error};
+          }
+        });
+
+        const results = await Promise.all(hostPromises);
+        const successCount = results.filter(r => r.success).length;
+        const failedHostsForTemplate = results.filter(r => !r.success && !r.skipped);
+        failedHostsForTemplate.forEach(f => failedHosts.add(f.host));
+        
+        const availableHostsForTemplate = hosts.filter(({host}) => !failedHosts.has(host));
+        
+        if (successCount === 0 && failedHostsForTemplate.length > 0) {
+          const errorDetails = failedHostsForTemplate.map(f => `${f.host}: ${f.error || 'Unknown error'}`).join('; ');
+          const errorMsg = `Template '${rowTemplate.template_name}' v${rowTemplate.version} creation failed on all hosts: ${errorDetails}`;
+          showStatus(errorMsg);
+          logMsg(errorMsg);
+          logMsg(`Stopping execution - template creation failed on all hosts`);
+          updateRunProgress(100, `Execution stopped - template creation failed`);
+          renderTemplates();
+          stopRunTimer();
+          errors.push(errorMsg);
+          if (runId) {
+            await api(`/run/update/${runId}`, {
+              method: 'PUT',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ 
+                status: 'error', 
+                message: 'Execution stopped - template creation failed',
+                errors: errors,
+                execution_details: executionDetails
+              })
+            });
+          }
+          if (runBtn) runBtn.disabled = false;
+          return;
+        }
+        
+        if (availableHostsForTemplate.length === 0) {
+          const errorMsg = `All hosts have failed. Stopping execution.`;
+          showStatus(errorMsg);
+          logMsg(errorMsg);
+          logMsg(`Stopping execution - all hosts failed`);
+          updateRunProgress(100, `Execution stopped - all hosts failed`);
+          renderTemplates();
+          stopRunTimer();
+          errors.push(errorMsg);
+          if (runId) {
+            await api(`/run/update/${runId}`, {
+              method: 'PUT',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ 
+                status: 'error', 
+                message: 'Execution stopped - all hosts failed',
+                errors: errors,
+                execution_details: executionDetails
+              })
+            });
+          }
+          if (runBtn) runBtn.disabled = false;
+          return;
+        }
+        
+        if (successCount > 0) {
+          createdCount++;
+          if (successCount < hosts.length) {
+            const failedHostNames = failedHostsForTemplate.map(f => f.host).join(', ');
+            showStatus(`Template '${rowTemplate.template_name}' created on ${successCount}/${hosts.length} host(s). Failed on: ${failedHostNames}`);
+            logMsg(`Template '${rowTemplate.template_name}' created on ${successCount}/${hosts.length} host(s). Failed on: ${failedHostNames}`);
+          }
+        }
+        renderTemplates();
+        
+        if (successCount > 0) {
+          logMsg(`Template '${rowTemplate.template_name}' v${rowTemplate.version} creation completed on ${successCount}/${hosts.length} host(s)`);
+        }
+        
+        await waitForNoRunningTasks(hosts, `After creating ${rowTemplate.template_name}`);
+        
+        const completedProgress = 20 + ((i + 1) / totalTemplates) * 40;
+        updateRunProgress(completedProgress, `Template ${i + 1}/${totalTemplates} created: ${rowTemplate.template_name}`);
+      }
+      
+      updateRunProgress(60, `All workspace templates processed: ${createdCount}/${totalTemplates} created successfully`);
+      renderTemplates();
+      
+      if (createdCount === totalTemplates) {
+        showStatus(`Created all ${templatesToCreate.length} workspace template(s) successfully`);
+        logMsg(`Created all ${templatesToCreate.length} workspace template(s) successfully: ${templatesToCreate.map(t => t.template_name).join(', ')}`);
+      } else {
+        showStatus(`Created ${createdCount}/${templatesToCreate.length} workspace template(s) successfully`);
+        logMsg(`Created ${createdCount}/${templatesToCreate.length} workspace template(s): ${templatesToCreate.map(t => t.template_name).join(', ')}`);
+      }
+    } else {
+      updateRunProgress(60, 'All workspace templates already exist');
+      logMsg('All workspace templates already created, skipping creation phase');
+      showStatus('All workspace templates already exist');
+    }
+    
+    // Execute SSH Profiles (if selected) BEFORE Install Workspace
+    const sshProfileSelect = el('sshProfileSelect');
+    const sshProfileId = sshProfileSelect ? sshProfileSelect.value : '';
+    const sshWaitTimeInput = el('sshWaitTime');
+    const sshWaitTime = sshWaitTimeInput ? (parseInt(sshWaitTimeInput.value) || 60) : 60;
+    
+    if (sshProfileId) {
+      updateRunProgress(61, 'Executing SSH profiles...');
+      showStatus('Executing SSH profiles on all hosts...');
+      logMsg('Starting SSH profile execution');
+      
+      const nhiPasswordInput = el('nhiDecryptPassword');
+      const encryptionPassword = nhiPasswordInput ? nhiPasswordInput.value.trim() : '';
+      
+      if (!encryptionPassword) {
+        showStatus('SSH profile execution requires encryption password. Please load NHI credential first.');
+        logMsg('SSH profile execution cancelled - encryption password not available');
+        errors.push('SSH profile execution cancelled - encryption password not available');
+        hideRunProgress();
+        stopRunTimer();
+        if (runId) {
+          await api(`/run/update/${runId}`, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ 
+              status: 'error', 
+              message: 'SSH execution failed - encryption password not available',
+              errors: errors,
+              execution_details: executionDetails
+            })
+          });
+        }
+        if (runBtn) runBtn.disabled = false;
+        return;
+      }
+      
+      try {
+        const availableHostsForSsh = hosts.filter(({host}) => !failedHosts.has(host));
+        
+        if (availableHostsForSsh.length === 0) {
+          showStatus('Skipping SSH profile execution - all hosts failed during template creation.');
+          logMsg('Skipping SSH profile execution - all hosts failed during template creation');
+        } else {
+          if (failedHosts.size > 0) {
+            const failedHostNames = Array.from(failedHosts).join(', ');
+            logMsg(`Skipping SSH execution on failed hosts: ${failedHostNames}. Executing on ${availableHostsForSsh.length} remaining host(s).`);
+          }
+          
+          const sshResults = await executeSshProfiles(availableHostsForSsh, sshProfileId, encryptionPassword, sshWaitTime);
+          const sshSuccessCount = sshResults.filter(r => r.success).length;
+          
+          // Track SSH execution results
+          sshResults.forEach(result => {
+            executionDetails.ssh_executions.push({
+              host: result.host,
+              success: result.success,
+              error: result.error || null,
+              output: result.output || null
+            });
+          });
+          
+          if (sshSuccessCount === availableHostsForSsh.length) {
+            updateRunProgress(63, 'SSH profiles executed successfully!');
+            showStatus(`SSH profiles executed successfully on all ${availableHostsForSsh.length} host(s)`);
+            logMsg(`SSH profiles executed successfully on all ${availableHostsForSsh.length} host(s)`);
+          } else {
+            updateRunProgress(63, `SSH profiles executed on ${sshSuccessCount}/${availableHostsForSsh.length} host(s)`);
+            showStatus(`SSH profiles executed on ${sshSuccessCount}/${availableHostsForSsh.length} host(s)`);
+            const sshErrors = sshResults.filter(r => !r.success).map(r => `${r.host}: ${r.error || 'Unknown error'}`);
+            if (sshErrors.length > 0) {
+              showStatus(`SSH profile errors (continuing with installation):\n${sshErrors.join('\n')}`, { error: true });
+              logMsg(`SSH profile errors: ${sshErrors.join('; ')}`);
+              errors.push(...sshErrors);
+            }
+          }
+        }
+      } catch (error) {
+        logMsg(`SSH profile execution error: ${error.message || error}`);
+        showStatus(`Error executing SSH profiles: ${error.message || error}`, { error: true });
+        errors.push(`SSH execution error: ${error.message || error}`);
+      }
+    }
+    
+    // Install the selected workspace (after SSH profiles execute)
+    updateRunProgress(64, 'Preparing to install selected workspace...');
+    logMsg('Preparing to install selected workspace...');
+    const opt = el('installSelect').value;
+    
+    let template_name, version, repo_name;
+    if (!opt) {
+      const select = el('installSelect');
+      if (select && select.options.length > 0 && select.options[0].value) {
+        [template_name, version] = select.options[0].value.split('|||');
+      } else {
+        const created = templates.filter(t => t.status === 'created' || t.status === 'installed');
+        if (created.length === 0) {
+          showStatus('No templates available to install. Please create templates first.');
+          logMsg('No templates available to install. Skipping installation phase.');
+          updateRunProgress(100, 'No templates available to install');
+          renderTemplates();
+          stopRunTimer();
+          if (runId) {
+            await api(`/run/update/${runId}`, {
+              method: 'PUT',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ 
+                status: 'success', 
+                message: 'No templates available to install',
+                errors: errors,
+                execution_details: executionDetails
+              })
+            });
+          }
+          if (runBtn) runBtn.disabled = false;
+          return;
+        }
+        const first = created[0];
+        template_name = first.template_name;
+        version = first.version;
+      }
+    } else {
+      [template_name, version] = opt.split('|||');
+    }
+    
+    // Get repo_name from rows if needed
+    if (!repo_name) {
+      document.querySelectorAll('.tpl-row').forEach(row => {
+        const selects = row.querySelectorAll('select');
+        const repoSelect = selects[0];
+        const templateFiltered = row._templateFiltered;
+        const versionSelect = selects.length > 2 ? selects[selects.length - 1] : (selects[1] || null);
+        const row_template = templateFiltered ? templateFiltered.getValue() : '';
+        const row_version = versionSelect?.value || '';
+        if (row_template === template_name && row_version === version) {
+          repo_name = repoSelect?.value || '';
+        }
+      });
+    }
+    
+    const installTargets = [];
+    const availableHosts = hosts.filter(({host}) => !failedHosts.has(host));
+    
+    if (availableHosts.length === 0) {
+      showStatus(`Cannot install workspace: all hosts failed during template creation. Skipping installation.`);
+      logMsg(`Skipping installation - all hosts failed during template creation`);
+      updateRunProgress(100, 'Installation skipped - all hosts failed');
+      renderTemplates();
+      stopRunTimer();
+      if (runId) {
+        await api(`/run/update/${runId}`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ 
+            status: 'error', 
+            message: 'Installation skipped - all hosts failed',
+            errors: errors,
+            execution_details: executionDetails
+          })
+        });
+      }
+      if (runBtn) runBtn.disabled = false;
+      return;
+    }
+    
+    if (failedHosts.size > 0) {
+      const failedHostNames = Array.from(failedHosts).join(', ');
+      showStatus(`Skipping installation on failed hosts: ${failedHostNames}. Installing on ${availableHosts.length} remaining host(s).`);
+      logMsg(`Skipping installation on failed hosts: ${failedHostNames}. Installing on ${availableHosts.length} remaining host(s).`);
+    }
+    
+    availableHosts.forEach(({host}) => {
+      let target = templates.find(t => 
+        t.template_name === template_name && 
+        t.version === version && 
+        t.host === host
+      );
+      if (!target) {
+        target = { 
+          template_name, 
+          repo_name: repo_name || '', 
+          version, 
+          host: host,
+          status: 'spin', 
+          installProgress: 0, 
+          hosts: [host] 
+        };
+        templates.push(target);
+      } else {
+        target.status = 'spin';
+        target.installProgress = 0;
+        target.hosts = [host];
+        if (!target.host || target.host === 'host' || target.host === 'Host') {
+          target.host = host;
+        }
+      }
+      installTargets.push({ target, host });
+    });
+    renderTemplates();
+    
+    // Install Workspace
+    updateRunProgress(65, 'Installing workspace...');
+    showStatus(`Installing workspace: ${template_name} v${version}...`);
+    logMsg(`Starting workspace installation: ${template_name} v${version}`);
+    
+    await waitForNoRunningTasks(hosts, 'Install Workspace');
+    
+    if (!template_name || !version) {
+      showStatus('Error: Template name and version are required');
+      logMsg('Error: Missing template_name or version');
+      hideRunProgress();
+      stopRunTimer();
+      if (runId) {
+        await api(`/run/update/${runId}`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ 
+            status: 'error', 
+            message: 'Missing template name or version',
+            errors: errors,
+            execution_details: executionDetails
+          })
+        });
+      }
+      if (runBtn) runBtn.disabled = false;
+      return;
+    }
+    
+    const sessionStatus = await checkSessionStatus();
+    if (!sessionStatus) {
+      showStatus(`Error: No active session. Please reload NHI credential.`);
+      logMsg(`Error: No active session`);
+      hideRunProgress();
+      stopRunTimer();
+      if (runId) {
+        await api(`/run/update/${runId}`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ 
+            status: 'error', 
+            message: 'No active session',
+            errors: errors,
+            execution_details: executionDetails
+          })
+        });
+      }
+      if (runBtn) runBtn.disabled = false;
+      return;
+    }
+    
+    updateRunProgress(70, `Installing workspace: ${template_name} v${version}`);
+    const totalHosts = hosts.length;
+    const hostProgressMap = new Map();
+    
+    logMsg(`Installing workspace ${template_name} v${version} on ${totalHosts} host(s)`);
+    
+    // Install on all hosts in parallel
+    const installPromises = installTargets.map(async ({target, host}, hostIdx) => {
+      const installStart = Date.now();
+      try {
+        logMsg(`Sending install request to ${host} for ${template_name} v${version}`);
+        
+        const res = await api('/runtime/fabric/install', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            fabric_host: host,
+            template_name,
+            version,
+          }),
+        });
+        
+        if (!res.ok) {
+          const errorText = await res.text();
+          logMsg(`Install workspace failed on ${host}: HTTP ${res.status} - ${errorText}`);
+          hostProgressMap.set(host, 100);
+          target.status = 'err';
+          target.installProgress = 0;
+          renderTemplates();
+          const installDuration = (Date.now() - installStart) / 1000;
+          executionDetails.installations.push({
+            host: host,
+            template_name: template_name,
+            version: version,
+            success: false,
+            duration_seconds: installDuration,
+            errors: [`HTTP ${res.status}: ${errorText}`]
+          });
+          return {host, success: false, error: `Install failed: HTTP ${res.status}`};
+        }
+        logMsg(`Workspace installation requested successfully on ${host}`);
+        
+        const timeoutMs = 15 * 60 * 1000;
+        target.installProgress = 5;
+        renderTemplates();
+        
+        const progressInterval = setInterval(() => {
+          const elapsed = Date.now() - installStart;
+          const installPct = Math.min(95, Math.max(5, Math.floor((elapsed / timeoutMs) * 100)));
+          if (target.installProgress !== installPct) {
+            target.installProgress = installPct;
+            renderTemplates();
+          }
+          hostProgressMap.set(host, installPct);
+          const totalProgress = Array.from(hostProgressMap.values()).reduce((sum, pct) => sum + pct, 0);
+          const avgProgress = totalProgress / totalHosts;
+          const overallProgress = 70 + (avgProgress / 100) * 25;
+          updateRunProgress(Math.min(95, overallProgress), `Installing on ${hosts.length} host(s)... (${Math.round(avgProgress)}%)`);
+        }, 500);
+        
+        const start = Date.now();
+        while (Date.now() - start < timeoutMs) {
+          const sres = await api('/tasks/status', { params: { fabric_host: host } });
+          if (!sres.ok) { clearInterval(progressInterval); break; }
+          const sdata = await sres.json();
+          const cnt = sdata.running_count ?? 0;
+          if (cnt === 0) { clearInterval(progressInterval); break; }
+          await new Promise(r => setTimeout(r, 2000));
+        }
+        clearInterval(progressInterval);
+        
+        const done = await api('/tasks/status', { params: { fabric_host: host } });
+        hostProgressMap.set(host, 100);
+        if (done.ok) {
+          const d = await done.json();
+          if ((d.running_count ?? 0) === 0) {
+            try {
+              const installStartTime = new Date(installStart).toISOString();
+              const errorsRes = await api('/tasks/errors', { 
+                params: { 
+                  fabric_host: host, 
+                  limit: 20,
+                  fabric_name: template_name,
+                  since_timestamp: installStartTime
+                } 
+              });
+              if (errorsRes.ok) {
+                const errorsData = await errorsRes.json();
+                if (errorsData.errors && errorsData.errors.length > 0) {
+                  const errorMessages = errorsData.errors.map(err => `Task '${err.task_name}': ${err.error}`).join('; ');
+                  const errorMsg = `Workspace '${template_name}' v${version} installation completed on ${host} but with errors: ${errorMessages}`;
+                  showStatus(errorMsg);
+                  logMsg(errorMsg);
+                  target.status = 'err';
+                  target.installProgress = 0;
+                  renderTemplates();
+                  const completedCount = Array.from(hostProgressMap.values()).filter(p => p === 100).length;
+                  updateRunProgress(70 + (completedCount / totalHosts) * 25, `Completed on ${completedCount}/${totalHosts} host(s)`);
+                  const installDuration = (Date.now() - installStart) / 1000;
+                  executionDetails.installations.push({
+                    host: host,
+                    template_name: template_name,
+                    version: version,
+                    success: false,
+                    duration_seconds: installDuration,
+                    errors: [errorMessages]
+                  });
+                  return {host, success: false, error: errorMessages};
+                }
+              }
+            } catch (error) {}
+            
+            logMsg(`Installed successfully on ${host}`);
+            target.status = 'installed';
+            target.installProgress = 100;
+            renderTemplates();
+            const completedCount = Array.from(hostProgressMap.values()).filter(p => p === 100).length;
+            updateRunProgress(70 + (completedCount / totalHosts) * 25, `Completed on ${completedCount}/${totalHosts} host(s)`);
+            const installDuration = (Date.now() - installStart) / 1000;
+            executionDetails.installations.push({
+              host: host,
+              template_name: template_name,
+              version: version,
+              success: true,
+              duration_seconds: installDuration
+            });
+            return {host, success: true};
+          } else {
+            logMsg(`Still running or timeout on ${host}`);
+            target.status = 'err';
+            target.installProgress = 0;
+            renderTemplates();
+            const installDuration = (Date.now() - installStart) / 1000;
+            executionDetails.installations.push({
+              host: host,
+              template_name: template_name,
+              version: version,
+              success: false,
+              duration_seconds: installDuration,
+              errors: ['Timeout']
+            });
+            return {host, success: false, error: 'Timeout'};
+          }
+        }
+        target.status = 'err';
+        target.installProgress = 0;
+        renderTemplates();
+        const installDuration = (Date.now() - installStart) / 1000;
+        executionDetails.installations.push({
+          host: host,
+          template_name: template_name,
+          version: version,
+          success: false,
+          duration_seconds: installDuration,
+          errors: ['Status check failed']
+        });
+        return {host, success: false, error: 'Status check failed'};
+      } catch (error) {
+        logMsg(`Error installing on ${host}: ${error.message || error}`);
+        hostProgressMap.set(host, 100);
+        target.status = 'err';
+        target.installProgress = 0;
+        renderTemplates();
+        const installDuration = (Date.now() - installStart) / 1000;
+        executionDetails.installations.push({
+          host: host,
+          template_name: template_name,
+          version: version,
+          success: false,
+          duration_seconds: installDuration,
+          errors: [error.message || String(error)]
+        });
+        return {host, success: false, error: error.message || error};
+      }
+    });
+
+    const results = await Promise.all(installPromises);
+    const successCount = results.filter(r => r.success).length;
+    
+    renderTemplates();
+    
+    if (successCount === hosts.length) {
+      updateRunProgress(100, 'Workspace installation completed successfully!');
+      showStatus(`Workspace installation completed successfully on all ${hosts.length} host(s)`);
+      logMsg(`Workspace ${template_name} v${version} installed successfully on all ${hosts.length} host(s)`);
+    } else {
+      updateRunProgress(100, `Workspace installation completed on ${successCount}/${hosts.length} host(s)`);
+      showStatus(`Workspace installation completed on ${successCount}/${hosts.length} host(s)`);
+      logMsg(`Workspace ${template_name} v${version} installed on ${successCount}/${hosts.length} host(s)`);
+      const installErrors = results.filter(r => !r.success).map(r => `${r.host}: ${r.error || 'Unknown error'}`);
+      errors.push(...installErrors);
+    }
+    
+    // Update run record with final status
+    const finalStatus = errors.length === 0 ? 'success' : 'error';
+    const finalMessage = errors.length === 0 
+      ? 'Run completed successfully' 
+      : `Run completed with ${errors.length} error(s)`;
+    
+    // Prepare final execution details with all required fields
+    const runDuration = (Date.now() - runStartTime) / 1000;
+    const finalExecutionDetails = {
+      ...executionDetails,
+      hosts: hosts.map(({host}) => host),
+      duration_seconds: runDuration
+    };
+    
+    // Transform ssh_executions to ssh_profile format if SSH profile was used
+    const sshProfileSelectForReport = el('sshProfileSelect');
+    const sshProfileIdForReport = sshProfileSelectForReport?.value;
+    if (sshProfileIdForReport && executionDetails.ssh_executions && executionDetails.ssh_executions.length > 0) {
+      const sshProfileName = sshProfileSelectForReport?.options[sshProfileSelectForReport.selectedIndex]?.text || 'N/A';
+      const sshWaitTimeInput = el('sshWaitTime');
+      const sshWaitTime = sshWaitTimeInput ? (parseInt(sshWaitTimeInput.value) || 60) : 60;
+      
+      // Get SSH profile commands if available
+      let sshCommands = [];
+      try {
+        const sshRes = await api('/ssh-command-profiles/list');
+        if (sshRes.ok) {
+          const sshData = await sshRes.json();
+          const sshProfile = sshData.profiles?.find(p => p.id === parseInt(sshProfileIdForReport));
+          if (sshProfile && sshProfile.commands) {
+            sshCommands = sshProfile.commands.split('\n').filter(c => c.trim());
+          }
+        }
+      } catch (err) {
+        // Ignore errors
+      }
+      
+      finalExecutionDetails.ssh_profile = {
+        profile_id: parseInt(sshProfileIdForReport),
+        profile_name: sshProfileName,
+        wait_time_seconds: sshWaitTime,
+        commands: sshCommands,
+        hosts: executionDetails.ssh_executions.map(exec => ({
+          host: exec.host,
+          success: exec.success,
+          commands_executed: exec.success ? sshCommands.length : 0,
+          commands_failed: exec.success ? 0 : sshCommands.length,
+          error: exec.error || null,
+          output: exec.output || null
+        }))
+      };
+      // Remove ssh_executions as we're using ssh_profile now
+      delete finalExecutionDetails.ssh_executions;
+    }
+    
+    if (runId) {
+      try {
+        await api(`/run/update/${runId}`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ 
+            status: finalStatus, 
+            message: finalMessage,
+            errors: errors,
+            execution_details: finalExecutionDetails
+          })
+        });
+        logMsg(`Run tracking updated (ID: ${runId}, Status: ${finalStatus})`);
+      } catch (err) {
+        logMsg(`Warning: Could not update run record: ${err.message || err}`);
+      }
+    }
+    
+    renderTemplates();
+    stopRunTimer();
+    
+    // Navigate to Reports after a short delay
+    setTimeout(() => {
+      const reportsMenuItem = document.querySelector('.submenu-item[data-section="reports"]');
+      if (reportsMenuItem) {
+        const group = reportsMenuItem.closest('.menu-group');
+        if (group) group.classList.add('expanded');
+        reportsMenuItem.click();
+        logMsg('Navigating to Reports section...');
+      }
+      
+      setTimeout(() => {
+        hideRunProgress();
+        if (runBtn) runBtn.disabled = false;
+      }, 2000);
+    }, 1500);
+  } catch (error) {
+    const errorMsg = `Run error: ${error.message || error}`;
+    showStatus(errorMsg, { error: true, showProgress: false });
+    logMsg(errorMsg);
+    hideRunProgress();
+    stopRunTimer();
+    
+    // Update run record with error
+    if (runId) {
+      try {
+        const runDuration = (Date.now() - runStartTime) / 1000;
+        const finalExecutionDetails = {
+          ...executionDetails,
+          hosts: (hosts || []).map(({host}) => host),
+          duration_seconds: runDuration
+        };
+        
+        await api(`/run/update/${runId}`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ 
+            status: 'error', 
+            message: errorMsg,
+            errors: [errorMsg],
+            execution_details: finalExecutionDetails
+          })
+        });
+      } catch (err) {
+        logMsg(`Warning: Could not update run record: ${err.message || err}`);
+      }
+    }
+    
+    const runBtn = el('btnInstallSelected');
+    if (runBtn) runBtn.disabled = false;
+  } finally {
+    updateInstallSelect();
+    const runBtn = el('btnInstallSelected');
+    if (runBtn && runBtn.disabled) {
+      const rows = Array.from(document.querySelectorAll('.tpl-row'));
+      const allFilled = rows.length > 0 && rows.every(r => {
+        const selects = r.querySelectorAll('select');
+        const repoSelect = selects[0];
+        const templateFiltered = r._templateFiltered;
+        const versionSelect = selects.length > 2 ? selects[selects.length - 1] : (selects[1] || null);
+        const repo_name = repoSelect?.value || '';
+        const template_name = templateFiltered ? templateFiltered.getValue() : '';
+        const version = versionSelect?.value || '';
+        return repo_name && template_name && version;
+      });
+      if (allFilled) {
+        runBtn.disabled = false;
+      }
+    }
   }
 }
 
@@ -7042,7 +8443,7 @@ async function handleSaveConfigButton() {
     editingConfigId = null;
     clearConfigName();
     
-    // Reset all inputs in FabricStudio Preparation section
+    // Reset all inputs in FabricStudio Runs section
     resetPreparationSection();
     
     // Navigate to configurations section
@@ -8435,6 +9836,462 @@ async function deleteSshCommandProfile(profileId) {
   }
 }
 
+// Custom dialog for SSH profile execution
+async function promptSshProfileExecution(profileId, profileName, commandCount) {
+  return new Promise((resolve) => {
+    const overlay = document.createElement('div');
+    overlay.style.position = 'fixed';
+    overlay.style.top = '0';
+    overlay.style.left = '0';
+    overlay.style.right = '0';
+    overlay.style.bottom = '0';
+    overlay.style.background = 'rgba(0,0,0,0.4)';
+    overlay.style.display = 'flex';
+    overlay.style.alignItems = 'center';
+    overlay.style.justifyContent = 'center';
+    overlay.style.zIndex = '9999';
+
+    const dialog = document.createElement('div');
+    dialog.style.background = 'white';
+    dialog.style.border = '1px solid #d2d2d7';
+    dialog.style.boxShadow = '0 4px 12px rgba(0,0,0,0.2)';
+    dialog.style.width = '500px';
+    dialog.style.maxWidth = '90%';
+    dialog.style.padding = '20px';
+    dialog.style.borderRadius = '0';
+
+    const title = document.createElement('div');
+    title.textContent = `Execute SSH Profile: ${profileName}`;
+    title.style.fontWeight = '600';
+    title.style.marginBottom = '16px';
+    title.style.color = '#1d1d1f';
+    title.style.fontSize = '16px';
+    dialog.appendChild(title);
+
+    const info = document.createElement('div');
+    info.textContent = `Commands: ${commandCount} command(s)`;
+    info.style.marginBottom = '16px';
+    info.style.color = '#86868b';
+    info.style.fontSize = '13px';
+    dialog.appendChild(info);
+
+    // NHI Credential selection
+    const nhiLabel = document.createElement('label');
+    nhiLabel.textContent = 'NHI Credential (optional):';
+    nhiLabel.style.display = 'block';
+    nhiLabel.style.marginBottom = '6px';
+    nhiLabel.style.color = '#424245';
+    nhiLabel.style.fontSize = '13px';
+    nhiLabel.style.fontWeight = '500';
+    dialog.appendChild(nhiLabel);
+
+    const nhiSelect = document.createElement('select');
+    nhiSelect.id = 'sshExecNhiSelect';
+    nhiSelect.style.width = '100%';
+    nhiSelect.style.boxSizing = 'border-box';
+    nhiSelect.style.margin = '0 0 16px 0';
+    nhiSelect.style.padding = '6px 10px';
+    nhiSelect.style.border = '1px solid #d2d2d7';
+    nhiSelect.style.minHeight = '32px';
+    nhiSelect.style.fontSize = '13px';
+    nhiSelect.style.color = '#1d1d1f';
+    nhiSelect.innerHTML = '<option value="">None (enter host manually)</option>';
+    dialog.appendChild(nhiSelect);
+
+    // Load NHI credentials
+    (async () => {
+      try {
+        const res = await api('/nhi/list');
+        if (res.ok) {
+          const data = await res.json();
+          const credentials = data.credentials || [];
+          credentials.forEach(cred => {
+            const option = document.createElement('option');
+            option.value = cred.id;
+            option.textContent = `${cred.name} (${cred.hosts_with_tokens?.length || 0} host(s))`;
+            nhiSelect.appendChild(option);
+          });
+        }
+      } catch (error) {
+        // Ignore errors
+      }
+    })();
+
+    // Host input (shown when NHI not selected)
+    const hostLabel = document.createElement('label');
+    hostLabel.textContent = 'Hostname or IP:';
+    hostLabel.style.display = 'block';
+    hostLabel.style.marginBottom = '6px';
+    hostLabel.style.color = '#424245';
+    hostLabel.style.fontSize = '13px';
+    hostLabel.style.fontWeight = '500';
+    dialog.appendChild(hostLabel);
+
+    const hostInput = document.createElement('input');
+    hostInput.id = 'sshExecHostInput';
+    hostInput.type = 'text';
+    hostInput.placeholder = 'Enter hostname or IP address';
+    hostInput.style.width = '100%';
+    hostInput.style.boxSizing = 'border-box';
+    hostInput.style.margin = '0 0 16px 0';
+    hostInput.style.padding = '6px 10px';
+    hostInput.style.border = '1px solid #d2d2d7';
+    hostInput.style.minHeight = '32px';
+    hostInput.style.fontSize = '13px';
+    hostInput.style.color = '#1d1d1f';
+    dialog.appendChild(hostInput);
+
+    // Hosts display (shown when NHI selected)
+    const hostsDisplay = document.createElement('div');
+    hostsDisplay.id = 'sshExecHostsDisplay';
+    hostsDisplay.style.display = 'none';
+    hostsDisplay.style.marginBottom = '16px';
+    dialog.appendChild(hostsDisplay);
+
+    // Hosts chips container
+    const hostsChipsContainer = document.createElement('div');
+    hostsChipsContainer.id = 'sshExecHostsChips';
+    hostsChipsContainer.style.display = 'none';
+    hostsChipsContainer.style.flexWrap = 'wrap';
+    hostsChipsContainer.style.gap = '6px';
+    hostsChipsContainer.style.marginTop = '8px';
+    hostsChipsContainer.style.minHeight = '32px';
+    hostsDisplay.appendChild(hostsChipsContainer);
+
+    // Selected hosts array
+    let selectedHosts = [];
+
+    // Function to render host chips
+    const renderHostChips = () => {
+      hostsChipsContainer.innerHTML = '';
+      if (selectedHosts.length === 0) {
+        hostsChipsContainer.style.display = 'none';
+        return;
+      }
+      hostsChipsContainer.style.display = 'flex';
+      
+      selectedHosts.forEach((hostInfo, index) => {
+        const host = typeof hostInfo === 'string' ? hostInfo : hostInfo.host;
+        const port = typeof hostInfo === 'object' ? (hostInfo.port || 22) : 22;
+        const entry = host + (port !== 22 ? ':' + port : '');
+        
+        const chip = document.createElement('div');
+        chip.className = 'host-chip valid';
+        
+        const chipText = document.createElement('span');
+        chipText.className = 'chip-text';
+        chipText.textContent = entry;
+        chip.appendChild(chipText);
+        
+        const chipDelete = document.createElement('button');
+        chipDelete.className = 'chip-delete';
+        chipDelete.textContent = '×';
+        chipDelete.type = 'button';
+        chipDelete.title = 'Remove host';
+        chipDelete.addEventListener('click', () => {
+          selectedHosts.splice(index, 1);
+          renderHostChips();
+          updateConfirmButton();
+        });
+        chip.appendChild(chipDelete);
+        
+        hostsChipsContainer.appendChild(chip);
+      });
+    };
+
+    // Update hosts display when NHI credential changes
+    nhiSelect.addEventListener('change', () => {
+      const nhiId = nhiSelect.value;
+      hostsConfirmed = false; // Reset confirmation when credential changes
+      if (nhiId) {
+        hostInput.style.display = 'none';
+        hostLabel.style.display = 'none';
+        hostsDisplay.style.display = 'block';
+        hostsDisplay.innerHTML = '<div style="font-size: 12px; color: #86868b; margin-bottom: 8px;">Hosts will be loaded from NHI credential when password is entered</div>';
+        hostsDisplay.appendChild(hostsChipsContainer);
+        hostsDisplay.setAttribute('data-nhi-id', nhiId);
+        selectedHosts = [];
+        renderHostChips();
+        // Execute button stays enabled so user can click it to load hosts
+        executeBtn.disabled = false;
+        executeBtn.style.opacity = '1';
+        executeBtn.style.cursor = 'pointer';
+      } else {
+        hostInput.style.display = 'block';
+        hostLabel.style.display = 'block';
+        hostsDisplay.style.display = 'none';
+        hostsDisplay.removeAttribute('data-nhi-id');
+        selectedHosts = [];
+        renderHostChips();
+        executeBtn.disabled = false; // Enable execute for manual host entry
+        executeBtn.style.opacity = '1';
+        executeBtn.style.cursor = 'pointer';
+      }
+      updateConfirmButton();
+    });
+
+    // Password input
+    const passwordLabel = document.createElement('label');
+    passwordLabel.textContent = 'Encryption Password:';
+    passwordLabel.style.display = 'block';
+    passwordLabel.style.marginBottom = '6px';
+    passwordLabel.style.color = '#424245';
+    passwordLabel.style.fontSize = '13px';
+    passwordLabel.style.fontWeight = '500';
+    dialog.appendChild(passwordLabel);
+
+    const passwordInput = document.createElement('input');
+    passwordInput.id = 'sshExecPasswordInput';
+    passwordInput.type = 'password';
+    passwordInput.placeholder = 'Enter encryption password (must match NHI credential and SSH key)';
+    passwordInput.style.width = '100%';
+    passwordInput.style.boxSizing = 'border-box';
+    passwordInput.style.margin = '0 0 16px 0';
+    passwordInput.style.padding = '6px 10px';
+    passwordInput.style.border = '1px solid #d2d2d7';
+    passwordInput.style.minHeight = '32px';
+    passwordInput.style.fontSize = '13px';
+    passwordInput.style.color = '#1d1d1f';
+    dialog.appendChild(passwordInput);
+
+    const errorDiv = document.createElement('div');
+    errorDiv.id = 'sshExecError';
+    errorDiv.style.display = 'none';
+    errorDiv.style.marginBottom = '12px';
+    errorDiv.style.padding = '8px';
+    errorDiv.style.background = '#fee';
+    errorDiv.style.border = '1px solid #f87171';
+    errorDiv.style.borderRadius = '4px';
+    errorDiv.style.fontSize = '12px';
+    errorDiv.style.color = '#dc2626';
+    dialog.appendChild(errorDiv);
+
+    // Confirm button (shown after hosts are loaded)
+    const confirmBtn = document.createElement('button');
+    confirmBtn.id = 'sshExecConfirmBtn';
+    confirmBtn.textContent = 'Confirm Hosts';
+    confirmBtn.style.padding = '6px 16px';
+    confirmBtn.style.border = 'none';
+    confirmBtn.style.background = '#10b981';
+    confirmBtn.style.color = 'white';
+    confirmBtn.style.cursor = 'pointer';
+    confirmBtn.style.fontSize = '13px';
+    confirmBtn.style.display = 'none';
+    confirmBtn.style.marginBottom = '12px';
+    confirmBtn.style.width = '100%';
+    
+    let hostsConfirmed = false;
+    
+    const updateConfirmButton = () => {
+      if (nhiSelect.value && selectedHosts.length > 0 && !hostsConfirmed) {
+        confirmBtn.style.display = 'block';
+      } else {
+        confirmBtn.style.display = 'none';
+      }
+    };
+    
+    confirmBtn.onclick = () => {
+      if (selectedHosts.length === 0) {
+        errorDiv.textContent = 'Please select at least one host';
+        errorDiv.style.display = 'block';
+        return;
+      }
+      hostsConfirmed = true;
+      confirmBtn.style.display = 'none';
+      errorDiv.style.display = 'none';
+      executeBtn.disabled = false;
+      executeBtn.style.opacity = '1';
+      executeBtn.style.cursor = 'pointer';
+    };
+    
+    dialog.appendChild(confirmBtn);
+
+    // Buttons
+    const buttonContainer = document.createElement('div');
+    buttonContainer.style.display = 'flex';
+    buttonContainer.style.gap = '8px';
+    buttonContainer.style.justifyContent = 'flex-end';
+
+    const cancelBtn = document.createElement('button');
+    cancelBtn.textContent = 'Cancel';
+    cancelBtn.style.padding = '6px 16px';
+    cancelBtn.style.border = '1px solid #d2d2d7';
+    cancelBtn.style.background = 'white';
+    cancelBtn.style.color = '#1d1d1f';
+    cancelBtn.style.cursor = 'pointer';
+    cancelBtn.style.fontSize = '13px';
+    cancelBtn.onclick = () => {
+      document.body.removeChild(overlay);
+      resolve(null);
+    };
+    buttonContainer.appendChild(cancelBtn);
+
+    const executeBtn = document.createElement('button');
+    executeBtn.textContent = 'Execute';
+    executeBtn.style.padding = '6px 16px';
+    executeBtn.style.border = 'none';
+    executeBtn.style.background = '#0071e3';
+    executeBtn.style.color = 'white';
+    executeBtn.style.cursor = 'pointer';
+    executeBtn.style.fontSize = '13px';
+    executeBtn.disabled = false; // Will be disabled if NHI credential is selected
+    executeBtn.style.opacity = executeBtn.disabled ? '0.5' : '1';
+    executeBtn.style.cursor = executeBtn.disabled ? 'not-allowed' : 'pointer';
+    executeBtn.onclick = async () => {
+      const nhiId = nhiSelect.value;
+      const host = hostInput.value.trim();
+      const password = passwordInput.value.trim();
+      
+      if (!password) {
+        errorDiv.textContent = 'Password is required';
+        errorDiv.style.display = 'block';
+        return;
+      }
+      
+      let hosts = [];
+      
+      // If NHI credential is selected, check if hosts are already loaded and confirmed
+      if (nhiId) {
+        if (!hostsConfirmed || selectedHosts.length === 0) {
+          // Load hosts using the password
+          errorDiv.style.display = 'none';
+          executeBtn.disabled = true;
+          executeBtn.textContent = 'Loading hosts...';
+          
+          // Update hosts display message
+          const messageDiv = hostsDisplay.querySelector('div');
+          if (messageDiv) {
+            messageDiv.textContent = 'Loading hosts...';
+          }
+          
+          try {
+            const nhiRes = await api(`/nhi/get/${nhiId}`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ encryption_password: password })
+            });
+            
+            if (!nhiRes.ok) {
+              const errorText = await nhiRes.text().catch(() => 'Unknown error');
+              errorDiv.textContent = `Failed to load hosts: ${errorText}`;
+              errorDiv.style.display = 'block';
+              executeBtn.disabled = false;
+              executeBtn.textContent = 'Execute';
+              executeBtn.style.opacity = '1';
+              executeBtn.style.cursor = 'pointer';
+              if (messageDiv) {
+                messageDiv.textContent = 'Failed to load hosts';
+              }
+              return;
+            }
+            
+            const nhiData = await nhiRes.json();
+            const hostsList = nhiData.hosts_with_tokens || [];
+            
+            if (hostsList.length === 0) {
+              errorDiv.textContent = 'No hosts found in this NHI credential';
+              errorDiv.style.display = 'block';
+              executeBtn.disabled = false;
+              executeBtn.textContent = 'Execute';
+              executeBtn.style.opacity = '1';
+              executeBtn.style.cursor = 'pointer';
+              if (messageDiv) {
+                messageDiv.textContent = 'No hosts found in this NHI credential';
+              }
+              return;
+            }
+            
+            // Populate selected hosts and render chips
+            selectedHosts = hostsList.map(h => ({ host: h, port: 22 }));
+            renderHostChips();
+            updateConfirmButton();
+            
+            if (messageDiv) {
+              messageDiv.textContent = `Loaded ${hostsList.length} host(s). Review and confirm:`;
+            }
+            
+            executeBtn.disabled = true;
+            executeBtn.textContent = 'Execute';
+            executeBtn.style.opacity = '0.5';
+            executeBtn.style.cursor = 'not-allowed';
+            return; // Wait for user to confirm hosts
+          } catch (error) {
+            errorDiv.textContent = `Error loading hosts: ${error.message || error}`;
+            errorDiv.style.display = 'block';
+            executeBtn.disabled = false;
+            executeBtn.textContent = 'Execute';
+            const messageDiv = hostsDisplay.querySelector('div');
+            if (messageDiv) {
+              messageDiv.textContent = 'Error loading hosts';
+            }
+            return;
+          }
+        } else {
+          // Hosts already confirmed, use selected hosts
+          hosts = selectedHosts.map(h => ({ host: typeof h === 'string' ? h : h.host, port: typeof h === 'object' ? (h.port || 22) : 22 }));
+        }
+      } else {
+        if (!host) {
+          errorDiv.textContent = 'Please enter a hostname or select an NHI credential';
+          errorDiv.style.display = 'block';
+          return;
+        }
+        hosts = [{ host, port: 22 }];
+      }
+      
+      // Validate password against both NHI credential (if provided) and SSH key
+      executeBtn.textContent = 'Validating password...';
+      
+      try {
+        const validateRes = await api('/ssh-profiles/validate-password', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            nhi_credential_id: nhiId ? parseInt(nhiId) : null,
+            ssh_profile_id: parseInt(profileId),
+            encryption_password: password
+          })
+        });
+        
+        const validateData = await validateRes.json();
+        if (!validateData.valid) {
+          errorDiv.textContent = validateData.error || 'Password validation failed';
+          errorDiv.style.display = 'block';
+          executeBtn.disabled = false;
+          executeBtn.textContent = 'Execute';
+          return;
+        }
+        
+        document.body.removeChild(overlay);
+        resolve({
+          nhi_credential_id: nhiId ? parseInt(nhiId) : null,
+          hosts: hosts,
+          encryption_password: password
+        });
+      } catch (error) {
+        errorDiv.textContent = `Validation error: ${error.message || error}`;
+        errorDiv.style.display = 'block';
+        executeBtn.disabled = false;
+        executeBtn.textContent = 'Execute';
+      }
+    };
+    buttonContainer.appendChild(executeBtn);
+
+    dialog.appendChild(buttonContainer);
+    overlay.appendChild(dialog);
+    document.body.appendChild(overlay);
+
+    // Focus on first input
+    setTimeout(() => {
+      if (nhiSelect.value) {
+        passwordInput.focus();
+      } else {
+        hostInput.focus();
+      }
+    }, 100);
+  });
+}
+
 // Run SSH command profile manually
 async function runSshCommandProfile(profileId) {
   try {
@@ -8459,73 +10316,89 @@ async function runSshCommandProfile(profileId) {
       return;
     }
     
-    // Prompt for hostname/IP
-    const hostname = await promptStyled(
-      `Execute SSH Profile: ${profile.name}`,
-      `Enter hostname or IP address:\n\nCommands: ${profile.commands.split('\n').filter(c => c.trim()).length} command(s)`,
-      'text'
-    );
-    if (!hostname || !hostname.trim()) {
-      return;
+    const commandCount = profile.commands.split('\n').filter(c => c.trim()).length;
+    
+    // Show custom dialog
+    const execData = await promptSshProfileExecution(profileId, profile.name, commandCount);
+    if (!execData) {
+      return; // User cancelled
     }
     
-    // Prompt for encryption password
-    const encryptionPassword = await promptStyled(
-      'SSH Key Decryption',
-      'Enter encryption password for SSH key decryption:',
-      'password'
-    );
-    if (!encryptionPassword) {
-      return;
+    const { nhi_credential_id, hosts, encryption_password } = execData;
+    
+    // Execute SSH profile on all hosts
+    showStatus(`Executing SSH profile '${profile.name}' on ${hosts.length} host(s)...`);
+    
+    const results = [];
+    for (const hostInfo of hosts) {
+      const host = typeof hostInfo === 'string' ? hostInfo : hostInfo.host;
+      const port = typeof hostInfo === 'object' ? (hostInfo.port || 22) : 22;
+      
+      try {
+        showStatus(`Executing SSH profile '${profile.name}' on ${host}...`);
+        
+        const executeRes = await api('/ssh-profiles/execute', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            fabric_host: host,
+            ssh_profile_id: profileId,
+            ssh_port: port,
+            encryption_password: encryption_password,
+            nhi_credential_id: nhi_credential_id,
+            wait_time_seconds: 0  // No wait time for manual execution
+          })
+        });
+        
+        if (!executeRes.ok) {
+          const errorText = await executeRes.text().catch(() => 'Unknown error');
+          results.push({ host, success: false, error: errorText });
+          continue;
+        }
+        
+        const executeData = await executeRes.json();
+        results.push({
+          host,
+          success: executeData.success,
+          output: executeData.output,
+          error: executeData.error
+        });
+      } catch (error) {
+        results.push({ host, success: false, error: error.message || error });
+      }
     }
-    
-    // Execute SSH profile
-    showStatus(`Executing SSH profile '${profile.name}' on ${hostname}...`);
-    
-    const executeRes = await api('/ssh-profiles/execute', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        fabric_host: hostname.trim(),
-        ssh_profile_id: profileId,
-        ssh_port: 22,
-        encryption_password: encryptionPassword,
-        wait_time_seconds: 0  // No wait time for manual execution
-      })
-    });
-    
-    if (!executeRes.ok) {
-      const errorText = await executeRes.text().catch(() => 'Unknown error');
-      showStatus(`SSH execution failed: ${errorText}`, { error: true });
-      return;
-    }
-    
-    const executeData = await executeRes.json();
     
     // Display results
-    if (executeData.success) {
-      let message = `✓ SSH profile '${profile.name}' executed successfully on ${hostname}`;
-      if (executeData.output) {
-        message += `\n\nOutput:\n${executeData.output}`;
+    const successCount = results.filter(r => r.success).length;
+    const failCount = results.length - successCount;
+    
+    let message = `SSH profile '${profile.name}' execution completed:\n`;
+    message += `✓ Success: ${successCount} host(s)\n`;
+    if (failCount > 0) {
+      message += `✗ Failed: ${failCount} host(s)\n`;
+    }
+    message += '\n';
+    
+    results.forEach(result => {
+      if (result.success) {
+        message += `✓ ${result.host}: Success\n`;
+        if (result.output) {
+          message += `  Output: ${result.output.substring(0, 200)}${result.output.length > 200 ? '...' : ''}\n`;
+        }
+      } else {
+        message += `✗ ${result.host}: ${result.error || 'Unknown error'}\n`;
+        if (result.output) {
+          message += `  Output: ${result.output.substring(0, 200)}${result.output.length > 200 ? '...' : ''}\n`;
+        }
       }
-      if (executeData.error) {
-        message += `\n\nWarnings:\n${executeData.error}`;
-      }
-      
-      // Show detailed results in a styled modal
+    });
+    
+    if (successCount === results.length) {
       await alertStyled('SSH Execution Success', message, false);
-      showStatus(`SSH profile '${profile.name}' executed successfully on ${hostname}`);
+      showStatus(`SSH profile '${profile.name}' executed successfully on all ${results.length} host(s)`);
     } else {
-      let errorMessage = `✗ SSH profile '${profile.name}' execution failed on ${hostname}`;
-      if (executeData.error) {
-        errorMessage += `\n\nErrors:\n${executeData.error}`;
-      }
-      if (executeData.output) {
-        errorMessage += `\n\nOutput:\n${executeData.output}`;
-      }
-      
-      await alertStyled('SSH Execution Failed', errorMessage, true);
-      showStatus(`SSH profile '${profile.name}' execution failed on ${hostname}`, { error: true });
+      await alertStyled('SSH Execution Completed', message, failCount > 0);
+      showStatus(`SSH profile '${profile.name}' executed on ${successCount}/${results.length} host(s)`, failCount > 0 ? { error: true } : {});
     }
   } catch (error) {
     showStatus(`Error running SSH command profile: ${error.message || error}`, { error: true });
@@ -8611,7 +10484,7 @@ async function executeSshProfiles(hosts, sshProfileId, encryptionPassword, waitT
 }
 
 // Audit Logs Management functions
-let currentFilters = { action: '', user: '' };
+let currentFilters = { action: '', user: '', date_from: '', date_to: '' };
 
 function setupAuditLogsButtons() {
   const refreshBtn = el('btnRefreshAuditLogs');
@@ -8645,7 +10518,7 @@ function setupAuditLogsButtons() {
 }
 
 // Server Logs functions
-let currentServerLogFilters = { level: '', logger_name: '', message: '' };
+let currentServerLogFilters = { level: '', logger_name: '', message: '', date_from: '', date_to: '' };
 
 function setupServerLogsButtons() {
   const refreshBtn = el('btnServerLogsRefresh');
@@ -8662,6 +10535,11 @@ function applyServerLogFilters() {
   currentServerLogFilters.level = (el('serverLogLevel')?.value || '');
   currentServerLogFilters.logger_name = (el('serverLogLogger')?.value || '').trim();
   currentServerLogFilters.message = (el('serverLogMessage')?.value || '').trim();
+  // Convert datetime-local to UTC ISO format (full ISO string with Z)
+  const dateFromValue = el('serverLogDateFrom')?.value || '';
+  const dateToValue = el('serverLogDateTo')?.value || '';
+  currentServerLogFilters.date_from = dateFromValue ? new Date(dateFromValue).toISOString() : '';
+  currentServerLogFilters.date_to = dateToValue ? new Date(dateToValue).toISOString() : '';
   loadServerLogs();
 }
 
@@ -8669,7 +10547,9 @@ function clearServerLogFilters() {
   if (el('serverLogLevel')) el('serverLogLevel').value = '';
   if (el('serverLogLogger')) el('serverLogLogger').value = '';
   if (el('serverLogMessage')) el('serverLogMessage').value = '';
-  currentServerLogFilters = { level: '', logger_name: '', message: '' };
+  if (el('serverLogDateFrom')) el('serverLogDateFrom').value = '';
+  if (el('serverLogDateTo')) el('serverLogDateTo').value = '';
+  currentServerLogFilters = { level: '', logger_name: '', message: '', date_from: '', date_to: '' };
   loadServerLogs();
 }
 
@@ -8679,10 +10559,12 @@ async function loadServerLogs() {
   try {
     listEl.innerHTML = '<p>Loading server logs...</p>';
     let url = '/server-logs/list?limit=1000';
-    const { level, logger_name, message } = currentServerLogFilters;
+    const { level, logger_name, message, date_from, date_to } = currentServerLogFilters;
     if (level) url += `&level=${encodeURIComponent(level)}`;
     if (logger_name) url += `&logger_name=${encodeURIComponent(logger_name)}`;
     if (message) url += `&message=${encodeURIComponent(message)}`;
+    if (date_from) url += `&date_from=${encodeURIComponent(date_from)}`;
+    if (date_to) url += `&date_to=${encodeURIComponent(date_to)}`;
     const res = await api(url);
     if (!res.ok) {
       listEl.innerHTML = `<p style="color: #f87171;">Error loading server logs: ${res.statusText}</p>`;
@@ -8719,11 +10601,13 @@ async function loadServerLogs() {
 
 async function exportServerLogs() {
   let url = '/server-logs/export';
-  const { level, logger_name, message } = currentServerLogFilters;
+  const { level, logger_name, message, date_from, date_to } = currentServerLogFilters;
   const params = [];
   if (level) params.push(`level=${encodeURIComponent(level)}`);
   if (logger_name) params.push(`logger_name=${encodeURIComponent(logger_name)}`);
   if (message) params.push(`message=${encodeURIComponent(message)}`);
+  if (date_from) params.push(`date_from=${encodeURIComponent(date_from)}`);
+  if (date_to) params.push(`date_to=${encodeURIComponent(date_to)}`);
   if (params.length) url += '?' + params.join('&');
   const res = await fetch(url);
   if (!res.ok) {
@@ -8744,9 +10628,16 @@ async function exportServerLogs() {
 function applyFilters() {
   const actionFilter = el('filterAction');
   const userFilter = el('filterUser');
+  const dateFromFilter = el('filterDateFrom');
+  const dateToFilter = el('filterDateTo');
   
   currentFilters.action = actionFilter ? actionFilter.value : '';
   currentFilters.user = userFilter ? userFilter.value.trim() : '';
+  // Convert datetime-local to UTC ISO format (full ISO string with Z)
+  const dateFromValue = dateFromFilter ? dateFromFilter.value : '';
+  const dateToValue = dateToFilter ? dateToFilter.value : '';
+  currentFilters.date_from = dateFromValue ? new Date(dateFromValue).toISOString() : '';
+  currentFilters.date_to = dateToValue ? new Date(dateToValue).toISOString() : '';
   
   loadAuditLogs();
 }
@@ -8754,11 +10645,15 @@ function applyFilters() {
 function clearFilters() {
   const actionFilter = el('filterAction');
   const userFilter = el('filterUser');
+  const dateFromFilter = el('filterDateFrom');
+  const dateToFilter = el('filterDateTo');
   
   if (actionFilter) actionFilter.value = '';
   if (userFilter) userFilter.value = '';
+  if (dateFromFilter) dateFromFilter.value = '';
+  if (dateToFilter) dateToFilter.value = '';
   
-  currentFilters = { action: '', user: '' };
+  currentFilters = { action: '', user: '', date_from: '', date_to: '' };
   loadAuditLogs();
 }
 
@@ -8775,6 +10670,12 @@ async function loadAuditLogs() {
     }
     if (currentFilters.user) {
       url += `&user=${encodeURIComponent(currentFilters.user)}`;
+    }
+    if (currentFilters.date_from) {
+      url += `&date_from=${encodeURIComponent(currentFilters.date_from)}`;
+    }
+    if (currentFilters.date_to) {
+      url += `&date_to=${encodeURIComponent(currentFilters.date_to)}`;
     }
     
     const res = await api(url);
@@ -8831,6 +10732,12 @@ async function exportAuditLogs() {
     if (currentFilters.user) {
       params.push(`user=${encodeURIComponent(currentFilters.user)}`);
     }
+    if (currentFilters.date_from) {
+      params.push(`date_from=${encodeURIComponent(currentFilters.date_from)}`);
+    }
+    if (currentFilters.date_to) {
+      params.push(`date_to=${encodeURIComponent(currentFilters.date_to)}`);
+    }
     if (params.length > 0) {
       url += '?' + params.join('&');
     }
@@ -8854,5 +10761,228 @@ async function exportAuditLogs() {
     showStatus('Audit logs exported successfully');
   } catch (error) {
     showStatus(`Error exporting audit logs: ${error.message || error}`);
+  }
+}
+
+// Reports section functions
+function setupReportsButtons() {
+  const refreshBtn = el('btnRefreshReports');
+  const backBtn = el('btnBackToReports');
+  
+  if (refreshBtn) {
+    refreshBtn.addEventListener('click', () => loadReports());
+  }
+  
+  if (backBtn) {
+    backBtn.addEventListener('click', () => {
+      el('reportsList').style.display = 'block';
+      el('reportDetailView').style.display = 'none';
+      loadReports();
+    });
+  }
+}
+
+async function loadReports() {
+  const listEl = el('reportsList');
+  if (!listEl) return;
+  
+  try {
+    listEl.innerHTML = '<p>Loading reports...</p>';
+    const res = await api('/run/reports');
+    
+    if (!res.ok) {
+      listEl.innerHTML = `<p style="color: #f87171;">Error loading reports: ${res.statusText}</p>`;
+      return;
+    }
+    
+    const data = await res.json();
+    const runs = data.runs || [];
+    
+    if (runs.length === 0) {
+      listEl.innerHTML = '<p>No run reports found.</p>';
+      return;
+    }
+    
+    let html = '<div style="display: flex; flex-direction: column; gap: 12px;">';
+    for (const run of runs) {
+      const statusColor = run.status === 'success' ? '#34d399' : run.status === 'error' ? '#f87171' : '#fbbf24';
+      const statusText = run.status === 'success' ? 'Success' : run.status === 'error' ? 'Error' : 'Running';
+      const startDate = run.started_at ? new Date(run.started_at).toLocaleString() : 'N/A';
+      const duration = run.duration_seconds ? `${Math.round(run.duration_seconds)}s` : 'N/A';
+      
+      html += `
+        <div class="config-item" data-run-id="${run.id}" style="padding: 12px; border: 1px solid #d2d2d7; border-radius: 4px; background: #f5f5f7; cursor: pointer;">
+          <div style="display: flex; align-items: center; gap: 12px; margin-bottom: 8px;">
+            <span style="padding: 4px 8px; background: ${statusColor}; color: white; border-radius: 4px; font-size: 12px; font-weight: 600;">${statusText}</span>
+            <span style="font-weight: 600; flex: 1;">${run.configuration_name || 'Manual Run'}</span>
+            <span style="font-size: 12px; color: #86868b; font-family: monospace;">ID: ${run.id}</span>
+            <span style="font-size: 12px; color: #86868b;">${startDate}</span>
+          </div>
+          <div style="font-size: 12px; color: #86868b;">
+            Duration: ${duration} | ${run.message || ''}
+          </div>
+        </div>
+      `;
+    }
+    html += '</div>';
+    
+    listEl.innerHTML = html;
+    
+    // Add click handlers
+    document.querySelectorAll('[data-run-id]').forEach(item => {
+      item.addEventListener('click', () => {
+        const runId = parseInt(item.getAttribute('data-run-id'));
+        showRunReport(runId);
+      });
+    });
+  } catch (error) {
+    listEl.innerHTML = `<p style="color: #f87171;">Error loading reports: ${error.message || error}</p>`;
+  }
+}
+
+async function showRunReport(runId) {
+  const detailView = el('reportDetailView');
+  const detailContent = el('reportDetailContent');
+  const detailTitle = el('reportDetailTitle');
+  const listEl = el('reportsList');
+  
+  if (!detailView || !detailContent || !detailTitle) return;
+  
+  try {
+    detailContent.innerHTML = '<p>Loading report details...</p>';
+    detailView.style.display = 'block';
+    listEl.style.display = 'none';
+    
+    const res = await api(`/run/reports/${runId}`);
+    if (!res.ok) {
+      detailContent.innerHTML = `<p style="color: #f87171;">Error loading report: ${res.statusText}</p>`;
+      return;
+    }
+    
+    const report = await res.json();
+    detailTitle.textContent = `Run Report: ${report.configuration_name || 'Manual Run'}`;
+    
+    const statusColor = report.status === 'success' ? '#34d399' : report.status === 'error' ? '#f87171' : '#fbbf24';
+    const statusText = report.status === 'success' ? 'Success' : report.status === 'error' ? 'Error' : 'Running';
+    const startDate = report.started_at ? new Date(report.started_at).toLocaleString() : 'N/A';
+    const endDate = report.completed_at ? new Date(report.completed_at).toLocaleString() : 'N/A';
+    const duration = report.execution_details?.duration_seconds ? `${Math.round(report.execution_details.duration_seconds)}s` : 'N/A';
+    
+    let html = `
+      <div style="margin-bottom: 24px;">
+        <div style="display: flex; gap: 12px; align-items: center; margin-bottom: 12px;">
+          <span style="padding: 6px 12px; background: ${statusColor}; color: white; border-radius: 4px; font-weight: 600;">${statusText}</span>
+          <span style="font-size: 14px; color: #86868b; font-family: monospace; font-weight: 600;">Run ID: ${report.id}</span>
+          <span style="font-size: 14px; color: #86868b;">Started: ${startDate}</span>
+          <span style="font-size: 14px; color: #86868b;">Completed: ${endDate}</span>
+          <span style="font-size: 14px; color: #86868b;">Duration: ${duration}</span>
+        </div>
+        ${report.message ? `<p style="margin-bottom: 12px;"><strong>Message:</strong> ${report.message}</p>` : ''}
+      </div>
+    `;
+    
+    const details = report.execution_details || {};
+    
+    // SSH Execution Summary (if SSH profile was used)
+    const sshProfile = details.ssh_profile;
+    if (sshProfile) {
+      html += '<h4 style="margin-top: 24px; margin-bottom: 12px;">SSH Commands Execution</h4>';
+      html += `<div style="border: 1px solid #d2d2d7; border-radius: 4px; padding: 12px; background: #fafafa; margin-bottom: 24px;">`;
+      html += `<p style="margin-bottom: 8px;"><strong>Profile:</strong> ${sshProfile.profile_name || 'N/A'} (ID: ${sshProfile.profile_id})</p>`;
+      html += `<p style="margin-bottom: 8px;"><strong>Wait Time:</strong> ${sshProfile.wait_time_seconds || 0}s between commands</p>`;
+      html += `<p style="margin-bottom: 12px;"><strong>Commands:</strong> ${(sshProfile.commands || []).length} command(s)</p>`;
+      
+      if (sshProfile.commands && sshProfile.commands.length > 0) {
+        html += '<div style="margin-bottom: 12px;"><strong>Command List:</strong><ul style="margin: 8px 0 0 20px; font-family: monospace; font-size: 12px;">';
+        for (const cmd of sshProfile.commands) {
+          html += `<li style="margin-bottom: 4px;">${cmd}</li>`;
+        }
+        html += '</ul></div>';
+      }
+      
+      // Per-host SSH execution results
+      if (sshProfile.hosts && sshProfile.hosts.length > 0) {
+        html += '<div style="margin-top: 12px;"><strong>Execution Results:</strong><div style="margin-top: 8px; display: flex; flex-direction: column; gap: 8px;">';
+        for (const hostResult of sshProfile.hosts) {
+          const successIcon = hostResult.success ? '✓' : '✗';
+          const successColor = hostResult.success ? '#34d399' : '#f87171';
+          html += `<div style="padding: 8px; border-left: 3px solid ${successColor}; background: white;">
+            <div style="font-weight: 600; margin-bottom: 4px;">
+              ${successIcon} <strong>Host:</strong> ${hostResult.host}
+            </div>
+            <div style="font-size: 12px; color: #86868b;">
+              Commands Executed: ${hostResult.commands_executed || 0} | 
+              Commands Failed: ${hostResult.commands_failed || 0}
+              ${hostResult.error ? `<br><span style="color: #f87171;">Error: ${hostResult.error}</span>` : ''}
+            </div>
+          </div>`;
+        }
+        html += '</div></div>';
+      }
+      
+      html += '</div>';
+    }
+    
+    const hosts = details.hosts || [];
+    
+    if (hosts.length > 0) {
+      html += '<h4 style="margin-top: 24px; margin-bottom: 12px;">Host Summary</h4>';
+      html += '<div style="display: flex; flex-direction: column; gap: 16px;">';
+      
+      for (const host of hosts) {
+        html += `<div style="border: 1px solid #d2d2d7; border-radius: 4px; padding: 12px; background: #fafafa;">`;
+        html += `<h5 style="margin: 0 0 12px 0; font-size: 14px; font-weight: 600;">Host: ${host}</h5>`;
+        
+        // Fabric Creations
+        const creations = (details.fabric_creations || []).filter(c => c.host === host);
+        if (creations.length > 0) {
+          html += '<div style="margin-bottom: 12px;"><strong>Fabric Creations:</strong><ul style="margin: 8px 0 0 20px;">';
+          for (const creation of creations) {
+            const successIcon = creation.success ? '✓' : '✗';
+            const successColor = creation.success ? '#34d399' : '#f87171';
+            const duration = creation.duration_seconds ? `${Math.round(creation.duration_seconds)}s` : 'N/A';
+            html += `<li style="color: ${successColor}; margin-bottom: 4px;">
+              ${successIcon} ${creation.template_name} v${creation.version} (${duration})
+              ${creation.errors ? ` - ${creation.errors.join('; ')}` : ''}
+            </li>`;
+          }
+          html += '</ul></div>';
+        }
+        
+        // Installations
+        const installations = (details.installations || []).filter(i => i.host === host);
+        if (installations.length > 0) {
+          html += '<div style="margin-bottom: 12px;"><strong>Installations:</strong><ul style="margin: 8px 0 0 20px;">';
+          for (const install of installations) {
+            const successIcon = install.success ? '✓' : '✗';
+            const successColor = install.success ? '#34d399' : '#f87171';
+            const duration = install.duration_seconds ? `${Math.round(install.duration_seconds)}s` : 'N/A';
+            html += `<li style="color: ${successColor}; margin-bottom: 4px;">
+              ${successIcon} ${install.template_name} v${install.version} (${duration})
+              ${install.errors ? ` - ${install.errors.join('; ')}` : ''}
+            </li>`;
+          }
+          html += '</ul></div>';
+        }
+        
+        html += '</div>';
+      }
+      
+      html += '</div>';
+    }
+    
+    // Errors
+    if (report.errors && report.errors.length > 0) {
+      html += '<h4 style="margin-top: 24px; margin-bottom: 12px; color: #f87171;">Errors</h4>';
+      html += '<ul style="margin-left: 20px;">';
+      for (const error of report.errors) {
+        html += `<li style="color: #f87171; margin-bottom: 8px;">${error}</li>`;
+      }
+      html += '</ul>';
+    }
+    
+    detailContent.innerHTML = html;
+  } catch (error) {
+    detailContent.innerHTML = `<p style="color: #f87171;">Error loading report: ${error.message || error}</p>`;
   }
 }
