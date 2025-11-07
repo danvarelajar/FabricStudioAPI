@@ -7,6 +7,7 @@ from fastapi.exceptions import RequestValidationError
 from starlette.middleware.base import BaseHTTPMiddleware
 from typing import Optional, List
 from pydantic import BaseModel
+from contextlib import asynccontextmanager
 import sqlite3
 import json
 import random
@@ -54,13 +55,21 @@ import requests
 import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
+# Lifespan handler to replace deprecated startup event
+@asynccontextmanager
+async def app_lifespan(app: FastAPI):
+    _start_background_threads()
+    yield
+
+
 # Initialize FastAPI with enhanced OpenAPI documentation
 app = FastAPI(
     title=Config.API_TITLE,
     description=Config.API_DESCRIPTION,
     version=Config.API_VERSION,
     docs_url="/docs",
-    redoc_url="/redoc"
+    redoc_url="/redoc",
+    lifespan=app_lifespan,
 )
 
 # Create API router for versioning
@@ -1900,7 +1909,7 @@ def cache_templates_post(req: CacheTemplatesReq):
 
 
 @app.get("/repo/templates/list")
-def repo_templates_list(request: Request, fabric_host: str, repo_name: str):
+def repo_templates_list_proxy(request: Request, fabric_host: str, repo_name: str):
     token = get_access_token_from_request(request, fabric_host)
     if not token:
         raise HTTPException(401, "Missing access_token in session or Authorization header")
@@ -4977,7 +4986,7 @@ async def update_nhi_token(request: Request, nhi_id: int):
 
 
 @app.delete("/nhi/delete/{nhi_id}")
-def delete_nhi(nhi_id: int):
+def delete_nhi_cleanup(nhi_id: int):
     """Delete an NHI credential by ID"""
     conn = db_connect_with_retry()
     if not conn:
@@ -5987,8 +5996,7 @@ token_refresh_thread = None
 cleanup_thread = None
 backup_thread = None
 
-@app.on_event("startup")
-def start_scheduler():
+def _start_background_threads():
     """Start the background scheduler on application startup"""
     global scheduler_thread, token_refresh_thread, cleanup_thread, backup_thread
     if scheduler_thread is None or not scheduler_thread.is_alive():
