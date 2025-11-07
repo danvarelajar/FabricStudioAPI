@@ -4192,6 +4192,12 @@ async function populateConfigEditForm(name, config) {
     editSshWaitTimeInput.value = config.sshWaitTime || 60;
   }
   
+  // Restore Run Workspace toggle
+  const editRunWorkspaceEnabledInput = el('editRunWorkspaceEnabled');
+  if (editRunWorkspaceEnabledInput && config.runWorkspaceEnabled !== undefined) {
+    editRunWorkspaceEnabledInput.checked = config.runWorkspaceEnabled !== false; // Default to true if not specified
+  }
+  
   // Create template rows and populate install select
   const tplFormList = el('editTplFormList');
   if (tplFormList) tplFormList.innerHTML = '';
@@ -4877,6 +4883,7 @@ function collectConfigFromEditForm() {
     newHostname: el('editNewHostname')?.value || '',
     chgPass: el('editChgPass')?.value || '',
     installSelect: el('editInstallSelect')?.value || '',
+    runWorkspaceEnabled: el('editRunWorkspaceEnabled') ? el('editRunWorkspaceEnabled').checked : true,
     sshProfileId: el('editSshProfileSelect')?.value || '',
     sshWaitTime: el('editSshWaitTime') ? (parseInt(el('editSshWaitTime').value) || 60) : 60,
     confirmedHosts: [],
@@ -6063,6 +6070,7 @@ function collectConfiguration() {
   const installSelectInput = el('installSelect');
   const sshProfileSelectInput = el('sshProfileSelect');
   const sshWaitTimeInput = el('sshWaitTime');
+  const runWorkspaceEnabledInput = el('runWorkspaceEnabled');
   
   // Ensure confirmedHosts is an array to avoid errors
   const hostsArray = Array.isArray(confirmedHosts) ? confirmedHosts : [];
@@ -6078,6 +6086,7 @@ function collectConfiguration() {
     chgPass: chgPassInput ? chgPassInput.value : '',
     confirmedHosts: hostsArray.map(h => ({ host: h.host, port: h.port })),
     installSelect: installSelectInput ? installSelectInput.value : '',
+    runWorkspaceEnabled: runWorkspaceEnabledInput ? runWorkspaceEnabledInput.checked : true,
     sshProfileId: sshProfileSelectInput ? (sshProfileSelectInput.value || '') : '',
     sshWaitTime: sshWaitTimeInput ? (parseInt(sshWaitTimeInput.value) || 60) : 60,
     templates: []
@@ -6833,6 +6842,12 @@ async function restoreConfiguration(config) {
     const installSelect = el('installSelect');
     if (installSelect) {
       installSelect.disabled = false;
+    }
+    
+    // Restore Run Workspace toggle
+    const runWorkspaceEnabledInput = el('runWorkspaceEnabled');
+    if (runWorkspaceEnabledInput && config.runWorkspaceEnabled !== undefined) {
+      runWorkspaceEnabledInput.checked = config.runWorkspaceEnabled !== false; // Default to true if not specified
     }
     
     // Call updateCreateEnabled to check if run button should be enabled
@@ -8141,6 +8156,47 @@ async function handleTrackedRunButton() {
     }
     
     // Install the selected workspace (after SSH profiles execute)
+    // Check if Run Workspace is enabled
+    const runWorkspaceEnabledInput = el('runWorkspaceEnabled');
+    const runWorkspaceEnabled = runWorkspaceEnabledInput ? runWorkspaceEnabledInput.checked : true;
+    
+    if (!runWorkspaceEnabled) {
+      logMsg('Run Workspace is disabled - skipping workspace installation');
+      updateRunProgress(100, 'Run completed - workspace installation skipped');
+      showStatus('Run completed - workspace installation was disabled');
+      renderTemplates();
+      stopRunTimer();
+      
+      // Update run record with final status
+      const finalStatus = errors.length === 0 ? 'success' : 'error';
+      const finalMessage = errors.length === 0 
+        ? 'Run completed successfully (workspace installation skipped)' 
+        : `Run completed with ${errors.length} error(s) (workspace installation skipped)`;
+      
+      const runDuration = (Date.now() - runStartTime) / 1000;
+      const finalExecutionDetails = {
+        ...executionDetails,
+        hosts: hosts.map(({host}) => host),
+        duration_seconds: runDuration
+      };
+      
+      if (runId) {
+        await api(`/run/update/${runId}`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ 
+            status: finalStatus, 
+            message: finalMessage,
+            errors: errors,
+            execution_details: finalExecutionDetails
+          })
+        });
+      }
+      
+      if (runBtn) runBtn.disabled = false;
+      return;
+    }
+    
     updateRunProgress(64, 'Preparing to install selected workspace...');
     logMsg('Preparing to install selected workspace...');
     const opt = el('installSelect').value;

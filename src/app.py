@@ -3544,154 +3544,159 @@ def run_configuration(config_data: dict, event_name: str, event_id: Optional[int
                     raise RuntimeError(f"SSH execution failed: {e}")
         
         # Step 5: Install selected workspace
-        # Only proceed if SSH execution succeeded (or was not required)
-        # Check if all hosts failed during SSH execution
-        if ssh_profile_id and ssh_execution_details:
-            ssh_failed_hosts = {h["host"] for h in ssh_execution_details["hosts"] if not h.get("success", False)}
-            if ssh_failed_hosts:
-                # If SSH failed on all hosts, stop the run
-                if ssh_failed_hosts == set(host_tokens.keys()):
-                    logger.error(f"Event '{event_name}': SSH execution failed on all hosts, stopping run")
-                    raise RuntimeError("SSH execution failed on all hosts")
-                # Otherwise, mark failed hosts and continue (some hosts succeeded)
-                failed_hosts.update(ssh_failed_hosts)
+        # Check if Run Workspace is enabled
+        run_workspace_enabled = config_data.get('runWorkspaceEnabled', True)  # Default to True for backward compatibility
         
-        installation_details = []  # Track installation details
-        if install_select:
-            template_name, version = install_select.split('|||')
-            # Find repo_name from templates list
-            repo_name = ''
-            for t in templates_list:
-                if t.get('template_name') == template_name and t.get('version') == version:
-                    repo_name = t.get('repo_name', '')
-                    break
+        if not run_workspace_enabled:
+            logger.info(f"Event '{event_name}': Run Workspace is disabled - skipping workspace installation")
+            installation_details = []
+        else:
+            # Only proceed if SSH execution succeeded (or was not required)
+            # Check if all hosts failed during SSH execution
+            if ssh_profile_id and ssh_execution_details:
+                ssh_failed_hosts = {h["host"] for h in ssh_execution_details["hosts"] if not h.get("success", False)}
+                if ssh_failed_hosts:
+                    # If SSH failed on all hosts, stop the run
+                    if ssh_failed_hosts == set(host_tokens.keys()):
+                        logger.error(f"Event '{event_name}': SSH execution failed on all hosts, stopping run")
+                        raise RuntimeError("SSH execution failed on all hosts")
+                    # Otherwise, mark failed hosts and continue (some hosts succeeded)
+                    failed_hosts.update(ssh_failed_hosts)
             
-            if repo_name:
-                # Filter out failed hosts
-                available_hosts = [h for h in host_tokens.keys() if h not in failed_hosts]
+            installation_details = []  # Track installation details
+            if install_select:
+                template_name, version = install_select.split('|||')
+                # Find repo_name from templates list
+                repo_name = ''
+                for t in templates_list:
+                    if t.get('template_name') == template_name and t.get('version') == version:
+                        repo_name = t.get('repo_name', '')
+                        break
                 
-                if not available_hosts:
-                    msg = f"All hosts failed during template creation. Skipping installation."
-                    logger.warning(f"Event '{event_name}': {msg}")
-                    errors.append(msg)
-                else:
-                    if failed_hosts:
-                        failed_host_names = ', '.join(failed_hosts)
-                        logger.info(f"Event '{event_name}': Skipping installation on failed hosts: {failed_host_names}. Installing on {len(available_hosts)} remaining host(s).")
+                if repo_name:
+                    # Filter out failed hosts
+                    available_hosts = [h for h in host_tokens.keys() if h not in failed_hosts]
                     
-                    # Install in parallel on all available hosts
-                    installation_lock = threading.Lock()
-                    
-                    def install_on_host(host):
-                        """Install fabric on a single host"""
-                        try:
-                            # Use cached template ID instead of fetching again
-                            template_id = get_cached_template_id(host, template_name, repo_name, version)
-                            if template_id:
-                                # install_fabric expects template name and version, not id
-                                install_start = datetime.now(timezone.utc)
-                                result = install_fabric(host, host_tokens[host], template_name, version)
-                                install_end = datetime.now(timezone.utc)
-                                install_duration = (install_end - install_start).total_seconds()
-                                
-                                if isinstance(result, tuple):
-                                    success, task_errors = result
+                    if not available_hosts:
+                        msg = f"All hosts failed during template creation. Skipping installation."
+                        logger.warning(f"Event '{event_name}': {msg}")
+                        errors.append(msg)
+                    else:
+                        if failed_hosts:
+                            failed_host_names = ', '.join(failed_hosts)
+                            logger.info(f"Event '{event_name}': Skipping installation on failed hosts: {failed_host_names}. Installing on {len(available_hosts)} remaining host(s).")
+                        
+                        # Install in parallel on all available hosts
+                        installation_lock = threading.Lock()
+                        
+                        def install_on_host(host):
+                            """Install fabric on a single host"""
+                            try:
+                                # Use cached template ID instead of fetching again
+                                template_id = get_cached_template_id(host, template_name, repo_name, version)
+                                if template_id:
+                                    # install_fabric expects template name and version, not id
+                                    install_start = datetime.now(timezone.utc)
+                                    result = install_fabric(host, host_tokens[host], template_name, version)
+                                    install_end = datetime.now(timezone.utc)
+                                    install_duration = (install_end - install_start).total_seconds()
+                                    
+                                    if isinstance(result, tuple):
+                                        success, task_errors = result
+                                    else:
+                                        success = result
+                                        task_errors = []
+                                    
+                                    # Track installation details (thread-safe)
+                                    with installation_lock:
+                                        installation_details.append({
+                                            "host": host,
+                                            "template_name": template_name,
+                                            "repo_name": repo_name,
+                                            "version": version,
+                                            "success": success,
+                                            "duration_seconds": install_duration,
+                                            "installed_at": install_start.isoformat(),
+                                            "errors": task_errors if task_errors else None
+                                        })
+                                    
+                                    if success:
+                                        # Log audit with duration
+                                        try:
+                                            log_audit("fabric_installed", details=f"host={host} template={template_name} version={version} event={event_name} duration_s={install_duration:.1f}", ip_address=None)
+                                        except Exception:
+                                            pass
+                                        logger.info(f"Event '{event_name}': Installation successful on host {host}: {template_name} v{version}")
+                                    else:
+                                        # Mark host as failed - stop processing for this host
+                                        with installation_lock:
+                                            failed_hosts.add(host)
+                                        
+                                        # Build detailed error message per host
+                                        if task_errors:
+                                            error_details = "; ".join(task_errors)
+                                            msg = f"Host {host}: Installation FAILED - {error_details}"
+                                        else:
+                                            msg = f"Host {host}: Installation FAILED - installation timed out or encountered an error"
+                                        
+                                        logger.error(f"Event '{event_name}': {msg}")
+                                        with installation_lock:
+                                            errors.append(msg)
                                 else:
-                                    success = result
-                                    task_errors = []
-                                
-                                # Track installation details (thread-safe)
-                                with installation_lock:
-                                    installation_details.append({
-                                        "host": host,
-                                        "template_name": template_name,
-                                        "repo_name": repo_name,
-                                        "version": version,
-                                        "success": success,
-                                        "duration_seconds": install_duration,
-                                        "installed_at": install_start.isoformat(),
-                                        "errors": task_errors if task_errors else None
-                                    })
-                                
-                                if success:
-                                    # Log audit with duration
-                                    try:
-                                        log_audit("fabric_installed", details=f"host={host} template={template_name} version={version} event={event_name} duration_s={install_duration:.1f}", ip_address=None)
-                                    except Exception:
-                                        pass
-                                    logger.info(f"Event '{event_name}': Installation successful on host {host}: {template_name} v{version}")
-                                else:
-                                    # Mark host as failed - stop processing for this host
+                                    # Mark host as failed - template not found
                                     with installation_lock:
                                         failed_hosts.add(host)
                                     
-                                    # Build detailed error message per host
-                                    if task_errors:
-                                        error_details = "; ".join(task_errors)
-                                        msg = f"Host {host}: Installation FAILED - {error_details}"
-                                    else:
-                                        msg = f"Host {host}: Installation FAILED - installation timed out or encountered an error"
-                                    
+                                    msg = f"Host {host}: Installation FAILED - Template '{template_name}' v{version} not found"
                                     logger.error(f"Event '{event_name}': {msg}")
                                     with installation_lock:
                                         errors.append(msg)
-                            else:
-                                # Mark host as failed - template not found
+                            except Exception as e:
+                                # Mark host as failed on exception
                                 with installation_lock:
                                     failed_hosts.add(host)
                                 
-                                msg = f"Host {host}: Installation FAILED - Template '{template_name}' v{version} not found"
+                                msg = f"Host {host}: Installation FAILED - Error: {e}"
                                 logger.error(f"Event '{event_name}': {msg}")
                                 with installation_lock:
                                     errors.append(msg)
-                        except Exception as e:
-                            # Mark host as failed on exception
-                            with installation_lock:
-                                failed_hosts.add(host)
-                            
-                            msg = f"Host {host}: Installation FAILED - Error: {e}"
-                            logger.error(f"Event '{event_name}': {msg}")
-                            with installation_lock:
-                                errors.append(msg)
-                    
-                    # Start installation threads for all available hosts
-                    install_threads = []
-                    for host in available_hosts:
-                        thread = threading.Thread(target=install_on_host, args=(host,))
-                        thread.daemon = False
-                        thread.start()
-                        install_threads.append(thread)
-                    
-                    # Wait for all installation threads to complete
-                    for thread in install_threads:
-                        thread.join()
-                    
-                    # Generate per-host installation summary
-                    successful_hosts = []
-                    failed_hosts_for_install = []
-                    for detail in installation_details:
-                        if detail["success"]:
-                            successful_hosts.append(detail["host"])
-                        else:
-                            failed_hosts_for_install.append(detail["host"])
-                            # failed_hosts already updated in install_on_host
-                    
-                    # Log summary per host
-                    if successful_hosts:
-                        success_msg = f"Event '{event_name}': Installation completed successfully on {len(successful_hosts)} host(s): {', '.join(successful_hosts)}"
-                        logger.info(success_msg)
-                        # Don't add success messages to errors list - they're informational only
-                        # Success details are already tracked in installation_details
-                    
-                    if failed_hosts_for_install:
-                        logger.warning(f"Event '{event_name}': Installation failed on {len(failed_hosts_for_install)} host(s): {', '.join(failed_hosts_for_install)}")
-                        # Per-host failure messages already added in install_on_host function
-            else:
-                msg = f"Repository name not found for template '{template_name}' v{version}"
-                logger.warning(f"Event '{event_name}': {msg}")
-                errors.append(msg)
-        else:
-            pass
+                        
+                        # Start installation threads for all available hosts
+                        install_threads = []
+                        for host in available_hosts:
+                            thread = threading.Thread(target=install_on_host, args=(host,))
+                            thread.daemon = False
+                            thread.start()
+                            install_threads.append(thread)
+                        
+                        # Wait for all installation threads to complete
+                        for thread in install_threads:
+                            thread.join()
+                        
+                        # Generate per-host installation summary
+                        successful_hosts = []
+                        failed_hosts_for_install = []
+                        for detail in installation_details:
+                            if detail["success"]:
+                                successful_hosts.append(detail["host"])
+                            else:
+                                failed_hosts_for_install.append(detail["host"])
+                                # failed_hosts already updated in install_on_host
+                        
+                        # Log summary per host
+                        if successful_hosts:
+                            success_msg = f"Event '{event_name}': Installation completed successfully on {len(successful_hosts)} host(s): {', '.join(successful_hosts)}"
+                            logger.info(success_msg)
+                            # Don't add success messages to errors list - they're informational only
+                            # Success details are already tracked in installation_details
+                        
+                        if failed_hosts_for_install:
+                            logger.warning(f"Event '{event_name}': Installation failed on {len(failed_hosts_for_install)} host(s): {', '.join(failed_hosts_for_install)}")
+                            # Per-host failure messages already added in install_on_host function
+                else:
+                    msg = f"Repository name not found for template '{template_name}' v{version}"
+                    logger.warning(f"Event '{event_name}': {msg}")
+                    errors.append(msg)
         
         completed_at = datetime.now(timezone.utc)
         
