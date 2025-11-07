@@ -3,11 +3,19 @@ import pytest
 import sys
 from pathlib import Path
 
-# Add src directory to path
-sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
+# Ensure project root is on the path so we can import from the src package
+PROJECT_ROOT = Path(__file__).parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 from fastapi.testclient import TestClient
-from app import app, validate_fabric_host, validate_template_name, validate_version, validate_name
+from src.app import (
+    app,
+    validate_fabric_host,
+    validate_template_name,
+    validate_version,
+    validate_name,
+)
 from fastapi import HTTPException
 
 client = TestClient(app)
@@ -39,7 +47,10 @@ def test_validate_fabric_host_invalid():
 def test_validate_template_name_valid():
     """Test template name validation with valid inputs"""
     assert validate_template_name("FortiGate") == "FortiGate"
-    assert validate_template_name("FortiAppSec Cloud WAF") == "FortiAppSec Cloud WAF"  # Spaces allowed
+    assert (
+        validate_template_name("FortiAppSec Cloud WAF")
+        == "FortiAppSec Cloud WAF"
+    )  # Spaces allowed
     assert validate_template_name("Template-v1.0") == "Template-v1.0"
 
 def test_validate_template_name_invalid():

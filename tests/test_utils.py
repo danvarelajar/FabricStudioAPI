@@ -1,6 +1,15 @@
 """Unit tests for utility functions"""
+import sys
+from pathlib import Path
+
 import pytest
-from utils import sanitize_for_logging
+
+# Ensure project root is available on sys.path
+PROJECT_ROOT = Path(__file__).parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from src.utils import sanitize_for_logging
 
 def test_sanitize_for_logging_password():
     """Test password sanitization"""

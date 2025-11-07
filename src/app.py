@@ -368,9 +368,34 @@ def validate_fabric_host(host: str) -> str:
     """Validate and sanitize fabric host input"""
     if not host or len(host) > 255:
         raise HTTPException(400, "Invalid host format or length")
+
     host = host.strip().lower()
-    if not (HOSTNAME_PATTERN.match(host) or IP_PATTERN.match(host)):
+
+    # Validate IPv4 addresses separately
+    if IP_PATTERN.match(host):
+        octets = host.split(".")
+        if len(octets) != 4:
+            raise HTTPException(400, "Invalid host format")
+        try:
+            if any(int(octet) > 255 for octet in octets):
+                raise HTTPException(400, "Invalid host format")
+        except ValueError:
+            raise HTTPException(400, "Invalid host format")
+        return host
+
+    if not HOSTNAME_PATTERN.match(host):
         raise HTTPException(400, "Invalid host format")
+
+    if ".." in host:
+        raise HTTPException(400, "Invalid host format")
+
+    labels = host.split(".")
+    for label in labels:
+        if not label or len(label) > 63:
+            raise HTTPException(400, "Invalid host format")
+        if label.startswith("-") or label.endswith("-"):
+            raise HTTPException(400, "Invalid host format")
+
     return host
 
 def validate_template_name(name: str) -> str:
