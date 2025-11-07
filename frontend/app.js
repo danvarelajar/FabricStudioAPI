@@ -8,6 +8,45 @@ let decryptedClientId = '';
 let decryptedClientSecret = '';
 let currentNhiId = null; // Track which NHI credential is currently loaded
 let sessionExpiresAt = null; // Track session expiration time
+let sessionStatusCache = null; // Cache for session status check
+let sessionStatusCacheTime = 0; // Timestamp of last session status check
+const SESSION_STATUS_CACHE_DURATION = 2000; // Cache session status for 2 seconds
+
+// Global error handler for unhandled errors
+window.addEventListener('error', (event) => {
+  console.error('Global error:', event.error);
+  // Log to backend (fail silently if backend unavailable)
+  fetch('/api/v1/log-error', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      message: event.error?.message || 'Unknown error',
+      stack: event.error?.stack || '',
+      url: window.location.href,
+      userAgent: navigator.userAgent
+    })
+  }).catch(() => {}); // Fail silently
+});
+
+// Global handler for unhandled promise rejections
+window.addEventListener('unhandledrejection', (event) => {
+  console.error('Unhandled promise rejection:', event.reason);
+  // Log to backend (fail silently if backend unavailable)
+  fetch('/api/v1/log-error', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      message: event.reason?.message || String(event.reason) || 'Unhandled promise rejection',
+      stack: event.reason?.stack || '',
+      url: window.location.href,
+      userAgent: navigator.userAgent
+    })
+  }).catch(() => {}); // Fail silently
+});
 
 const el = (id) => document.getElementById(id);
 // Password modal prompt used for NHI password (hidden while typing)
@@ -706,7 +745,15 @@ function initGuestPasswordValidation() {
 }
 
 // Session status check - tokens are stored server-side
+// Uses short-term caching to avoid redundant API calls during configuration loading
 async function checkSessionStatus() {
+  // Return cached result if still valid (within cache duration)
+  // Note: null is a valid cached value (means no session), so we check cacheTime instead
+  const now = Date.now();
+  if (sessionStatusCacheTime > 0 && (now - sessionStatusCacheTime) < SESSION_STATUS_CACHE_DURATION) {
+    return sessionStatusCache;
+  }
+  
   try {
     const res = await api('/auth/session/status', {
       credentials: 'include' // Include cookies
@@ -714,14 +761,26 @@ async function checkSessionStatus() {
     if (res.ok) {
       const data = await res.json();
       sessionExpiresAt = data.expires_at ? new Date(data.expires_at) : null;
+      // Cache successful result
+      sessionStatusCache = data;
+      sessionStatusCacheTime = now;
       return data;
     } else if (res.status === 401) {
       // Session expired
       sessionExpiresAt = null;
+      // Cache null result to avoid repeated 401s
+      sessionStatusCache = null;
+      sessionStatusCacheTime = now;
       return null;
     }
+    // Cache null result for other errors too
+    sessionStatusCache = null;
+    sessionStatusCacheTime = now;
     return null;
   } catch (error) {
+    // Cache null result on exception
+    sessionStatusCache = null;
+    sessionStatusCacheTime = now;
     return null;
   }
 }
@@ -732,6 +791,9 @@ function handleSessionExpired() {
   // Session-based: client_secret is no longer used
   currentNhiId = null;
   sessionExpiresAt = null;
+  // Clear session status cache to force fresh check
+  sessionStatusCache = null;
+  sessionStatusCacheTime = 0;
   // Show message to user
   showStatus('Session expired. Please reload NHI credential.');
   // Update UI
@@ -747,9 +809,8 @@ async function renderFabricHostList() {
   const items = parseFabricHosts();
   confirmedHosts = items; // Store confirmed hosts
   
-  // Always check session status to ensure it's current
-  const session = await checkSessionStatus();
-  // sessionExpiresAt is updated by checkSessionStatus()
+  // Use existing sessionExpiresAt instead of making API call
+  // The session status will be checked when actually needed (e.g., before API calls)
   
   items.forEach(({host, port}, i) => {
     const li = document.createElement('li');
@@ -1261,6 +1322,18 @@ async function api(path, options = {}) {
   const params = options.params || {};
   const headers = new Headers(options.headers || {});
   
+  // Add CSRF token if available (for state-changing operations)
+  const method = (options.method || 'GET').toUpperCase();
+  if (['POST', 'PUT', 'DELETE', 'PATCH'].includes(method)) {
+    const csrfToken = sessionStorage.getItem('csrf_token');
+    if (csrfToken) {
+      headers.set('X-CSRF-Token', csrfToken);
+    }
+  }
+  
+  // Get timeout from options or use default (30 seconds)
+  const timeout = options.timeout || 30000; // Default 30 seconds
+  
   // Always include credentials for cookie-based sessions
   const fetchOptions = {
     ...options,
@@ -1286,7 +1359,33 @@ async function api(path, options = {}) {
       url.searchParams.set('_ts', Date.now());
     }
     headers.set('Cache-Control', 'no-cache');
-    return fetch(url.toString(), { ...fetchOptions, cache: 'no-store' });
+    
+    // Add timeout to fetch request
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), timeout);
+    
+    try {
+      const response = await fetch(url.toString(), { 
+        ...fetchOptions, 
+        cache: 'no-store',
+        signal: controller.signal
+      });
+      clearTimeout(timeoutId);
+      
+      // Extract CSRF token from response headers if present (for all responses)
+      const newCsrfToken = response.headers.get('X-CSRF-Token');
+      if (newCsrfToken) {
+        sessionStorage.setItem('csrf_token', newCsrfToken);
+      }
+      
+      return response;
+    } catch (error) {
+      clearTimeout(timeoutId);
+      if (error.name === 'AbortError') {
+        throw new Error(`Request timeout after ${timeout}ms`);
+      }
+      throw error;
+    }
   }
   
   try {
@@ -1301,11 +1400,37 @@ async function api(path, options = {}) {
       });
     }
     // Add cache-busting and disable browser cache
-    if ((options.method || 'GET').toUpperCase() === 'GET') {
+    if (method === 'GET') {
       url.searchParams.set('_ts', Date.now());
     }
     headers.set('Cache-Control', 'no-cache');
-    return fetch(url.toString(), { ...fetchOptions, cache: 'no-store' });
+    
+    // Add timeout to fetch request
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), timeout);
+    
+    try {
+      const response = await fetch(url.toString(), { 
+        ...fetchOptions, 
+        cache: 'no-store',
+        signal: controller.signal
+      });
+      clearTimeout(timeoutId);
+      
+      // Extract CSRF token from response headers if present
+      const newCsrfToken = response.headers.get('X-CSRF-Token');
+      if (newCsrfToken) {
+        sessionStorage.setItem('csrf_token', newCsrfToken);
+      }
+      
+      return response;
+    } catch (error) {
+      clearTimeout(timeoutId);
+      if (error.name === 'AbortError') {
+        throw new Error(`Request timeout after ${timeout}ms`);
+      }
+      throw error;
+    }
   } catch (error) {
     // If base URL is invalid, try using current origin as fallback
     const baseUrl = window.location.origin;
@@ -1318,11 +1443,38 @@ async function api(path, options = {}) {
         }
       });
     }
-    if ((options.method || 'GET').toUpperCase() === 'GET') {
+    if (method === 'GET') {
       url.searchParams.set('_ts', Date.now());
     }
     headers.set('Cache-Control', 'no-cache');
-    return fetch(url.toString(), { ...options, headers, cache: 'no-store' });
+    
+    // Add timeout to fetch request
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), timeout);
+    
+    try {
+      const response = await fetch(url.toString(), { 
+        ...options, 
+        headers, 
+        cache: 'no-store',
+        signal: controller.signal
+      });
+      clearTimeout(timeoutId);
+      
+      // Extract CSRF token from response headers if present
+      const newCsrfToken = response.headers.get('X-CSRF-Token');
+      if (newCsrfToken) {
+        sessionStorage.setItem('csrf_token', newCsrfToken);
+      }
+      
+      return response;
+    } catch (fetchError) {
+      clearTimeout(timeoutId);
+      if (fetchError.name === 'AbortError') {
+        throw new Error(`Request timeout after ${timeout}ms`);
+      }
+      throw fetchError;
+    }
   }
 }
 
@@ -1507,7 +1659,7 @@ async function acquireTokens() {
     return true;
 }
 
-// Cache all templates from all repositories for all confirmed hosts
+// Cache all templates from all repositories for the first confirmed host only
 // Templates are stored independently (deduplicated across hosts)
 async function cacheAllTemplates() {
   if (confirmedHosts.length === 0) {
@@ -1522,72 +1674,72 @@ async function cacheAllTemplates() {
   try {
     showStatus('Fetching repositories and templates...', { hideAfterMs: false });
     
-    // For each confirmed host, get all repositories and their templates
-    for (const {host} of confirmedHosts) {
-      // Check session status first
-      const session = await checkSessionStatus();
-      if (!session) {
+    // Only use the first host for template caching
+    const firstHost = confirmedHosts[0];
+    const {host} = firstHost;
+    // Check session status first
+    const session = await checkSessionStatus();
+    if (!session) {
+      errorCount++;
+      return;
+    }
+    
+    try {
+      // Get all repositories for the first host - cookies sent automatically
+      const reposRes = await api('/repo/remotes', { params: { fabric_host: host } });
+      if (!reposRes.ok) {
+        if (reposRes.status === 401) {
+          handleSessionExpired();
+        }
         errorCount++;
-        continue;
+        return;
       }
       
-      try {
-        // Get all repositories for this host - cookies sent automatically
-        const reposRes = await api('/repo/remotes', { params: { fabric_host: host } });
-        if (!reposRes.ok) {
-          if (reposRes.status === 401) {
-            handleSessionExpired();
-          }
-          errorCount++;
+      const reposData = await reposRes.json();
+      const repositories = reposData.repositories || [];
+      
+      // For each repository, get all templates
+      for (const repo of repositories) {
+        const repoId = repo.id;
+        const repoName = repo.name;
+        
+        if (!repoId || !repoName) {
           continue;
         }
         
-        const reposData = await reposRes.json();
-        const repositories = reposData.repositories || [];
-        
-        // For each repository, get all templates
-        for (const repo of repositories) {
-          const repoId = repo.id;
-          const repoName = repo.name;
+        try {
+          const templatesData = await apiJson('/repo/templates/list', { 
+            params: { fabric_host: host, repo_name: repoName }
+          });
+          const templates = templatesData.templates || [];
           
-          if (!repoId || !repoName) {
-            continue;
-          }
-          
-          try {
-            const templatesData = await apiJson('/repo/templates/list', { 
-              params: { fabric_host: host, repo_name: repoName }
-            });
-            const templates = templatesData.templates || [];
+          // Add templates to collection, deduplicating by repo_name + template_name + version
+          for (const tpl of templates) {
+            const templateName = tpl.name;
+            const version = tpl.version || null;
+            const uniqueKey = `${repoName}|${templateName}|${version}`;
             
-            // Add templates to collection, deduplicating by repo_name + template_name + version
-            for (const tpl of templates) {
-              const templateName = tpl.name;
-              const version = tpl.version || null;
-              const uniqueKey = `${repoName}|${templateName}|${version}`;
-              
-              // Only add if we haven't seen this template before
-              if (!uniqueTemplates.has(uniqueKey)) {
-                const templateEntry = {
-                  repo_id: repoId,
-                  repo_name: repoName,
-                  template_id: tpl.id,
-                  template_name: templateName,
-                  version: version
-                };
-                uniqueTemplates.set(uniqueKey, templateEntry);
-                allTemplates.push(templateEntry);
-              }
+            // Only add if we haven't seen this template before
+            if (!uniqueTemplates.has(uniqueKey)) {
+              const templateEntry = {
+                repo_id: repoId,
+                repo_name: repoName,
+                template_id: tpl.id,
+                template_name: templateName,
+                version: version
+              };
+              uniqueTemplates.set(uniqueKey, templateEntry);
+              allTemplates.push(templateEntry);
             }
-            
-            successCount++;
-          } catch (error) {
-            errorCount++;
           }
+          
+          successCount++;
+        } catch (error) {
+          errorCount++;
         }
-      } catch (error) {
-        errorCount++;
       }
+    } catch (error) {
+      errorCount++;
     }
     
     // Send all unique templates to the cache endpoint (will purge and replace all existing)
@@ -1602,7 +1754,7 @@ async function cacheAllTemplates() {
         if (cacheRes.ok) {
           const cacheData = await cacheRes.json();
           showStatus(`Cached ${cacheData.count} unique templates successfully`, { hideAfterMs: 3000 });
-          logMsg(`Cached ${cacheData.count} unique templates from ${confirmedHosts.length} host(s)`);
+          logMsg(`Cached ${cacheData.count} unique templates from ${host}`);
         } else {
           const errorText = await cacheRes.text().catch(() => 'Unknown error');
           showStatus(`Failed to cache templates: ${errorText}`, { hideAfterMs: 5000 });
@@ -2299,10 +2451,10 @@ async function loadSection(sectionName) {
     return;
   }
   
-  const url = `/frontend/${sectionName}.html`;
+  const url = `/${sectionName}.html`;
   
   try {
-    // Fetch HTML from /frontend/ path to match backend static file serving
+    // Fetch HTML from root path
     const response = await fetch(url);
     
     if (!response.ok) {
@@ -3057,20 +3209,38 @@ async function loadEventConfigs() {
   }
 }
 
-// Helper functions for UTC/local timezone conversion
+// Helper functions for UTC/local timezone conversion using dayjs
+// Falls back to native Date if dayjs is not available
 function localToUTC(dateStr, timeStr) {
   // Convert local date/time to UTC
   // dateStr: YYYY-MM-DD, timeStr: HH:MM
   if (!dateStr) return { date: null, time: null };
   
-  // Create a Date object from local date/time (JavaScript interprets as local time)
-  const localDateTime = new Date(dateStr + (timeStr ? 'T' + timeStr + ':00' : 'T00:00:00'));
-  
-  // Get UTC equivalent
-  const utcDate = localDateTime.toISOString().split('T')[0]; // YYYY-MM-DD
-  const utcTime = localDateTime.toISOString().split('T')[1].substring(0, 5); // HH:MM
-  
-  return { date: utcDate, time: timeStr ? utcTime : null };
+  try {
+    // Use dayjs if available, otherwise fall back to native Date
+    if (typeof dayjs !== 'undefined' && dayjs.utc) {
+      const timePart = (timeStr && timeStr.trim()) ? timeStr.trim() + ':00' : '00:00';
+      const localDateTime = dayjs(`${dateStr}T${timePart}`);
+      
+      if (!localDateTime.isValid()) {
+        return { date: dateStr, time: timeStr || null };
+      }
+      
+      const utcDateTime = localDateTime.utc();
+      const utcDate = utcDateTime.format('YYYY-MM-DD');
+      const utcTime = timeStr ? utcDateTime.format('HH:mm') : null;
+      
+      return { date: utcDate, time: utcTime };
+    } else {
+      // Fallback to native Date
+      const localDateTime = new Date(dateStr + (timeStr ? 'T' + timeStr + ':00' : 'T00:00:00'));
+      const utcDate = localDateTime.toISOString().split('T')[0];
+      const utcTime = localDateTime.toISOString().split('T')[1].substring(0, 5);
+      return { date: utcDate, time: timeStr ? utcTime : null };
+    }
+  } catch (e) {
+    return { date: dateStr, time: timeStr || null };
+  }
 }
 
 function utcToLocal(dateStr, timeStr) {
@@ -3079,33 +3249,41 @@ function utcToLocal(dateStr, timeStr) {
   if (!dateStr) return { date: null, time: null };
   
   try {
-    // Create UTC datetime string with Z suffix
-    // If timeStr is provided, use it; otherwise use midnight UTC
-    const timePart = (timeStr && timeStr.trim()) ? timeStr.trim() + ':00:00' : '00:00:00';
-    const utcDateTimeStr = dateStr + 'T' + timePart + 'Z';
-    
-    // Create Date object from UTC string - JavaScript will automatically convert to local timezone
-    const utcDateTime = new Date(utcDateTimeStr);
-    
-    // Check if date is valid
-    if (isNaN(utcDateTime.getTime())) {
-      return { date: dateStr, time: timeStr || null };
+    // Use dayjs if available, otherwise fall back to native Date
+    if (typeof dayjs !== 'undefined' && dayjs.utc) {
+      const timePart = (timeStr && timeStr.trim()) ? timeStr.trim() + ':00' : '00:00';
+      const utcDateTime = dayjs.utc(`${dateStr}T${timePart}`);
+      
+      if (!utcDateTime.isValid()) {
+        return { date: dateStr, time: timeStr || null };
+      }
+      
+      const localDateTime = utcDateTime.local();
+      const localDate = localDateTime.format('YYYY-MM-DD');
+      const localTime = (timeStr && timeStr.trim()) ? localDateTime.format('HH:mm') : null;
+      
+      return { date: localDate, time: localTime };
+    } else {
+      // Fallback to native Date
+      const timePart = (timeStr && timeStr.trim()) ? timeStr.trim() + ':00:00' : '00:00:00';
+      const utcDateTime = new Date(dateStr + 'T' + timePart + 'Z');
+      
+      if (isNaN(utcDateTime.getTime())) {
+        return { date: dateStr, time: timeStr || null };
+      }
+      
+      const year = utcDateTime.getFullYear();
+      const month = String(utcDateTime.getMonth() + 1).padStart(2, '0');
+      const day = String(utcDateTime.getDate()).padStart(2, '0');
+      const hours = String(utcDateTime.getHours()).padStart(2, '0');
+      const minutes = String(utcDateTime.getMinutes()).padStart(2, '0');
+      
+      return { 
+        date: `${year}-${month}-${day}`, 
+        time: (timeStr && timeStr.trim()) ? `${hours}:${minutes}` : null 
+      };
     }
-    
-    // Use getFullYear, getMonth, getDate, getHours, getMinutes - these return LOCAL time values
-    // when the Date object is created from a UTC string
-    const year = utcDateTime.getFullYear();
-    const month = String(utcDateTime.getMonth() + 1).padStart(2, '0');
-    const day = String(utcDateTime.getDate()).padStart(2, '0');
-    const hours = String(utcDateTime.getHours()).padStart(2, '0');
-    const minutes = String(utcDateTime.getMinutes()).padStart(2, '0');
-    
-    return { 
-      date: `${year}-${month}-${day}`, 
-      time: (timeStr && timeStr.trim()) ? `${hours}:${minutes}` : null 
-    };
   } catch (e) {
-    // Return original values if conversion fails
     return { date: dateStr, time: timeStr || null };
   }
 }
@@ -3159,44 +3337,59 @@ async function loadEvents() {
     `;
     html += '<div style="display: flex; flex-direction: column; gap: 12px;">';
     enrichedEvents.forEach(event => {
-      // Convert UTC date/time from backend to local time for display
+      // Convert UTC date/time from backend to local time for display using dayjs
       let dateTimeDisplay;
       try {
         if (event.event_date) {
           // Backend stores date/time in UTC, convert to local for display
-          // Create UTC datetime string
-          const utcTimePart = (event.event_time && event.event_time.trim()) ? event.event_time.trim() + ':00' : '00:00:00';
-          const utcDateTimeStr = event.event_date + 'T' + utcTimePart + 'Z';
-          
-          // Create Date object from UTC string - JavaScript handles timezone conversion
-          const utcDateObj = new Date(utcDateTimeStr);
-          
-          if (!isNaN(utcDateObj.getTime())) {
-            // Format date as dd/mm/yyyy to match input field format
-            const day = String(utcDateObj.getDate()).padStart(2, '0');
-            const month = String(utcDateObj.getMonth() + 1).padStart(2, '0');
-            const year = utcDateObj.getFullYear();
-            const localDate = `${day}/${month}/${year}`;
+          if (typeof dayjs !== 'undefined' && dayjs.utc) {
+            const timePart = (event.event_time && event.event_time.trim()) ? event.event_time.trim() + ':00' : '00:00';
+            const utcDateTime = dayjs.utc(`${event.event_date}T${timePart}`);
             
-            if (event.event_time && event.event_time.trim()) {
-              // Format time in 12-hour format
-              const hours = utcDateObj.getHours(); // Returns local hours
-              const minutes = utcDateObj.getMinutes(); // Returns local minutes
-              const ampm = hours >= 12 ? 'PM' : 'AM';
-              const displayHours = hours % 12 || 12;
-              dateTimeDisplay = `${localDate} at ${displayHours}:${String(minutes).padStart(2, '0')} ${ampm}`;
+            if (utcDateTime.isValid()) {
+              const localDateTime = utcDateTime.local();
+              const localDate = localDateTime.format('DD/MM/YYYY');
+              
+              if (event.event_time && event.event_time.trim()) {
+                const displayHours = localDateTime.format('h');
+                const displayMinutes = localDateTime.format('mm');
+                const ampm = localDateTime.format('A');
+                dateTimeDisplay = `${localDate} at ${displayHours}:${displayMinutes} ${ampm}`;
+              } else {
+                dateTimeDisplay = localDate;
+              }
             } else {
-              dateTimeDisplay = localDate;
+              dateTimeDisplay = event.event_date + (event.event_time ? ` ${event.event_time} UTC` : '');
             }
           } else {
-            // Fallback: show UTC time if conversion fails
-            dateTimeDisplay = event.event_date + (event.event_time ? ` ${event.event_time} UTC` : '');
+            // Fallback to native Date
+            const utcTimePart = (event.event_time && event.event_time.trim()) ? event.event_time.trim() + ':00' : '00:00:00';
+            const utcDateTimeStr = event.event_date + 'T' + utcTimePart + 'Z';
+            const utcDateObj = new Date(utcDateTimeStr);
+            
+            if (!isNaN(utcDateObj.getTime())) {
+              const day = String(utcDateObj.getDate()).padStart(2, '0');
+              const month = String(utcDateObj.getMonth() + 1).padStart(2, '0');
+              const year = utcDateObj.getFullYear();
+              const localDate = `${day}/${month}/${year}`;
+              
+              if (event.event_time && event.event_time.trim()) {
+                const hours = utcDateObj.getHours();
+                const minutes = utcDateObj.getMinutes();
+                const ampm = hours >= 12 ? 'PM' : 'AM';
+                const displayHours = hours % 12 || 12;
+                dateTimeDisplay = `${localDate} at ${displayHours}:${String(minutes).padStart(2, '0')} ${ampm}`;
+              } else {
+                dateTimeDisplay = localDate;
+              }
+            } else {
+              dateTimeDisplay = event.event_date + (event.event_time ? ` ${event.event_time} UTC` : '');
+            }
           }
         } else {
           dateTimeDisplay = 'No date set';
         }
       } catch (e) {
-        // Fallback to raw values if conversion fails
         dateTimeDisplay = event.event_date + (event.event_time ? ` ${event.event_time} UTC` : '');
       }
       
@@ -3648,7 +3841,7 @@ function showLoadingScreen(message = 'Loading configuration...') {
     overlay.className = 'loading-overlay';
     overlay.innerHTML = `
       <div class="loading-logo-container">
-        <img src="/frontend/images/Fortinet-logomark-rgb-red.svg" alt="Fortinet" class="loading-logo" id="loadingLogo">
+        <img src="/images/Fortinet-logomark-rgb-red.svg" alt="Fortinet" class="loading-logo" id="loadingLogo">
         <div class="loading-text" id="loadingText">${message}</div>
         <div class="loading-spinner"></div>
       </div>
@@ -5419,11 +5612,12 @@ async function handleRunButton() {
           }
         });
 
-        const results = await Promise.all(hostPromises);
-        const successCount = results.filter(r => r.success).length;
+        const results = await Promise.allSettled(hostPromises);
+        const settledResults = results.map(r => r.status === 'fulfilled' ? r.value : {host: 'unknown', success: false, error: r.reason?.message || 'Promise rejected'});
+        const successCount = settledResults.filter(r => r.success).length;
         
         // Collect error details for failed hosts (excluding skipped ones)
-        const failedHostsForTemplate = results.filter(r => !r.success && !r.skipped);
+        const failedHostsForTemplate = settledResults.filter(r => !r.success && !r.skipped);
         
         // Track failed hosts to skip installation later
         failedHostsForTemplate.forEach(f => failedHosts.add(f.host));
@@ -5699,6 +5893,7 @@ async function handleRunButton() {
             template_name,
             version,
           }),
+          timeout: 15 * 60 * 1000, // 15 minutes timeout for installation
         });
         
         if (!res.ok) {
@@ -5809,8 +6004,9 @@ async function handleRunButton() {
       }
     });
 
-    const results = await Promise.all(installPromises);
-    const successCount = results.filter(r => r.success).length;
+    const results = await Promise.allSettled(installPromises);
+    const settledResults = results.map(r => r.status === 'fulfilled' ? r.value : {host: 'unknown', success: false, error: r.reason?.message || 'Promise rejected'});
+    const successCount = settledResults.filter(r => r.success).length;
     
     // Status is already updated per host in the promise handlers above
     renderTemplates();
@@ -5920,6 +6116,19 @@ async function restoreConfiguration(config) {
       return;
     }
     
+    // IMPORTANT: Disable Run button immediately when loading configuration
+    // It will only be enabled after explicit "Load Credentials" and "Confirm Hosts" clicks
+    const runBtn = el('btnInstallSelected');
+    if (runBtn) {
+      runBtn.disabled = true;
+    }
+    
+    // Reset state to ensure fresh start
+    currentNhiId = null;
+    decryptedClientId = '';
+    confirmedHosts = [];
+    validatedHosts = [];
+    
     // Restore apiBase FIRST before any API calls are made
     const apiBaseInput = el('apiBase');
     if (apiBaseInput && config.apiBase !== undefined && config.apiBase) {
@@ -5960,14 +6169,17 @@ async function restoreConfiguration(config) {
               // Session-based: client_secret is no longer returned, tokens are managed server-side
               currentNhiId = parseInt(config.nhiCredentialId);
               // Session-based: tokens are managed server-side
-              // Check session status to get expiration time
-              const session = await checkSessionStatus();
-              if (session && session.expires_at) {
-                sessionExpiresAt = new Date(session.expires_at);
-              }
+              // Session was created server-side by /nhi/get endpoint
+              // We'll check session status later when actually needed (e.g., before API calls)
+              // This avoids unnecessary 401 errors during configuration restore
+              // The session expiration will be checked when the user performs actions that require it
               // Enable confirm button now that credentials are loaded
               const confirmBtn = el('btnConfirmHosts');
               if (confirmBtn) confirmBtn.disabled = false;
+              
+              // IMPORTANT: Keep Run button disabled - user must still click "Confirm Hosts"
+              const runBtnAfterLoad = el('btnInstallSelected');
+              if (runBtnAfterLoad) runBtnAfterLoad.disabled = true;
               
               // Automatically confirm hosts if they are available from NHI credential
               // This makes the configuration ready to run without manual confirmation
@@ -6030,8 +6242,13 @@ async function restoreConfiguration(config) {
                     showStatus('Configuration loaded and ready. Caching templates...', { hideAfterMs: 1000 });
                     // Cache templates
                     await cacheAllTemplates();
+                    // Now update Run button state - both credentials loaded AND hosts confirmed
+                    updateCreateEnabled();
                   } else {
                     showStatus('Configuration loaded but token acquisition failed. Please check credentials.');
+                    // Keep Run button disabled if token acquisition failed
+                    const runBtnTokenFail = el('btnInstallSelected');
+                    if (runBtnTokenFail) runBtnTokenFail.disabled = true;
                   }
                 } else {
                   // NHI credential loaded but hosts not validated yet, use confirmed hosts from config if available
@@ -6052,8 +6269,13 @@ async function restoreConfiguration(config) {
                       fabricHostInput.value = hostString;
                     }
                     showStatus('NHI credential loaded. Hosts confirmed from configuration.');
+                    // Update Run button state - credentials loaded AND hosts confirmed
+                    updateCreateEnabled();
                   } else {
                     showStatus('NHI credential loaded. Compare hosts from credential with Host List.');
+                    // Keep Run button disabled - hosts not confirmed yet
+                    const runBtnNoHosts = el('btnInstallSelected');
+                    if (runBtnNoHosts) runBtnNoHosts.disabled = true;
                   }
                 }
               } else if (config.confirmedHosts && config.confirmedHosts.length > 0) {
@@ -6074,20 +6296,38 @@ async function restoreConfiguration(config) {
                   fabricHostInput.value = hostString;
                 }
                 showStatus('NHI credential loaded. Hosts confirmed from configuration.');
+                // Update Run button state - credentials loaded AND hosts confirmed
+                updateCreateEnabled();
               } else {
                 showStatus('NHI credential loaded. Compare hosts from credential with Host List.');
+                // Keep Run button disabled - hosts not confirmed yet
+                const runBtnNoHosts2 = el('btnInstallSelected');
+                if (runBtnNoHosts2) runBtnNoHosts2.disabled = true;
               }
             } else {
               const errText = await res.text().catch(() => 'Failed to load NHI credential');
               showStatus(`Failed to load NHI credential: ${errText}`);
+              // Keep Run button disabled on error
+              const runBtnError = el('btnInstallSelected');
+              if (runBtnError) runBtnError.disabled = true;
             }
           } else {
             showStatus('Enter Encryption Password to load NHI credential for this configuration');
+            // Keep Run button disabled - credentials not loaded yet
+            const runBtnNoPwd = el('btnInstallSelected');
+            if (runBtnNoPwd) runBtnNoPwd.disabled = true;
           }
         } catch (e) {
           showStatus('Error loading NHI credential for configuration');
+          // Keep Run button disabled on error
+          const runBtnError2 = el('btnInstallSelected');
+          if (runBtnError2) runBtnError2.disabled = true;
         }
       }
+    } else {
+      // No NHI credential in config - keep Run button disabled
+      const runBtnNoNhi = el('btnInstallSelected');
+      if (runBtnNoNhi) runBtnNoNhi.disabled = true;
     }
     const newHostnameInput = el('newHostname');
     if (newHostnameInput && config.newHostname !== undefined) {
@@ -6197,22 +6437,23 @@ async function restoreConfiguration(config) {
       
       // First, try to populate repositories from cache or API
       const host = getFabricHostPrimary();
-      // Check session status - tokens are managed server-side
-      const session = await checkSessionStatus();
       let availableRepos = [];
       
       if (cachedTemplates.length > 0) {
         // Get unique repos from cache
         availableRepos = Array.from(new Set(cachedTemplates.map(t => t.repo_name).filter(Boolean))).sort();
-      } else if (host && session) {
+      } else if (host) {
         // Try to load from API - cookies sent automatically
+        // No need to pre-check session; API will return 401 if no session, which we handle gracefully
         try {
           const reposRes = await api('/repo/remotes', { params: { fabric_host: host } });
           if (reposRes.ok) {
             const reposData = await reposRes.json();
             availableRepos = (reposData.repositories || []).map(r => r.name).filter(Boolean);
           }
+          // If 401, we just continue without repos (silent failure is fine during config restore)
         } catch (err) {
+          // Silent failure - we'll use cached templates or empty repos
         }
       }
       
@@ -6782,9 +7023,21 @@ function setupEventButtons() {
   }
   
   // Validate that date/time is not in the past (using local time)
-  const eventDateTime = new Date(date + (time ? 'T' + time : 'T00:00:00'));
-  const now = new Date();
-  if (eventDateTime < now) {
+  const timePart = time ? time + ':00' : '00:00';
+  let eventDateTime, now;
+  if (typeof dayjs !== 'undefined') {
+    eventDateTime = dayjs(`${date}T${timePart}`);
+    now = dayjs();
+  } else {
+    eventDateTime = new Date(date + (time ? 'T' + time : 'T00:00:00'));
+    now = new Date();
+  }
+  
+  const isValid = typeof dayjs !== 'undefined' 
+    ? eventDateTime.isValid() && !eventDateTime.isBefore(now)
+    : !isNaN(eventDateTime.getTime()) && eventDateTime >= now;
+  
+  if (!isValid) {
     showStatus('Event date and time cannot be in the past', { error: true });
     updateCreateEventButton(); // Update to show error messages
     return;
@@ -6871,9 +7124,21 @@ function setupEventButtons() {
       }
       
       // Validate that date/time is not in the past (using local time)
-      const eventDateTime = new Date(date + (time ? 'T' + time : 'T00:00:00'));
-      const now = new Date();
-      if (eventDateTime < now) {
+      const timePart = time ? time + ':00' : '00:00';
+      let eventDateTime, now;
+      if (typeof dayjs !== 'undefined') {
+        eventDateTime = dayjs(`${date}T${timePart}`);
+        now = dayjs();
+      } else {
+        eventDateTime = new Date(date + (time ? 'T' + time : 'T00:00:00'));
+        now = new Date();
+      }
+      
+      const isValid = typeof dayjs !== 'undefined' 
+        ? eventDateTime.isValid() && !eventDateTime.isBefore(now)
+        : !isNaN(eventDateTime.getTime()) && eventDateTime >= now;
+      
+      if (!isValid) {
         showStatus('Event date and time cannot be in the past', { error: true });
         updateCreateEventButton(); // Update to show error messages
         return;
@@ -7017,10 +7282,21 @@ function updateCreateEventButton() {
   let timeErrorMessage = '';
   
   if (date) {
-    const eventDateTime = new Date(date + (time ? 'T' + time : 'T00:00:00'));
-    const now = new Date();
+    const timePart = time ? time + ':00' : '00:00';
+    let eventDateTime, now;
+    if (typeof dayjs !== 'undefined') {
+      eventDateTime = dayjs(`${date}T${timePart}`);
+      now = dayjs();
+    } else {
+      eventDateTime = new Date(date + (time ? 'T' + time : 'T00:00:00'));
+      now = new Date();
+    }
     
-    if (eventDateTime < now) {
+    const isValid = typeof dayjs !== 'undefined' 
+      ? eventDateTime.isValid() && !eventDateTime.isBefore(now)
+      : !isNaN(eventDateTime.getTime()) && eventDateTime >= now;
+    
+    if (!isValid) {
       dateTimeValid = false;
       if (time) {
         timeErrorMessage = 'Event date and time cannot be in the past';
@@ -7073,20 +7349,29 @@ function initEventFormValidation() {
   
   // Set min date to today
   if (dateInput) {
-    const today = new Date().toISOString().split('T')[0];
+    const today = typeof dayjs !== 'undefined' 
+      ? dayjs().format('YYYY-MM-DD')
+      : new Date().toISOString().split('T')[0];
     dateInput.setAttribute('min', today);
     
     // Update min date when date changes (to handle time validation)
     dateInput.addEventListener('change', function() {
       const selectedDate = dateInput.value;
-      const today = new Date().toISOString().split('T')[0];
+      const today = typeof dayjs !== 'undefined' 
+        ? dayjs().format('YYYY-MM-DD')
+        : new Date().toISOString().split('T')[0];
       
       if (selectedDate === today && timeInput) {
         // If date is today, set min time to current time
-        const now = new Date();
-        const hours = String(now.getHours()).padStart(2, '0');
-        const minutes = String(now.getMinutes()).padStart(2, '0');
-        timeInput.setAttribute('min', `${hours}:${minutes}`);
+        if (typeof dayjs !== 'undefined') {
+          const currentTime = dayjs().format('HH:mm');
+          timeInput.setAttribute('min', currentTime);
+        } else {
+          const now = new Date();
+          const hours = String(now.getHours()).padStart(2, '0');
+          const minutes = String(now.getMinutes()).padStart(2, '0');
+          timeInput.setAttribute('min', `${hours}:${minutes}`);
+        }
       } else if (timeInput) {
         // If date is in the future, remove min time restriction
         timeInput.removeAttribute('min');
@@ -7103,7 +7388,9 @@ function initEventFormValidation() {
       // Validate when time changes
       if (dateInput && dateInput.value) {
         const selectedDate = dateInput.value;
-        const today = new Date().toISOString().split('T')[0];
+        const today = typeof dayjs !== 'undefined' 
+          ? dayjs().format('YYYY-MM-DD')
+          : new Date().toISOString().split('T')[0];
         const selectedTime = timeInput.value;
         
         if (selectedDate === today && selectedTime) {
@@ -7583,8 +7870,8 @@ async function handleTrackedRunButton() {
                     if (errorsData.errors && errorsData.errors.length > 0) {
                       const errorMessages = errorsData.errors.map(err => `Task '${err.task_name}': ${err.error}`).join('; ');
                       const errorMsg = `Template '${t.template_name}' v${t.version} creation completed on ${host} but with errors: ${errorMessages}`;
+                      // showStatus already calls logMsg internally, so don't duplicate
                       showStatus(errorMsg);
-                      logMsg(errorMsg);
                       t.status = 'err';
                       t.createProgress = 0;
                       renderTemplates();
@@ -7602,8 +7889,8 @@ async function handleTrackedRunButton() {
                   }
                 } catch (error) {}
                 
+                // showStatus already calls logMsg internally, so don't duplicate
                 showStatus(`Template '${t.template_name}' v${t.version} created successfully on ${host}`);
-                logMsg(`Template '${t.template_name}' v${t.version} created successfully on ${host}`);
                 t.status = 'created';
                 t.createProgress = 100;
                 renderTemplates();
@@ -7675,9 +7962,10 @@ async function handleTrackedRunButton() {
           }
         });
 
-        const results = await Promise.all(hostPromises);
-        const successCount = results.filter(r => r.success).length;
-        const failedHostsForTemplate = results.filter(r => !r.success && !r.skipped);
+        const results = await Promise.allSettled(hostPromises);
+        const settledResults = results.map(r => r.status === 'fulfilled' ? r.value : {host: 'unknown', success: false, error: r.reason?.message || 'Promise rejected'});
+        const successCount = settledResults.filter(r => r.success).length;
+        const failedHostsForTemplate = settledResults.filter(r => !r.success && !r.skipped);
         failedHostsForTemplate.forEach(f => failedHosts.add(f.host));
         
         const availableHostsForTemplate = hosts.filter(({host}) => !failedHosts.has(host));
@@ -8038,6 +8326,7 @@ async function handleTrackedRunButton() {
             template_name,
             version,
           }),
+          timeout: 15 * 60 * 1000, // 15 minutes timeout for installation
         });
         
         if (!res.ok) {
@@ -8194,8 +8483,9 @@ async function handleTrackedRunButton() {
       }
     });
 
-    const results = await Promise.all(installPromises);
-    const successCount = results.filter(r => r.success).length;
+    const results = await Promise.allSettled(installPromises);
+    const settledResults = results.map(r => r.status === 'fulfilled' ? r.value : {host: 'unknown', success: false, error: r.reason?.message || 'Promise rejected'});
+    const successCount = settledResults.filter(r => r.success).length;
     
     renderTemplates();
     
@@ -10347,7 +10637,8 @@ async function runSshCommandProfile(profileId) {
             encryption_password: encryption_password,
             nhi_credential_id: nhi_credential_id,
             wait_time_seconds: 0  // No wait time for manual execution
-          })
+          }),
+          timeout: 600000 // 10 minutes timeout for manual SSH execution (no wait time, but commands can take time)
         });
         
         if (!executeRes.ok) {
@@ -10437,6 +10728,38 @@ async function loadSshProfilesForPreparation() {
 async function executeSshProfiles(hosts, sshProfileId, encryptionPassword, waitTimeSeconds = 60) {
   const results = [];
   
+  // Calculate timeout based on SSH operation requirements:
+  // - Connection timeout: 30 seconds
+  // - Command execution: up to 5 minutes (300 seconds) per command
+  // - Wait time between commands: waitTimeSeconds
+  // - Add buffer: 30 seconds
+  // We need to fetch the profile first to know the number of commands
+  let numCommands = 1; // Default to 1 command if we can't determine
+  try {
+    const profileRes = await api(`/ssh-command-profiles/get/${sshProfileId}`);
+    if (profileRes.ok) {
+      const profileData = await profileRes.json();
+      if (profileData.commands) {
+        const commandList = profileData.commands.split('\n').filter(cmd => cmd.trim());
+        numCommands = Math.max(1, commandList.length);
+      }
+    }
+  } catch (error) {
+    // If we can't fetch the profile, use default
+    console.warn('Could not fetch SSH profile to calculate timeout, using default:', error);
+  }
+  
+  // Calculate timeout: connection (30s) + (commands * 300s) + (wait * commands) + buffer (30s)
+  // Note: Wait time is applied after each command, including the last one
+  const connectionTimeout = 30000; // 30 seconds
+  const commandTimeout = 300000; // 5 minutes per command
+  const waitTimeout = (waitTimeSeconds || 0) * 1000 * numCommands; // Wait after each command
+  const buffer = 30000; // 30 seconds buffer
+  const calculatedTimeout = connectionTimeout + (numCommands * commandTimeout) + waitTimeout + buffer;
+  
+  // Cap at 30 minutes maximum
+  const timeout = Math.min(calculatedTimeout, 1800000);
+  
   for (const {host, port} of hosts) {
     try {
       logMsg(`Executing SSH profile on ${host}`);
@@ -10450,7 +10773,8 @@ async function executeSshProfiles(hosts, sshProfileId, encryptionPassword, waitT
           ssh_port: port || 22,
           encryption_password: encryptionPassword,
           wait_time_seconds: waitTimeSeconds || 0
-        })
+        }),
+        timeout: timeout // Use calculated timeout
       });
       
       if (!res.ok) {

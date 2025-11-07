@@ -13,7 +13,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY requirements.txt .
 
 # Install Python dependencies to a temporary location
-RUN pip install --no-cache-dir --prefix=/install -r requirements.txt
+# Use BuildKit cache mount for pip cache (faster rebuilds)
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install --no-cache-dir --prefix=/install -r requirements.txt
 
 # Production stage
 FROM python:3.9-slim
@@ -32,8 +34,7 @@ RUN python -c "import uvicorn" && which uvicorn
 
 # Copy application code - copy frontend separately to ensure cache invalidation on frontend changes
 COPY --chown=fabricstudio:fabricstudio frontend/ ./frontend/
-COPY --chown=fabricstudio:fabricstudio fabricstudio/ ./fabricstudio/
-COPY --chown=fabricstudio:fabricstudio *.py ./
+COPY --chown=fabricstudio:fabricstudio src/ ./src/
 COPY --chown=fabricstudio:fabricstudio requirements.txt ./
 
 # Create directories for database and logs with proper permissions
@@ -44,6 +45,7 @@ RUN mkdir -p /app/data /app/logs && \
 ENV PATH=/usr/local/bin:$PATH \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONPATH=/app/src \
     DB_PATH=/app/data/fabricstudio_ui.db
 
 # Switch to non-root user
@@ -52,10 +54,10 @@ USER fabricstudio
 # Expose port
 EXPOSE 8000
 
-# Health check
+# Health check (use dedicated health endpoint)
 HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
-    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/')" || exit 1
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')" || exit 1
 
 # Run the application
-CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["uvicorn", "src.app:app", "--host", "0.0.0.0", "--port", "8000"]
 

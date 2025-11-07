@@ -29,14 +29,16 @@ fi
 # Set environment variables
 export FS_SERVER_SECRET=${FS_SERVER_SECRET:-$(openssl rand -base64 32)}
 export DB_PATH=${DB_PATH:-fabricstudio_ui.db}
+export PYTHONPATH=${PYTHONPATH:-$(pwd)/src}
 
 echo ""
 echo "Starting FabricStudio API..."
 echo "Virtual environment: $VENV_PATH"
 echo "Server secret: Set via FS_SERVER_SECRET environment variable"
 echo "Database: $DB_PATH"
+echo "Python path: $PYTHONPATH"
 echo ""
 
 # Run uvicorn with reload for development
-uvicorn app:app --reload --host 0.0.0.0 --port 8000
+uvicorn src.app:app --reload --host 0.0.0.0 --port 8000
 

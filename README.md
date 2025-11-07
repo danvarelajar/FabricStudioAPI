@@ -40,7 +40,7 @@ pip install -r requirements.txt
 
 3. Initialize the database:
 ```bash
-python init_empty_db.py
+python src/init_empty_db.py
 ```
 
 Or the database will be automatically created when you first run the application.
@@ -49,7 +49,14 @@ Or the database will be automatically created when you first run the application
 
 **Option 1: Run locally (without Docker)**
 ```bash
-uvicorn app:app --reload --port 8000
+./scripts/run-local.sh
+```
+
+Or manually:
+```bash
+export PYTHONPATH=$(pwd)/src
+export FS_SERVER_SECRET=$(openssl rand -base64 32)
+uvicorn src.app:app --reload --host 0.0.0.0 --port 8000
 ```
 
 **Option 2: Run with Docker (Recommended)**
@@ -82,12 +89,12 @@ This project uses **Colima** as a lightweight Docker alternative for Mac. Colima
 
 3. **Start the application:**
    ```bash
-   ./docker-start.sh
+   ./scripts/docker-start.sh
    ```
    
    **To rebuild without cache:**
    ```bash
-   ./docker-start.sh --rebuild
+   ./scripts/docker-start.sh --rebuild
    ```
 
 ### Manual Setup
@@ -96,8 +103,7 @@ If you prefer to set up manually:
 
 1. **Install Colima:**
    ```bash
-   brew install colima docker docker-compose
-   colima start
+   ./scripts/setup-colima.sh
    ```
 
 2. **Create environment file:**

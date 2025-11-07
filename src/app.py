@@ -1,9 +1,10 @@
-from fastapi import FastAPI, HTTPException, BackgroundTasks, Request, Header
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Request, Header, APIRouter
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.types import ASGIApp
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.exceptions import RequestValidationError
+from starlette.middleware.base import BaseHTTPMiddleware
 from typing import Optional, List
 from pydantic import BaseModel
 import sqlite3
@@ -14,7 +15,9 @@ import paramiko
 import io
 import threading
 import time
+import socket
 import logging
+import queue
 from cryptography.fernet import Fernet
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
@@ -24,6 +27,13 @@ import os
 import secrets
 import hashlib
 
+# Import configuration and utilities
+from .config import Config
+from .utils import sanitize_for_logging
+from .csrf import CSRFProtectionMiddleware
+from .db_utils import get_db_connection, backup_database, backup_database_periodically
+from .response_models import HealthResponse
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -32,24 +42,160 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-from fabricstudio.auth import get_access_token
-from fabricstudio.fabricstudio_api import (
+from .fabricstudio.auth import get_access_token
+from .fabricstudio.fabricstudio_api import (
     query_hostname, change_hostname, get_userId, change_password,
     reset_fabric, batch_delete, refresh_repositories,
     get_template, create_fabric, install_fabric, check_tasks, get_running_task_count,
     get_recent_task_errors,
     list_all_templates, list_templates_for_repo, get_repositoryId, list_repositories
 )
-import sqlite3
-import time
-import logging
-
-logger = logging.getLogger(__name__)
 import requests
 import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-app = FastAPI()
+# Initialize FastAPI with enhanced OpenAPI documentation
+app = FastAPI(
+    title=Config.API_TITLE,
+    description=Config.API_DESCRIPTION,
+    version=Config.API_VERSION,
+    docs_url="/docs",
+    redoc_url="/redoc"
+)
+
+# Create API router for versioning
+api_v1 = APIRouter(prefix="/api/v1")
+
+# Rate limiting configuration (using Config)
+RATE_LIMIT_REQUESTS = Config.RATE_LIMIT_REQUESTS
+RATE_LIMIT_WINDOW = Config.RATE_LIMIT_WINDOW
+RATE_LIMIT_CLEANUP_INTERVAL = Config.RATE_LIMIT_CLEANUP_INTERVAL
+
+# Rate limiting storage: {ip: [(timestamp1, timestamp2, ...)]}
+_rate_limit_store: dict[str, list[float]] = {}
+# Per-endpoint rate limiting: {endpoint: {ip: [(timestamp1, timestamp2, ...)]}}
+_endpoint_rate_limit_store: dict[str, dict[str, list[float]]] = {}
+_rate_limit_lock = threading.Lock()
+_last_cleanup = time.time()
+
+def _cleanup_rate_limit_store():
+    """Remove old entries from rate limit store"""
+    global _last_cleanup
+    now = time.time()
+    cutoff = now - RATE_LIMIT_WINDOW
+    
+    with _rate_limit_lock:
+        for ip in list(_rate_limit_store.keys()):
+            # Remove timestamps older than the window
+            _rate_limit_store[ip] = [ts for ts in _rate_limit_store[ip] if ts > cutoff]
+            # Remove IPs with no recent requests
+            if not _rate_limit_store[ip]:
+                del _rate_limit_store[ip]
+    
+    _last_cleanup = now
+
+def _check_rate_limit(ip: str) -> bool:
+    """Check if IP is within rate limit. Returns True if allowed, False if rate limited."""
+    global _last_cleanup
+    
+    # Periodic cleanup
+    if time.time() - _last_cleanup > RATE_LIMIT_CLEANUP_INTERVAL:
+        _cleanup_rate_limit_store()
+    
+    now = time.time()
+    cutoff = now - RATE_LIMIT_WINDOW
+    
+    with _rate_limit_lock:
+        # Get or create request timestamps for this IP
+        if ip not in _rate_limit_store:
+            _rate_limit_store[ip] = []
+        
+        # Remove old timestamps
+        _rate_limit_store[ip] = [ts for ts in _rate_limit_store[ip] if ts > cutoff]
+        
+        # Check if limit exceeded
+        if len(_rate_limit_store[ip]) >= RATE_LIMIT_REQUESTS:
+            return False
+        
+        # Add current request timestamp
+        _rate_limit_store[ip].append(now)
+        return True
+
+def _check_rate_limit_for_endpoint(ip: str, endpoint: str, max_requests: int, window: int) -> bool:
+    """Check if IP is within rate limit for a specific endpoint."""
+    now = time.time()
+    cutoff = now - window
+    
+    with _rate_limit_lock:
+        # Initialize endpoint store if needed
+        if endpoint not in _endpoint_rate_limit_store:
+            _endpoint_rate_limit_store[endpoint] = {}
+        
+        # Get or create request timestamps for this IP on this endpoint
+        if ip not in _endpoint_rate_limit_store[endpoint]:
+            _endpoint_rate_limit_store[endpoint][ip] = []
+        
+        # Remove old timestamps
+        _endpoint_rate_limit_store[endpoint][ip] = [
+            ts for ts in _endpoint_rate_limit_store[endpoint][ip] if ts > cutoff
+        ]
+        
+        # Check if limit exceeded
+        if len(_endpoint_rate_limit_store[endpoint][ip]) >= max_requests:
+            return False
+        
+        # Add current request timestamp
+        _endpoint_rate_limit_store[endpoint][ip].append(now)
+        return True
+
+class RateLimitMiddleware(BaseHTTPMiddleware):
+    """Middleware to enforce rate limiting on API endpoints"""
+    
+    async def dispatch(self, request: Request, call_next):
+        # Skip rate limiting for static files and frontend routes
+        path = request.url.path
+        if path.startswith('/static/') or path == '/' or path.endswith(('.html', '.js', '.css', '.woff2', '.svg', '.ico', '.png', '.jpg', '.jpeg')):
+            return await call_next(request)
+        
+        # Get client IP
+        ip = get_client_ip(request)
+        
+        # Check per-endpoint rate limit if configured
+        endpoint_limit = Config.RATE_LIMITS.get(path)
+        if endpoint_limit:
+            # Use stricter limit for this endpoint
+            limit_requests = endpoint_limit["requests"]
+            limit_window = endpoint_limit["window"]
+            if not _check_rate_limit_for_endpoint(ip, path, limit_requests, limit_window):
+                logger.warning(f"Rate limit exceeded for IP {ip} on {request.method} {path}")
+                return JSONResponse(
+                    status_code=429,
+                    content={
+                        "detail": f"Rate limit exceeded. Maximum {limit_requests} requests per {limit_window} seconds for this endpoint."
+                    },
+                    headers={"Retry-After": str(limit_window)}
+                )
+        
+        # Check global rate limit
+        if not _check_rate_limit(ip):
+            logger.warning(f"Rate limit exceeded for IP {ip} on {request.method} {path}")
+            return JSONResponse(
+                status_code=429,
+                content={
+                    "detail": f"Rate limit exceeded. Maximum {RATE_LIMIT_REQUESTS} requests per {RATE_LIMIT_WINDOW} seconds."
+                },
+                headers={"Retry-After": str(RATE_LIMIT_WINDOW)}
+            )
+        
+        # Process request
+        response = await call_next(request)
+        return response
+
+# Add rate limiting middleware
+app.add_middleware(RateLimitMiddleware)
+
+# Add CSRF protection middleware (after rate limiting)
+app.add_middleware(CSRFProtectionMiddleware)
 
 # HTTP request logging middleware removed - now using INFO log handler instead
 
@@ -59,7 +205,9 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
     logger.error(f"Validation error on {request.method} {request.url.path}: {exc.errors()}")
     try:
         body = await request.body()
-        logger.error(f"Request body: {body.decode() if body else 'empty'}")
+        # Sanitize request body before logging
+        sanitized_body = sanitize_for_logging(body.decode() if body else 'empty')
+        logger.error(f"Request body: {sanitized_body}")
     except Exception as e:
         logger.error(f"Could not read request body: {e}")
     return JSONResponse(
@@ -67,13 +215,13 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
         content={"detail": exc.errors()}
     )
 
-# Helper function to extract access_token from Authorization header or session
+# Helper function to extract access_token from session
 def get_access_token_from_request(request: Request, fabric_host: str = None) -> Optional[str]:
     """
-    Extract access_token from session (preferred) or Authorization header (fallback).
+    Extract access_token from session.
     Returns the token string or None if not found.
     """
-    # First try session (if fabric_host provided)
+    # Get token from session (requires fabric_host)
     if fabric_host:
         session = get_session_from_request(request)
         if session:
@@ -119,33 +267,45 @@ def get_access_token_from_request(request: Request, fabric_host: str = None) -> 
                 except Exception as e:
                     logger.error(f"Error getting token from session: {e}")
     
-    # Fallback to Authorization header (backward compatibility)
-    auth_header = request.headers.get("Authorization", "")
-    if auth_header.startswith("Bearer "):
-        return auth_header.replace("Bearer ", "", 1).strip()
-    
     return None
 
-# Database setup - use environment variable or default to current directory
-DB_PATH = os.environ.get("DB_PATH", "fabricstudio_ui.db")
+# Database setup - use Config module
+DB_PATH = Config.DB_PATH
 
 # Thread lock for database operations to prevent SQLite locking issues
 _db_lock = threading.Lock()
 
-def db_connect_with_retry(timeout=5.0, max_retries=3, retry_delay=0.1):
-    """Connect to SQLite database with retry logic and timeout"""
-    for attempt in range(max_retries):
-        try:
-            conn = sqlite3.connect(DB_PATH, timeout=timeout)
-            # Enable WAL mode for better concurrency
-            conn.execute('PRAGMA journal_mode=WAL')
-            return conn
-        except sqlite3.OperationalError as e:
-            if "database is locked" in str(e).lower() and attempt < max_retries - 1:
-                time.sleep(retry_delay * (2 ** attempt))  # Exponential backoff
-                continue
-            raise
-    return None
+# Connection pool limit to prevent exhaustion
+from threading import Semaphore
+_db_semaphore = Semaphore(Config.DB_MAX_CONNECTIONS)
+
+def db_connect_with_retry(timeout=None, max_retries=None, retry_delay=None):
+    """Connect to SQLite database with retry logic, timeout, and connection pooling"""
+    # Use Config defaults if not specified
+    timeout = timeout or Config.DB_TIMEOUT
+    max_retries = max_retries or Config.DB_MAX_RETRIES
+    retry_delay = retry_delay or Config.DB_RETRY_DELAY
+    
+    _db_semaphore.acquire()
+    try:
+        for attempt in range(max_retries):
+            try:
+                conn = sqlite3.connect(DB_PATH, timeout=timeout)
+                # Enable WAL mode and optimizations for better concurrency
+                conn.execute('PRAGMA journal_mode=WAL')
+                conn.execute('PRAGMA synchronous=NORMAL')
+                conn.execute('PRAGMA cache_size=-64000')  # 64MB cache
+                conn.execute('PRAGMA temp_store=MEMORY')
+                conn.execute('PRAGMA mmap_size=268435456')  # 256MB memory-mapped I/O
+                return conn
+            except sqlite3.OperationalError as e:
+                if "database is locked" in str(e).lower() and attempt < max_retries - 1:
+                    time.sleep(retry_delay * (2 ** attempt))  # Exponential backoff
+                    continue
+                raise
+        return None
+    finally:
+        _db_semaphore.release()
 
 # Custom logging handler to capture INFO logs to database
 class DatabaseLogHandler(logging.Handler):
@@ -190,10 +350,128 @@ class DatabaseLogHandler(logging.Handler):
         except Exception:
             pass
 
+# Input validation patterns and functions
+import re
+HOSTNAME_PATTERN = re.compile(r'^[a-zA-Z0-9]([a-zA-Z0-9\-\.]{0,253}[a-zA-Z0-9])?$')
+IP_PATTERN = re.compile(r'^(\d{1,3}\.){3}\d{1,3}$')
+TEMPLATE_NAME_PATTERN = re.compile(r'^[a-zA-Z0-9][a-zA-Z0-9\s\-_\.]{0,99}$')  # Allows spaces
+VERSION_PATTERN = re.compile(r'^\d+\.\d+(\.\d+)?(-[a-zA-Z0-9]+)?$')
+
+# Limits (using Config)
+MAX_HOSTS_PER_CONFIG = Config.MAX_HOSTS_PER_CONFIG
+MAX_SSH_COMMAND_LENGTH = Config.MAX_SSH_COMMAND_LENGTH
+MAX_SSH_COMMANDS = Config.MAX_SSH_COMMANDS
+MAX_TOTAL_COMMANDS_SIZE = Config.MAX_TOTAL_COMMANDS_SIZE
+SSH_OPERATION_TIMEOUT = Config.SSH_OPERATION_TIMEOUT
+
+def validate_fabric_host(host: str) -> str:
+    """Validate and sanitize fabric host input"""
+    if not host or len(host) > 255:
+        raise HTTPException(400, "Invalid host format or length")
+    host = host.strip().lower()
+    if not (HOSTNAME_PATTERN.match(host) or IP_PATTERN.match(host)):
+        raise HTTPException(400, "Invalid host format")
+    return host
+
+def validate_template_name(name: str) -> str:
+    """Validate template name format (allows spaces)"""
+    if not name or len(name) > 100:
+        raise HTTPException(400, "Invalid template name format or length")
+    name = name.strip()
+    if not TEMPLATE_NAME_PATTERN.match(name):
+        raise HTTPException(400, "Invalid template name format")
+    return name
+
+def validate_version(version: str) -> str:
+    """Validate version format"""
+    if not version or not version.strip():
+        raise HTTPException(400, "Version is required")
+    version = version.strip()
+    if not VERSION_PATTERN.match(version):
+        raise HTTPException(400, "Invalid version format")
+    return version
+
+def validate_name(name: str, field_name: str = "name", max_length: int = 255) -> str:
+    """Validate name format (alphanumeric, dash, underscore)"""
+    if not name or not name.strip():
+        raise HTTPException(400, f"{field_name} is required")
+    name = name.strip()
+    if len(name) > max_length:
+        raise HTTPException(400, f"{field_name} exceeds maximum length of {max_length} characters")
+    if not re.match(r'^[a-zA-Z0-9_-]+$', name):
+        raise HTTPException(400, f"{field_name} must contain only alphanumeric characters, dashes, and underscores")
+    return name
+
+def validate_hostname(hostname: str) -> str:
+    """Validate hostname format"""
+    if not hostname or not hostname.strip():
+        raise HTTPException(400, "Hostname is required")
+    hostname = hostname.strip()
+    if len(hostname) > 253:
+        raise HTTPException(400, "Hostname exceeds maximum length of 253 characters")
+    if not HOSTNAME_PATTERN.match(hostname):
+        raise HTTPException(400, "Invalid hostname format")
+    return hostname
+
+def validate_client_id(client_id: str) -> str:
+    """Validate client ID"""
+    if not client_id or not client_id.strip():
+        raise HTTPException(400, "Client ID is required")
+    client_id = client_id.strip()
+    if len(client_id) > 500:
+        raise HTTPException(400, "Client ID exceeds maximum length of 500 characters")
+    return client_id
+
+def validate_client_secret(client_secret: str) -> str:
+    """Validate client secret"""
+    if not client_secret or not client_secret.strip():
+        raise HTTPException(400, "Client Secret is required")
+    client_secret = client_secret.strip()
+    if len(client_secret) > 1000:
+        raise HTTPException(400, "Client Secret exceeds maximum length of 1000 characters")
+    return client_secret
+
+def validate_fabric_hosts_list(fabric_hosts: str) -> list[str]:
+    """Validate and parse space-separated list of fabric hosts"""
+    if not fabric_hosts or not fabric_hosts.strip():
+        return []
+    hosts = [h.strip() for h in fabric_hosts.strip().split() if h.strip()]
+    validated_hosts = []
+    for host in hosts:
+        validated_hosts.append(validate_fabric_host(host))
+    return validated_hosts
+
+# Thread safety for event scheduler
+_executed_events_lock = threading.Lock()
+_executed_events: set[str] = set()
+
+# Token refresh locks per host
+_token_refresh_locks: dict[str, threading.Lock] = {}
+_token_locks_lock = threading.Lock()
+
+def get_token_refresh_lock(host: str) -> threading.Lock:
+    """Get or create lock for a specific host token refresh"""
+    with _token_locks_lock:
+        if host not in _token_refresh_locks:
+            _token_refresh_locks[host] = threading.Lock()
+        return _token_refresh_locks[host]
+
 def init_db():
     """Initialize the SQLite database with configurations and event_schedules tables"""
-    conn = sqlite3.connect(DB_PATH)
+    conn = db_connect_with_retry()
+    if not conn:
+        raise RuntimeError("Failed to connect to database during initialization")
     c = conn.cursor()
+    
+    # Apply SQLite performance optimizations (also applied in db_connect_with_retry, but ensure they're set)
+    # These are idempotent and safe to run multiple times
+    c.execute('PRAGMA journal_mode=WAL')
+    c.execute('PRAGMA synchronous=NORMAL')
+    c.execute('PRAGMA cache_size=-64000')  # 64MB cache
+    c.execute('PRAGMA temp_store=MEMORY')
+    c.execute('PRAGMA mmap_size=268435456')  # 256MB memory-mapped I/O
+    c.execute('PRAGMA foreign_keys=ON')  # Enable foreign key constraints
+    
     c.execute('''
         CREATE TABLE IF NOT EXISTS configurations (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -483,6 +761,15 @@ def init_db():
     c.execute('CREATE INDEX IF NOT EXISTS idx_app_logs_level ON app_logs(level)')
     c.execute('CREATE INDEX IF NOT EXISTS idx_app_logs_logger_name ON app_logs(logger_name)')
     
+    # Additional performance indexes
+    c.execute('CREATE INDEX IF NOT EXISTS idx_event_schedules_auto_run_date ON event_schedules(auto_run, event_date)')
+    c.execute('CREATE INDEX IF NOT EXISTS idx_nhi_tokens_cred_host ON nhi_tokens(nhi_credential_id, fabric_host)')
+    c.execute('CREATE INDEX IF NOT EXISTS idx_nhi_tokens_expires ON nhi_tokens(token_expires_at)')
+    c.execute('CREATE INDEX IF NOT EXISTS idx_event_executions_event_status ON event_executions(event_id, status)')
+    c.execute('CREATE INDEX IF NOT EXISTS idx_event_executions_started_at ON event_executions(started_at DESC)')
+    c.execute('CREATE INDEX IF NOT EXISTS idx_sessions_last_used ON sessions(last_used)')
+    c.execute('CREATE INDEX IF NOT EXISTS idx_cached_templates_repo_name ON cached_templates(repo_name, template_name)')
+    
     # Drop old http_logs table if it exists (replaced by app_logs)
     c.execute('DROP TABLE IF EXISTS http_logs')
     
@@ -544,59 +831,141 @@ def decrypt_with_server_secret(ciphertext_b64: str) -> str:
     dec = f.decrypt(enc_bytes)
     return dec.decode()
 
-# Audit logging helper function
-def log_audit(action: str, user: str = None, details: str = None, ip_address: str = None):
-    """Log an audit event to the database, with deduplication for fabric creation"""
-    # Use lock to prevent concurrent database access
-    with _db_lock:
-        conn = None
+# Audit log queue for batch writes
+_audit_log_queue = queue.Queue(maxsize=1000)
+_audit_log_thread = None
+_audit_log_thread_lock = threading.Lock()
+
+def _audit_log_worker():
+    """Background thread to batch write audit logs to database"""
+    batch = []
+    batch_size = 50  # Write in batches of 50
+    batch_timeout = 2.0  # Or every 2 seconds, whichever comes first
+    last_write = time.time()
+    
+    while True:
         try:
-            conn = db_connect_with_retry(timeout=10.0, max_retries=5, retry_delay=0.05)
-            if not conn:
-                logger.error("Failed to connect to database for audit log after retries")
-                return
-            
-            c = conn.cursor()
-            
-            # Use timezone-aware timestamp
-            now_utc = datetime.now(timezone.utc)
-            
-            # Check for duplicate entries within the last 5 seconds for fabric_created action
-            if action == "fabric_created" and details:
-                five_seconds_ago = (now_utc - timedelta(seconds=5)).isoformat()
+            # Try to get an item from queue with timeout
+            try:
+                item = _audit_log_queue.get(timeout=1.0)
+                if item is None:  # Shutdown signal
+                    # Write remaining batch before exiting
+                    if batch:
+                        _write_audit_batch(batch)
+                    break
                 
-                # Extract host, template, and version from details string
-                # Format: "host=X template=Y version=Z" or "host=X template=Y version=Z event=W"
+                batch.append(item)
+                _audit_log_queue.task_done()
+            except queue.Empty:
+                pass
+            
+            # Write batch if it's full or timeout reached
+            now = time.time()
+            if len(batch) >= batch_size or (batch and (now - last_write) >= batch_timeout):
+                if batch:
+                    _write_audit_batch(batch)
+                    batch = []
+                    last_write = now
+        except Exception as e:
+            logger.error(f"Error in audit log worker: {e}", exc_info=True)
+            time.sleep(0.1)  # Brief pause on error
+
+def _write_audit_batch(batch: list):
+    """Write a batch of audit logs to the database"""
+    if not batch:
+        return
+    
+    conn = None
+    try:
+        conn = db_connect_with_retry(timeout=10.0, max_retries=5, retry_delay=0.05)
+        if not conn:
+            logger.error("Failed to connect to database for batch audit log write")
+            return
+        
+        c = conn.cursor()
+        now_utc = datetime.now(timezone.utc)
+        
+        # Prepare deduplication check for fabric_created entries
+        fabric_created_details = {}
+        for item in batch:
+            if item['action'] == 'fabric_created' and item['details']:
+                fabric_created_details[item['details']] = item
+        
+        # Check for duplicates if we have fabric_created entries
+        if fabric_created_details:
+            five_seconds_ago = (now_utc - timedelta(seconds=5)).isoformat()
+            for details in list(fabric_created_details.keys()):
                 c.execute('''
                     SELECT id FROM audit_logs
                     WHERE action = ? AND details = ?
                     AND created_at > ?
                     LIMIT 1
-                ''', (action, details, five_seconds_ago))
+                ''', ('fabric_created', details, five_seconds_ago))
                 if c.fetchone():
-                    # Duplicate found within 5 seconds, skip logging
-                    conn.close()
-                    return
-            
-            # Insert audit log
-            c.execute('''
+                    # Remove duplicate from batch
+                    batch.remove(fabric_created_details[details])
+        
+        # Insert all non-duplicate entries
+        if batch:
+            c.executemany('''
                 INSERT INTO audit_logs (action, user, details, ip_address, created_at)
                 VALUES (?, ?, ?, ?, ?)
-            ''', (action, user, details, ip_address, now_utc.isoformat()))
+            ''', [
+                (item['action'], item['user'], item['details'], item['ip_address'], item['created_at'])
+                for item in batch
+            ])
             conn.commit()
-        except sqlite3.OperationalError as e:
-            if "database is locked" in str(e).lower():
-                logger.warning(f"Database locked when logging audit event '{action}', skipping")
-            else:
-                logger.error(f"Failed to log audit event: {e}", exc_info=True)
-        except Exception as e:
-            logger.error(f"Failed to log audit event: {e}", exc_info=True)
-        finally:
-            if conn:
+    except sqlite3.OperationalError as e:
+        if "database is locked" in str(e).lower():
+            logger.warning(f"Database locked when writing audit log batch, retrying later")
+            # Put items back in queue (at front) for retry
+            for item in reversed(batch):
                 try:
-                    conn.close()
-                except Exception:
-                    pass
+                    _audit_log_queue.put_nowait(item)
+                except queue.Full:
+                    logger.warning("Audit log queue full, dropping audit log entry")
+        else:
+            logger.error(f"Failed to write audit log batch: {e}", exc_info=True)
+    except Exception as e:
+        logger.error(f"Error writing audit log batch: {e}", exc_info=True)
+    finally:
+        if conn:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+def _start_audit_log_worker():
+    """Start the audit log worker thread if not already running"""
+    global _audit_log_thread
+    with _audit_log_thread_lock:
+        if _audit_log_thread is None or not _audit_log_thread.is_alive():
+            _audit_log_thread = threading.Thread(target=_audit_log_worker, daemon=True)
+            _audit_log_thread.start()
+            logger.info("Audit log worker thread started")
+
+# Audit logging helper function
+def log_audit(action: str, user: str = None, details: str = None, ip_address: str = None):
+    """Log an audit event to the database via queue (batched writes)"""
+    # Ensure worker thread is running
+    _start_audit_log_worker()
+    
+    # Prepare log entry
+    now_utc = datetime.now(timezone.utc)
+    log_entry = {
+        'action': action,
+        'user': user,
+        'details': details,
+        'ip_address': ip_address,
+        'created_at': now_utc.isoformat()
+    }
+    
+    # Add to queue (non-blocking)
+    try:
+        _audit_log_queue.put_nowait(log_entry)
+    except queue.Full:
+        # Queue is full, log warning and drop entry
+        logger.warning(f"Audit log queue full, dropping audit log entry: {action}")
 
 def get_client_ip(request: Request) -> str:
     """Extract client IP address from request"""
@@ -684,61 +1053,70 @@ def is_token_expiring_soon(token_info: dict, minutes: int = 5) -> bool:
 
 def refresh_token_for_host(session_id: str, fabric_host: str) -> bool:
     """Refresh an expired or expiring token for a specific host"""
-    try:
-        session = get_session(session_id)
-        if not session:
-            logger.warning(f"Session {session_id} not found for token refresh")
-            return False
-        
-        session_key = get_session_key_temp(session_id)
-        if not session_key:
-            logger.warning(f"Session key not found for session {session_id}")
-            return False
-        
-        # Decrypt tokens to get credentials
-        tokens = decrypt_tokens_from_session(session['tokens_encrypted'], session_key)
-        credentials = tokens.get('_credentials')
-        
-        if not credentials:
-            logger.warning(f"No credentials stored in session {session_id} for token refresh")
-            return False
-        
-        client_id = credentials.get('client_id')
-        client_secret = credentials.get('client_secret')
-        
-        if not client_id or not client_secret:
-            logger.warning(f"Missing client_id or client_secret in session {session_id}")
-            return False
-        
-        # Get new token from FabricStudio API
-        token_data = get_access_token(client_id, client_secret, fabric_host)
-        if not token_data or not isinstance(token_data, dict) or not token_data.get("access_token"):
-            logger.error(f"Failed to get new token for {fabric_host} in session {session_id}")
-            return False
-        
-        # Update token in session
-        tokens[fabric_host] = create_token_info(token_data)
-        
-        # Re-encrypt and save
-        tokens_encrypted = encrypt_tokens_for_session(tokens, session_key)
-        
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
+    lock = get_token_refresh_lock(fabric_host)
+    with lock:
         try:
-            c.execute('''
-                UPDATE sessions 
-                SET tokens_encrypted = ?, last_used = CURRENT_TIMESTAMP
-                WHERE session_id = ?
-            ''', (tokens_encrypted, session_id))
-            conn.commit()
-            # Token refreshed successfully
-            return True
-        finally:
-            conn.close()
+            session = get_session(session_id)
+            if not session:
+                logger.warning(f"Session {session_id} not found for token refresh")
+                return False
             
-    except Exception as e:
-        logger.error(f"Error refreshing token for {fabric_host} in session {session_id}: {e}", exc_info=True)
-        return False
+            session_key = get_session_key_temp(session_id)
+            if not session_key:
+                logger.warning(f"Session key not found for session {session_id}")
+                return False
+            
+            # Decrypt tokens to get credentials
+            tokens = decrypt_tokens_from_session(session['tokens_encrypted'], session_key)
+            credentials = tokens.get('_credentials')
+            
+            if not credentials:
+                logger.warning(f"No credentials stored in session {session_id} for token refresh")
+                return False
+            
+            client_id = credentials.get('client_id')
+            client_secret = credentials.get('client_secret')
+            
+            if not client_id or not client_secret:
+                logger.warning(f"Missing client_id or client_secret in session {session_id}")
+                return False
+            
+            # Get new token from FabricStudio API
+            token_data = get_access_token(client_id, client_secret, fabric_host)
+            if not token_data or not isinstance(token_data, dict) or not token_data.get("access_token"):
+                logger.error(f"Failed to get new token for {fabric_host} in session {session_id}")
+                return False
+            
+            # Update token in session
+            tokens[fabric_host] = create_token_info(token_data)
+            
+            # Re-encrypt and save
+            tokens_encrypted = encrypt_tokens_for_session(tokens, session_key)
+            
+            conn = db_connect_with_retry()
+            if not conn:
+                logger.error(f"Failed to connect to database for token refresh")
+                return False
+            
+            c = conn.cursor()
+            try:
+                c.execute('''
+                    UPDATE sessions 
+                    SET tokens_encrypted = ?, last_used = CURRENT_TIMESTAMP
+                    WHERE session_id = ?
+                ''', (tokens_encrypted, session_id))
+                conn.commit()
+                logger.info(f"Token refreshed successfully for {fabric_host} in session {session_id}")
+                return True
+            except sqlite3.Error as e:
+                logger.error(f"Database error refreshing token: {e}")
+                conn.rollback()
+                return False
+            finally:
+                conn.close()
+        except Exception as e:
+            logger.error(f"Error refreshing token for {fabric_host} in session {session_id}: {e}", exc_info=True)
+            return False
 
 def calculate_expires_in(expires_at_str: str) -> int:
     """Calculate expires_in seconds from expires_at ISO string"""
@@ -778,7 +1156,9 @@ def create_session(nhi_credential_id: int, encryption_password: str, tokens_by_h
     # Session expires after 1 hour of inactivity
     expires_at = datetime.now(timezone.utc) + timedelta(hours=1)
     
-    conn = sqlite3.connect(DB_PATH)
+    conn = db_connect_with_retry()
+    if not conn:
+        raise RuntimeError("Failed to connect to database for session creation")
     c = conn.cursor()
     try:
         c.execute('''
@@ -797,7 +1177,10 @@ def create_session(nhi_credential_id: int, encryption_password: str, tokens_by_h
 
 def get_session(session_id: str) -> Optional[dict]:
     """Get session data from database"""
-    conn = sqlite3.connect(DB_PATH)
+    conn = db_connect_with_retry()
+    if not conn:
+        logger.error(f"Failed to connect to database for session {session_id}")
+        return None
     c = conn.cursor()
     try:
         c.execute('''
@@ -837,7 +1220,10 @@ def get_session(session_id: str) -> Optional[dict]:
 
 def update_session_activity(session_id: str):
     """Update last_used timestamp for session"""
-    conn = sqlite3.connect(DB_PATH)
+    conn = db_connect_with_retry()
+    if not conn:
+        logger.error(f"Failed to connect to database for session activity update")
+        return
     c = conn.cursor()
     try:
         c.execute('''
@@ -851,7 +1237,10 @@ def update_session_activity(session_id: str):
 
 def update_session_tokens(session_id: str, tokens_encrypted: str):
     """Update tokens in session"""
-    conn = sqlite3.connect(DB_PATH)
+    conn = db_connect_with_retry()
+    if not conn:
+        logger.error(f"Failed to connect to database for session token update")
+        return
     c = conn.cursor()
     try:
         c.execute('''
@@ -866,7 +1255,10 @@ def update_session_tokens(session_id: str, tokens_encrypted: str):
 def refresh_session(session_id: str) -> Optional[datetime]:
     """Refresh session expiration time"""
     expires_at = datetime.now(timezone.utc) + timedelta(hours=1)
-    conn = sqlite3.connect(DB_PATH)
+    conn = db_connect_with_retry()
+    if not conn:
+        logger.error(f"Failed to connect to database for session refresh")
+        return None
     c = conn.cursor()
     try:
         c.execute('''
@@ -881,14 +1273,18 @@ def refresh_session(session_id: str) -> Optional[datetime]:
 
 def delete_session(session_id: str):
     """Delete session from database"""
-    conn = sqlite3.connect(DB_PATH)
+    conn = db_connect_with_retry()
+    if not conn:
+        logger.error(f"Failed to connect to database for session deletion")
+        return
     c = conn.cursor()
     try:
         c.execute('DELETE FROM sessions WHERE session_id = ?', (session_id,))
         conn.commit()
         # Remove from temp storage
-        if session_id in _session_keys:
-            del _session_keys[session_id]
+        with _session_keys_lock:
+            if session_id in _session_keys:
+                del _session_keys[session_id]
     finally:
         conn.close()
 
@@ -899,17 +1295,43 @@ def get_session_from_request(request: Request) -> Optional[dict]:
         return None
     return get_session(session_id)
 
-# Store session keys temporarily in memory (will be replaced with better approach)
+# Store session keys temporarily in memory with TTL-based cleanup
 # In production, consider using Redis or storing encrypted session key
-_session_keys: dict[str, bytes] = {}
+from collections import OrderedDict
+_session_keys: dict[str, tuple[bytes, datetime]] = OrderedDict()
+_session_keys_lock = threading.Lock()
+_SESSION_KEY_TTL = timedelta(hours=24)
+_MAX_SESSION_KEYS = 1000
+
+def cleanup_expired_session_keys():
+    """Remove expired session keys"""
+    now = datetime.now()
+    with _session_keys_lock:
+        expired = [k for k, (_, ts) in _session_keys.items() 
+                   if now - ts > _SESSION_KEY_TTL]
+        for k in expired:
+            _session_keys.pop(k, None)
+        # Keep only last MAX_SESSION_KEYS entries
+        while len(_session_keys) > _MAX_SESSION_KEYS:
+            _session_keys.popitem(last=False)
 
 def store_session_key_temp(session_id: str, session_key: bytes):
-    """Temporarily store session key in memory (for testing)"""
-    _session_keys[session_id] = session_key
+    """Store session key with TTL"""
+    cleanup_expired_session_keys()
+    with _session_keys_lock:
+        _session_keys[session_id] = (session_key, datetime.now())
 
 def get_session_key_temp(session_id: str) -> Optional[bytes]:
-    """Get temporarily stored session key"""
-    return _session_keys.get(session_id)
+    """Get temporarily stored session key if not expired"""
+    cleanup_expired_session_keys()
+    with _session_keys_lock:
+        entry = _session_keys.get(session_id)
+        if entry:
+            key, ts = entry
+            if datetime.now() - ts < _SESSION_KEY_TTL:
+                return key
+            _session_keys.pop(session_id, None)
+    return None
 
 # Initialize database on startup
 init_db()
@@ -921,7 +1343,7 @@ formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(messag
 db_handler.setFormatter(formatter)
 logging.getLogger().addHandler(db_handler)
 
-# Adjust allowed origins to your frontend(s)
+# CORS middleware
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -937,8 +1359,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Serve the frontend under /frontend (for direct access)
-app.mount("/frontend", StaticFiles(directory="frontend", html=True), name="frontend")
+# Note: Static files are served via explicit routes below, not via mount
+# This ensures API routes take precedence
 
 # Serve static assets at root paths for index.html references
 @app.get("/app.js")
@@ -949,6 +1371,48 @@ def serve_app_js():
         "Expires": "0",
     })
 
+@app.get("/health", response_model=HealthResponse, summary="Health check", 
+         description="Check the health status of the API and database")
+def health_check():
+    """
+    Health check endpoint for monitoring and orchestration.
+    
+    Returns:
+        HealthResponse with status, timestamp, database status, and version
+    """
+    try:
+        # Check database connectivity
+        conn = db_connect_with_retry(timeout=5.0, max_retries=1)
+        if not conn:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "status": "unhealthy",
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "database": "unavailable",
+                    "version": Config.API_VERSION
+                }
+            )
+        conn.close()
+        
+        return HealthResponse(
+            status="healthy",
+            timestamp=datetime.now(timezone.utc).isoformat(),
+            database="ok",
+            version=Config.API_VERSION
+        )
+    except Exception as e:
+        logger.error(f"Health check failed: {e}")
+        return JSONResponse(
+            status_code=503,
+            content={
+                "status": "unhealthy",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "database": f"error: {str(e)}",
+                "version": Config.API_VERSION
+            }
+        )
+
 @app.get("/styles.css")
 def serve_styles_css():
     return FileResponse("frontend/styles.css", headers={
@@ -958,7 +1422,7 @@ def serve_styles_css():
     })
 
 @app.get("/Fortinet-logomark-rgb-red.svg")
-@app.get("/frontend/images/Fortinet-logomark-rgb-red.svg")
+@app.get("/images/Fortinet-logomark-rgb-red.svg")
 def serve_fortinet_logo():
     import os
     # Try images directory first, then fallback to frontend root
@@ -989,47 +1453,47 @@ async def add_no_cache_headers(request, call_next):
     # Add no-cache headers for frontend files (HTML, JSON, JS, CSS)
     if ("text/html" in ct or "application/json" in ct or 
         "application/javascript" in ct or "text/css" in ct or
-        path in {"/", "/frontend/index.html", "/app.js", "/styles.css"} or
-        path.startswith("/frontend/")):
+        path in {"/", "/index.html", "/app.js", "/styles.css"} or
+        path.endswith(('.html', '.js', '.css'))):
         response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
         response.headers["Pragma"] = "no-cache"
         response.headers["Expires"] = "0"
     return response
 
 # Serve section HTML files for dynamic loading
-@app.get("/frontend/preparation.html")
+@app.get("/preparation.html")
 def serve_preparation():
     return FileResponse("frontend/preparation.html", media_type="text/html")
 
-@app.get("/frontend/configurations.html")
+@app.get("/configurations.html")
 def serve_configurations():
     return FileResponse("frontend/configurations.html", media_type="text/html")
 
-@app.get("/frontend/event-schedule.html")
+@app.get("/event-schedule.html")
 def serve_event_schedule():
     return FileResponse("frontend/event-schedule.html", media_type="text/html")
 
-@app.get("/frontend/nhi-management.html")
+@app.get("/nhi-management.html")
 def serve_nhi_management():
     return FileResponse("frontend/nhi-management.html", media_type="text/html")
 
-@app.get("/frontend/ssh-keys.html")
+@app.get("/ssh-keys.html")
 def serve_ssh_keys():
     return FileResponse("frontend/ssh-keys.html", media_type="text/html")
 
-@app.get("/frontend/ssh-command-profiles.html")
+@app.get("/ssh-command-profiles.html")
 def serve_ssh_command_profiles():
     return FileResponse("frontend/ssh-command-profiles.html", media_type="text/html")
 
-@app.get("/frontend/server-logs.html")
+@app.get("/server-logs.html")
 def serve_server_logs_page():
     return FileResponse("frontend/server-logs.html", media_type="text/html")
 
-@app.get("/frontend/audit-logs.html")
+@app.get("/audit-logs.html")
 def serve_audit_logs():
     return FileResponse("frontend/audit-logs.html", media_type="text/html")
 
-@app.get("/frontend/reports.html")
+@app.get("/reports.html")
 def serve_reports():
     return FileResponse("frontend/reports.html", media_type="text/html")
 
@@ -1078,6 +1542,11 @@ class InstallFabricReq(BaseModel):
 
 @app.post("/auth/token")
 def auth_token(req: TokenReq):
+    # Validate inputs
+    req.fabric_host = validate_fabric_host(req.fabric_host)
+    req.client_id = validate_client_id(req.client_id)
+    req.client_secret = validate_client_secret(req.client_secret)
+    
     token_data = get_access_token(req.client_id, req.client_secret, req.fabric_host)
     if not token_data or not token_data.get("access_token"):
         raise HTTPException(400, "Failed to get token")
@@ -1089,6 +1558,7 @@ def auth_token(req: TokenReq):
 
 @app.get("/system/hostname")
 def get_hostname(request: Request, fabric_host: str):
+    fabric_host = validate_fabric_host(fabric_host)
     token = get_access_token_from_request(request, fabric_host)
     if not token:
         raise HTTPException(401, "Missing access_token in session or Authorization header")
@@ -1100,6 +1570,8 @@ def get_hostname(request: Request, fabric_host: str):
 
 @app.post("/system/hostname")
 def set_hostname(request: Request, req: HostnameReq):
+    req.fabric_host = validate_fabric_host(req.fabric_host)
+    req.hostname = validate_hostname(req.hostname)
     token = get_access_token_from_request(request, req.fabric_host)
     if not token:
         raise HTTPException(401, "Missing access_token in session or Authorization header")
@@ -1121,6 +1593,7 @@ def set_password(request: Request, req: UserPassReq):
 
 @app.post("/runtime/reset")
 def runtime_reset(request: Request, fabric_host: str):
+    fabric_host = validate_fabric_host(fabric_host)
     token = get_access_token_from_request(request, fabric_host)
     if not token:
         raise HTTPException(401, "Missing access_token in session or Authorization header")
@@ -1130,6 +1603,7 @@ def runtime_reset(request: Request, fabric_host: str):
 
 @app.delete("/model/fabric/batch")
 def model_batch_delete(request: Request, fabric_host: str):
+    fabric_host = validate_fabric_host(fabric_host)
     token = get_access_token_from_request(request, fabric_host)
     if not token:
         raise HTTPException(401, "Missing access_token in session or Authorization header")
@@ -1139,6 +1613,7 @@ def model_batch_delete(request: Request, fabric_host: str):
 
 @app.post("/repo/refresh")
 def repo_refresh(request: Request, fabric_host: str):
+    fabric_host = validate_fabric_host(fabric_host)
     token = get_access_token_from_request(request, fabric_host)
     if not token:
         raise HTTPException(401, "Missing access_token in session or Authorization header")
@@ -1148,6 +1623,14 @@ def repo_refresh(request: Request, fabric_host: str):
 
 @app.get("/repo/template")
 def repo_template(request: Request, fabric_host: str, template_name: str, repo_name: str, version: str):
+    fabric_host = validate_fabric_host(fabric_host)
+    template_name = validate_template_name(template_name)
+    version = validate_version(version)
+    # Validate repo_name
+    if not repo_name or not repo_name.strip():
+        raise HTTPException(400, "Repository name is required")
+    repo_name = repo_name.strip()
+    
     token = get_access_token_from_request(request, fabric_host)
     if not token:
         raise HTTPException(401, "Missing access_token in session or Authorization header")
@@ -1159,6 +1642,11 @@ def repo_template(request: Request, fabric_host: str, template_name: str, repo_n
 
 @app.post("/model/fabric")
 def model_fabric_create(request: Request, req: CreateFabricReq):
+    req.fabric_host = validate_fabric_host(req.fabric_host)
+    req.template_name = validate_template_name(req.template_name)
+    if req.version:
+        req.version = validate_version(req.version)
+    
     token = get_access_token_from_request(request, req.fabric_host)
     if not token:
         raise HTTPException(401, "Missing access_token in session or Authorization header")
@@ -1194,6 +1682,11 @@ def model_fabric_create(request: Request, req: CreateFabricReq):
 
 @app.post("/runtime/fabric/install")
 def model_fabric_install(request: Request, req: InstallFabricReq):
+    req.fabric_host = validate_fabric_host(req.fabric_host)
+    req.template_name = validate_template_name(req.template_name)
+    if req.version:
+        req.version = validate_version(req.version)
+    
     token = get_access_token_from_request(request, req.fabric_host)
     if not token:
         raise HTTPException(401, "Missing access_token in session or Authorization header")
@@ -1229,6 +1722,7 @@ def model_fabric_install(request: Request, req: InstallFabricReq):
 
 @app.get("/tasks/progress")
 def tasks_progress(request: Request, fabric_host: str):
+    fabric_host = validate_fabric_host(fabric_host)
     token = get_access_token_from_request(request, fabric_host)
     if not token:
         raise HTTPException(401, "Missing access_token in session or Authorization header")
@@ -1238,6 +1732,7 @@ def tasks_progress(request: Request, fabric_host: str):
 
 @app.get("/tasks/status")
 def tasks_status(request: Request, fabric_host: str):
+    fabric_host = validate_fabric_host(fabric_host)
     token = get_access_token_from_request(request, fabric_host)
     if not token:
         raise HTTPException(401, "Missing access_token in session or Authorization header")
@@ -1250,6 +1745,11 @@ def tasks_status(request: Request, fabric_host: str):
 @app.get("/tasks/errors")
 def tasks_errors(request: Request, fabric_host: str, limit: int = 20, fabric_name: Optional[str] = None, since_timestamp: Optional[str] = None):
     """Get recent task errors from the FabricStudio host"""
+    fabric_host = validate_fabric_host(fabric_host)
+    # Validate limit
+    if limit < 1 or limit > 1000:
+        raise HTTPException(400, "Limit must be between 1 and 1000")
+    
     token = get_access_token_from_request(request, fabric_host)
     if not token:
         raise HTTPException(401, "Missing access_token in session or Authorization header")
@@ -1553,7 +2053,9 @@ class CacheTemplatesReq(BaseModel):
 @app.post("/cache/templates")
 def cache_templates(req: CacheTemplatesReq):
     """Cache templates in the database - purges all existing templates and replaces with new ones"""
-    conn = sqlite3.connect(DB_PATH)
+    conn = db_connect_with_retry()
+    if not conn:
+        raise HTTPException(500, "Database connection failed")
     c = conn.cursor()
     
     try:
@@ -1580,7 +2082,7 @@ def cache_templates(req: CacheTemplatesReq):
                 ''', (repo_id, repo_name, template_id, template_name, version))
                 inserted_count += 1
             except sqlite3.Error as e:
-                print(f"Error inserting template {template_name}: {e}")
+                logger.error(f"Error inserting template {template_name}: {e}")
                 continue
         
         conn.commit()
@@ -1595,7 +2097,9 @@ def cache_templates(req: CacheTemplatesReq):
 @app.get("/cache/templates")
 def get_cached_templates():
     """Get all cached templates (independent of hosts)"""
-    conn = sqlite3.connect(DB_PATH)
+    conn = db_connect_with_retry()
+    if not conn:
+        raise HTTPException(500, "Database connection failed")
     c = conn.cursor()
     
     try:
@@ -1644,7 +2148,14 @@ def save_config(req: SaveConfigReq, request: Request):
     if not req.name or not req.name.strip():
         raise HTTPException(400, "Name is required")
     
-    conn = sqlite3.connect(DB_PATH)
+    # Validate host count limit
+    hosts = req.config_data.get('confirmedHosts', [])
+    if len(hosts) > MAX_HOSTS_PER_CONFIG:
+        raise HTTPException(400, f"Maximum {MAX_HOSTS_PER_CONFIG} hosts allowed per configuration")
+    
+    conn = db_connect_with_retry()
+    if not conn:
+        raise HTTPException(500, "Database connection failed")
     c = conn.cursor()
     
     try:
@@ -1693,7 +2204,9 @@ def save_config(req: SaveConfigReq, request: Request):
 @app.get("/config/list")
 def list_configs():
     """List all saved configurations"""
-    conn = sqlite3.connect(DB_PATH)
+    conn = db_connect_with_retry()
+    if not conn:
+        raise HTTPException(500, "Database connection failed")
     c = conn.cursor()
     
     try:
@@ -1714,8 +2227,8 @@ def list_configs():
                 for row in rows
             ]
         }
-    except sqlite3.Error as e:
-        raise HTTPException(500, f"Database error: {str(e)}")
+    except Exception as e:
+        raise HTTPException(500, f"Error listing configurations: {str(e)}")
     finally:
         conn.close()
 
@@ -1723,7 +2236,9 @@ def list_configs():
 @app.get("/config/get/{config_id}")
 def get_config(config_id: int):
     """Retrieve a configuration by ID"""
-    conn = sqlite3.connect(DB_PATH)
+    conn = db_connect_with_retry()
+    if not conn:
+        raise HTTPException(500, "Database connection failed")
     c = conn.cursor()
     
     try:
@@ -1755,7 +2270,9 @@ def get_config(config_id: int):
 @app.delete("/config/delete/{config_id}")
 def delete_config(config_id: int, request: Request):
     """Delete a configuration by ID"""
-    conn = sqlite3.connect(DB_PATH)
+    conn = db_connect_with_retry()
+    if not conn:
+        raise HTTPException(500, "Database connection failed")
     c = conn.cursor()
     
     try:
@@ -1835,7 +2352,9 @@ def save_event(req: CreateEventReq, request: Request):
     except ValueError as e:
         raise HTTPException(400, f"Invalid date/time format: {str(e)}")
     
-    conn = sqlite3.connect(DB_PATH)
+    conn = db_connect_with_retry()
+    if not conn:
+        raise HTTPException(500, "Database connection failed")
     c = conn.cursor()
     
     try:
@@ -1917,7 +2436,9 @@ def save_event(req: CreateEventReq, request: Request):
 @app.get("/event/list")
 def list_events():
     """List all event schedules"""
-    conn = sqlite3.connect(DB_PATH)
+    conn = db_connect_with_retry()
+    if not conn:
+        raise HTTPException(500, "Database connection failed")
     c = conn.cursor()
     
     try:
@@ -1957,7 +2478,7 @@ def list_events():
     except Exception as e:
         import traceback
         error_detail = traceback.format_exc()
-        print(f"Error in list_events: {error_detail}")
+        logger.error(f"Error in list_events: {error_detail}")
         raise HTTPException(500, f"Error listing events: {str(e)}")
     finally:
         conn.close()
@@ -1966,7 +2487,9 @@ def list_events():
 @app.get("/event/get/{event_id}")
 def get_event(event_id: int):
     """Retrieve an event by ID"""
-    conn = sqlite3.connect(DB_PATH)
+    conn = db_connect_with_retry()
+    if not conn:
+        raise HTTPException(500, "Database connection failed")
     c = conn.cursor()
     
     try:
@@ -2009,7 +2532,9 @@ def get_event(event_id: int):
 @app.delete("/event/delete/{event_id}")
 def delete_event(event_id: int, request: Request):
     """Delete an event by ID"""
-    conn = sqlite3.connect(DB_PATH)
+    conn = db_connect_with_retry()
+    if not conn:
+        raise HTTPException(500, "Database connection failed")
     c = conn.cursor()
     
     try:
@@ -2038,7 +2563,9 @@ def delete_event(event_id: int, request: Request):
 @app.get("/event/executions/{event_id}")
 def get_event_executions(event_id: int):
     """Get all execution records for an event"""
-    conn = sqlite3.connect(DB_PATH)
+    conn = db_connect_with_retry()
+    if not conn:
+        raise HTTPException(500, "Database connection failed")
     c = conn.cursor()
     
     try:
@@ -2097,7 +2624,9 @@ def get_event_executions(event_id: int):
 @app.get("/run/reports")
 def list_manual_runs():
     """List all manual run reports"""
-    conn = sqlite3.connect(DB_PATH)
+    conn = db_connect_with_retry()
+    if not conn:
+        raise HTTPException(500, "Database connection failed")
     c = conn.cursor()
     
     try:
@@ -2141,7 +2670,9 @@ def list_manual_runs():
 @app.get("/run/reports/{run_id}")
 def get_manual_run_report(run_id: int):
     """Get detailed report for a manual run"""
-    conn = sqlite3.connect(DB_PATH)
+    conn = db_connect_with_retry()
+    if not conn:
+        raise HTTPException(500, "Database connection failed")
     c = conn.cursor()
     
     try:
@@ -2180,7 +2711,9 @@ def create_manual_run(req: dict):
     """Create a manual run record"""
     try:
         configuration_name = req.get('configuration_name', 'Manual Run')
-        conn = sqlite3.connect(DB_PATH)
+        conn = db_connect_with_retry()
+        if not conn:
+            raise HTTPException(500, "Database connection failed")
         c = conn.cursor()
         try:
             started_at = datetime.now(timezone.utc).isoformat()
@@ -2208,7 +2741,9 @@ def update_manual_run(run_id: int, req: dict):
         errors = req.get('errors', [])
         execution_details = req.get('execution_details', {})
         
-        conn = sqlite3.connect(DB_PATH)
+        conn = db_connect_with_retry()
+        if not conn:
+            raise HTTPException(500, "Database connection failed")
         c = conn.cursor()
         try:
             completed_at = datetime.now(timezone.utc).isoformat() if status in ['success', 'error'] else None
@@ -2254,7 +2789,9 @@ def execute_run(req: dict, request: Request):
 @app.post("/event/execute/{event_id}")
 def execute_event(event_id: int, background_tasks: BackgroundTasks):
     """Execute an event's configuration automatically"""
-    conn = sqlite3.connect(DB_PATH)
+    conn = db_connect_with_retry()
+    if not conn:
+        raise HTTPException(500, "Database connection failed")
     c = conn.cursor()
     
     try:
@@ -2298,69 +2835,76 @@ def run_configuration(config_data: dict, event_name: str, event_id: Optional[int
         # Create execution record in database
         is_manual_run = (event_id is None)
         if event_id is not None:
-            conn = sqlite3.connect(DB_PATH)
-            c = conn.cursor()
-            try:
-                c.execute('''
-                    INSERT INTO event_executions (event_id, status, started_at)
-                    VALUES (?, ?, ?)
-                ''', (event_id, 'running', started_at.isoformat()))
-                execution_record_id = c.lastrowid
-                conn.commit()
-                # Audit: event run started
+            conn = db_connect_with_retry()
+            if not conn:
+                logger.error(f"Failed to connect to database for execution record creation")
+            else:
+                c = conn.cursor()
                 try:
-                    log_audit(
-                        "event_run_started",
-                        details=f"event_id={event_id} event_name={event_name}",
-                        ip_address=None
-                    )
-                except Exception:
-                    pass
-            except sqlite3.Error as e:
-                logger.error(f"Failed to create execution record: {e}")
-            finally:
-                conn.close()
+                    c.execute('''
+                        INSERT INTO event_executions (event_id, status, started_at)
+                        VALUES (?, ?, ?)
+                    ''', (event_id, 'running', started_at.isoformat()))
+                    execution_record_id = c.lastrowid
+                    conn.commit()
+                    # Audit: event run started
+                    try:
+                        log_audit(
+                            "event_run_started",
+                            details=f"event_id={event_id} event_name={event_name}",
+                            ip_address=None
+                        )
+                    except Exception:
+                        pass
+                except sqlite3.Error as e:
+                    logger.error(f"Failed to create execution record: {e}")
+                finally:
+                    conn.close()
         elif is_manual_run:
             # Create manual run record
             configuration_name = config_data.get('configName', 'Manual Run')
-            conn = sqlite3.connect(DB_PATH)
-            c = conn.cursor()
-            try:
-                c.execute('''
-                    INSERT INTO manual_runs (configuration_name, status, started_at)
-                    VALUES (?, ?, ?)
-                ''', (configuration_name, 'running', started_at.isoformat()))
-                execution_record_id = c.lastrowid
-                conn.commit()
-            except sqlite3.Error as e:
-                logger.error(f"Failed to create manual run record: {e}")
-            finally:
-                conn.close()
+            conn = db_connect_with_retry()
+            if not conn:
+                logger.error(f"Failed to connect to database for manual run record creation")
+            else:
+                c = conn.cursor()
+                try:
+                    c.execute('''
+                        INSERT INTO manual_runs (configuration_name, status, started_at)
+                        VALUES (?, ?, ?)
+                    ''', (configuration_name, 'running', started_at.isoformat()))
+                    execution_record_id = c.lastrowid
+                    conn.commit()
+                except sqlite3.Error as e:
+                    logger.error(f"Failed to create manual run record: {e}")
+                finally:
+                    conn.close()
         # Extract configuration data
         hosts = config_data.get('confirmedHosts', [])
         if not hosts:
             logger.warning(f"No hosts configured for event {event_name}")
             completed_at = datetime.now(timezone.utc)
             if execution_record_id is not None:
-                conn = sqlite3.connect(DB_PATH)
-                c = conn.cursor()
-                try:
-                    c.execute('''
-                        UPDATE event_executions
-                        SET status = ?, message = ?, errors = ?, completed_at = ?
-                        WHERE id = ?
-                    ''', (
-                        'error',
-                        "No hosts configured",
-                        json.dumps(["No hosts configured"]),
-                        completed_at.isoformat(),
-                        execution_record_id
-                    ))
-                    conn.commit()
-                except sqlite3.Error as e:
-                    logger.error(f"Failed to update execution record: {e}")
-                finally:
-                    conn.close()
+                conn = db_connect_with_retry()
+                if conn:
+                    c = conn.cursor()
+                    try:
+                        c.execute('''
+                            UPDATE event_executions
+                            SET status = ?, message = ?, errors = ?, completed_at = ?
+                            WHERE id = ?
+                        ''', (
+                            'error',
+                            "No hosts configured",
+                            json.dumps(["No hosts configured"]),
+                            completed_at.isoformat(),
+                            execution_record_id
+                        ))
+                        conn.commit()
+                    except sqlite3.Error as e:
+                        logger.error(f"Failed to update execution record: {e}")
+                    finally:
+                        conn.close()
             return {"status": "error", "message": "No hosts configured", "errors": ["No hosts configured"], "event": event_name}
         
         client_id = config_data.get('clientId', '')
@@ -2375,38 +2919,39 @@ def run_configuration(config_data: dict, event_name: str, event_id: Optional[int
         # 2) For manual runs: from provided nhiCredentialId + nhiDecryptPassword
         if not client_secret:
             try:
-                conn = sqlite3.connect(DB_PATH)
-                c = conn.cursor()
-                if event_id is not None:
-                    # Get stored password and related credential id for event
-                    c.execute('SELECT nhi_credential_id, password_encrypted FROM event_nhi_passwords WHERE event_id = ?', (event_id,))
-                    row = c.fetchone()
-                    if row:
-                        nhi_cred_id, pwd_enc = row
-                        nhi_password = decrypt_with_server_secret(pwd_enc)
-                        # Fetch encrypted client secret and client_id
-                        c.execute('SELECT client_id, client_secret_encrypted FROM nhi_credentials WHERE id = ?', (nhi_cred_id,))
-                        cred = c.fetchone()
-                        if cred:
-                            client_id_db, client_secret_encrypted = cred
-                            if not client_id:
-                                client_id = client_id_db or client_id
-                            if client_secret_encrypted:
-                                client_secret = decrypt_client_secret(client_secret_encrypted, nhi_password)
-                else:
-                    # Manual run: accept NHI credential + decrypt password from payload
-                    nhi_cred_id_payload = config_data.get('nhiCredentialId')
-                    nhi_decrypt_password = config_data.get('nhiDecryptPassword')
-                    if nhi_cred_id_payload and nhi_decrypt_password:
-                        c.execute('SELECT client_id, client_secret_encrypted FROM nhi_credentials WHERE id = ?', (int(nhi_cred_id_payload),))
-                        cred = c.fetchone()
-                        if cred:
-                            client_id_db, client_secret_encrypted = cred
-                            if not client_id:
-                                client_id = client_id_db or client_id
-                            if client_secret_encrypted:
-                                client_secret = decrypt_client_secret(client_secret_encrypted, nhi_decrypt_password)
-                conn.close()
+                conn = db_connect_with_retry()
+                if conn:
+                    c = conn.cursor()
+                    if event_id is not None:
+                        # Get stored password and related credential id for event
+                        c.execute('SELECT nhi_credential_id, password_encrypted FROM event_nhi_passwords WHERE event_id = ?', (event_id,))
+                        row = c.fetchone()
+                        if row:
+                            nhi_cred_id, pwd_enc = row
+                            nhi_password = decrypt_with_server_secret(pwd_enc)
+                            # Fetch encrypted client secret and client_id
+                            c.execute('SELECT client_id, client_secret_encrypted FROM nhi_credentials WHERE id = ?', (nhi_cred_id,))
+                            cred = c.fetchone()
+                            if cred:
+                                client_id_db, client_secret_encrypted = cred
+                                if not client_id:
+                                    client_id = client_id_db or client_id
+                                if client_secret_encrypted:
+                                    client_secret = decrypt_client_secret(client_secret_encrypted, nhi_password)
+                    else:
+                        # Manual run: accept NHI credential + decrypt password from payload
+                        nhi_cred_id_payload = config_data.get('nhiCredentialId')
+                        nhi_decrypt_password = config_data.get('nhiDecryptPassword')
+                        if nhi_cred_id_payload and nhi_decrypt_password:
+                            c.execute('SELECT client_id, client_secret_encrypted FROM nhi_credentials WHERE id = ?', (int(nhi_cred_id_payload),))
+                            cred = c.fetchone()
+                            if cred:
+                                client_id_db, client_secret_encrypted = cred
+                                if not client_id:
+                                    client_id = client_id_db or client_id
+                                if client_secret_encrypted:
+                                    client_secret = decrypt_client_secret(client_secret_encrypted, nhi_decrypt_password)
+                    conn.close()
             except Exception as e:
                 logger.error(f"Event '{event_name}': Failed to retrieve/decrypt client secret: {e}", exc_info=True)
 
@@ -2418,14 +2963,15 @@ def run_configuration(config_data: dict, event_name: str, event_id: Optional[int
         nhi_password = None
         if event_id is not None:
             try:
-                conn = sqlite3.connect(DB_PATH)
-                c = conn.cursor()
-                c.execute('SELECT nhi_credential_id, password_encrypted FROM event_nhi_passwords WHERE event_id = ?', (event_id,))
-                nhi_row = c.fetchone()
-                if nhi_row:
-                    nhi_cred_id = nhi_row[0]
-                    nhi_password = decrypt_with_server_secret(nhi_row[1])
-                conn.close()
+                conn = db_connect_with_retry()
+                if conn:
+                    c = conn.cursor()
+                    c.execute('SELECT nhi_credential_id, password_encrypted FROM event_nhi_passwords WHERE event_id = ?', (event_id,))
+                    nhi_row = c.fetchone()
+                    if nhi_row:
+                        nhi_cred_id = nhi_row[0]
+                        nhi_password = decrypt_with_server_secret(nhi_row[1])
+                    conn.close()
             except Exception as e:
                 logger.warning(f"Event '{event_name}': Could not retrieve NHI credential info: {e}")
         
@@ -2436,24 +2982,25 @@ def run_configuration(config_data: dict, event_name: str, event_id: Optional[int
             # First, try to reuse stored token from NHI credential if available
             if nhi_cred_id and nhi_password:
                 try:
-                    conn = sqlite3.connect(DB_PATH)
-                    c = conn.cursor()
-                    c.execute('SELECT token_encrypted, token_expires_at FROM nhi_tokens WHERE nhi_credential_id = ? AND fabric_host = ?', (nhi_cred_id, host))
-                    token_row = c.fetchone()
-                    if token_row:
-                        token_encrypted, token_expires_at_str = token_row
-                        if token_expires_at_str:
-                            expires_at = datetime.fromisoformat(token_expires_at_str)
-                            now = datetime.now()
-                            if expires_at > now:
-                                # Token is still valid, reuse it
-                                decrypted_token = decrypt_client_secret(token_encrypted, nhi_password)
-                                host_tokens[host] = decrypted_token
-                                delta = expires_at - now
-                                hours = int(delta.total_seconds() // 3600)
-                                minutes = int((delta.total_seconds() % 3600) // 60)
-                                token_fetched = True
-                    conn.close()
+                    conn = db_connect_with_retry()
+                    if conn:
+                        c = conn.cursor()
+                        c.execute('SELECT token_encrypted, token_expires_at FROM nhi_tokens WHERE nhi_credential_id = ? AND fabric_host = ?', (nhi_cred_id, host))
+                        token_row = c.fetchone()
+                        if token_row:
+                            token_encrypted, token_expires_at_str = token_row
+                            if token_expires_at_str:
+                                expires_at = datetime.fromisoformat(token_expires_at_str)
+                                now = datetime.now()
+                                if expires_at > now:
+                                    # Token is still valid, reuse it
+                                    decrypted_token = decrypt_client_secret(token_encrypted, nhi_password)
+                                    host_tokens[host] = decrypted_token
+                                    delta = expires_at - now
+                                    hours = int(delta.total_seconds() // 3600)
+                                    minutes = int((delta.total_seconds() % 3600) // 60)
+                                    token_fetched = True
+                        conn.close()
                 except Exception as e:
                     logger.warning(f"Event '{event_name}': Error checking stored token for {host}: {e}, will fetch new token")
             
@@ -2473,15 +3020,16 @@ def run_configuration(config_data: dict, event_name: str, event_id: Optional[int
                                     token_expires_at = expires_at.isoformat()
                                     token_encrypted = encrypt_client_secret(token_data.get("access_token"), nhi_password)
                                     
-                                    conn = sqlite3.connect(DB_PATH)
-                                    c = conn.cursor()
-                                    c.execute('''
-                                        INSERT OR REPLACE INTO nhi_tokens 
-                                        (nhi_credential_id, fabric_host, token_encrypted, token_expires_at, updated_at)
-                                        VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
-                                    ''', (nhi_cred_id, host, token_encrypted, token_expires_at))
-                                    conn.commit()
-                                    conn.close()
+                                    conn = db_connect_with_retry()
+                                    if conn:
+                                        c = conn.cursor()
+                                        c.execute('''
+                                            INSERT OR REPLACE INTO nhi_tokens 
+                                            (nhi_credential_id, fabric_host, token_encrypted, token_expires_at, updated_at)
+                                            VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+                                        ''', (nhi_cred_id, host, token_encrypted, token_expires_at))
+                                        conn.commit()
+                                        conn.close()
                             except Exception as e:
                                 logger.warning(f"Event '{event_name}': Failed to store token for {host}: {e}")
                     else:
@@ -2490,7 +3038,35 @@ def run_configuration(config_data: dict, event_name: str, event_id: Optional[int
                         errors.append(msg)
                         completed_at = datetime.now(timezone.utc)
                         if execution_record_id is not None:
-                            conn = sqlite3.connect(DB_PATH)
+                            conn = db_connect_with_retry()
+                            if conn:
+                                c = conn.cursor()
+                                try:
+                                    c.execute('''
+                                        UPDATE event_executions
+                                        SET status = ?, message = ?, errors = ?, completed_at = ?
+                                        WHERE id = ?
+                                    ''', (
+                                        'error',
+                                        msg,
+                                        json.dumps(errors),
+                                        completed_at.isoformat(),
+                                        execution_record_id
+                                    ))
+                                    conn.commit()
+                                except sqlite3.Error as db_err:
+                                    logger.error(f"Failed to update execution record: {db_err}")
+                                finally:
+                                    conn.close()
+                        return {"status": "error", "message": msg, "errors": errors, "event": event_name}
+                except Exception as e:
+                    msg = f"Error acquiring token for host {host}: {e}"
+                    logger.error(f"Event '{event_name}': {msg}")
+                    errors.append(msg)
+                    completed_at = datetime.now(timezone.utc)
+                    if execution_record_id is not None:
+                        conn = db_connect_with_retry()
+                        if conn:
                             c = conn.cursor()
                             try:
                                 c.execute('''
@@ -2509,35 +3085,50 @@ def run_configuration(config_data: dict, event_name: str, event_id: Optional[int
                                 logger.error(f"Failed to update execution record: {db_err}")
                             finally:
                                 conn.close()
-                        return {"status": "error", "message": msg, "errors": errors, "event": event_name}
-                except Exception as e:
-                    msg = f"Error acquiring token for host {host}: {e}"
-                    logger.error(f"Event '{event_name}': {msg}")
-                    errors.append(msg)
-                    completed_at = datetime.now(timezone.utc)
-                    if execution_record_id is not None:
-                        conn = sqlite3.connect(DB_PATH)
-                        c = conn.cursor()
-                        try:
-                            c.execute('''
-                                UPDATE event_executions
-                                SET status = ?, message = ?, errors = ?, completed_at = ?
-                                WHERE id = ?
-                            ''', (
-                                'error',
-                                msg,
-                                json.dumps(errors),
-                                completed_at.isoformat(),
-                                execution_record_id
-                            ))
-                            conn.commit()
-                        except sqlite3.Error as db_err:
-                            logger.error(f"Failed to update execution record: {db_err}")
-                        finally:
-                            conn.close()
                     return {"status": "error", "message": msg, "errors": errors, "event": event_name}
         
         # Step 2: Execute preparation steps
+        
+        # Initialize caches for repository IDs and template IDs to avoid repeated API calls
+        repo_id_cache = {}  # Format: {host: {repo_name: repo_id}}
+        template_id_cache = {}  # Format: {host: {(template_name, repo_name, version): template_id}}
+        
+        # Helper function to get cached repository ID
+        def get_cached_repo_id(host, repo_name):
+            if host not in repo_id_cache:
+                repo_id_cache[host] = {}
+            if repo_name not in repo_id_cache[host]:
+                repo_id = get_repositoryId(host, host_tokens[host], repo_name)
+                if repo_id:
+                    repo_id_cache[host][repo_name] = repo_id
+                else:
+                    return None
+            return repo_id_cache[host].get(repo_name)
+        
+        # Helper function to get cached template ID
+        def get_cached_template_id(host, template_name, repo_name, version):
+            cache_key = (template_name, repo_name, version)
+            if host not in template_id_cache:
+                template_id_cache[host] = {}
+            if cache_key not in template_id_cache[host]:
+                # First ensure repo_id is cached
+                repo_id = get_cached_repo_id(host, repo_name)
+                if not repo_id:
+                    return None
+                # Get template ID using cached repo_id
+                items = list_templates_for_repo(host, host_tokens[host], repo_id)
+                t_norm = (template_name or "").strip().lower()
+                v_norm = (version or "").strip()
+                for item in items:
+                    name_norm = (item.get('name') or "").strip().lower()
+                    ver_val = (item.get('version') or "").strip()
+                    if name_norm == t_norm and ver_val == v_norm:
+                        template_id = item.get('id')
+                        template_id_cache[host][cache_key] = template_id
+                        logger.info(f"Event '{event_name}': Cached template '{template_name}' (version={version}) -> id {template_id} on host {host}")
+                        return template_id
+                return None
+            return template_id_cache[host].get(cache_key)
         
         # Refresh repositories
         for host in host_tokens.keys():
@@ -2606,8 +3197,10 @@ def run_configuration(config_data: dict, event_name: str, event_id: Optional[int
                 if not (template_name and repo_name and version):
                     continue
                 
-                # Check for running tasks before creating
+                # Check for running tasks before creating (only if there are actually running tasks)
                 for host in host_tokens.keys():
+                    if host in failed_hosts:
+                        continue
                     try:
                         running_count = get_running_task_count(host, host_tokens[host])
                         if running_count > 0:
@@ -2624,8 +3217,8 @@ def run_configuration(config_data: dict, event_name: str, event_id: Optional[int
                         continue
                     
                     try:
-                        # Get template ID
-                        template_id = get_template(host, host_tokens[host], template_name, repo_name, version)
+                        # Get template ID using cache
+                        template_id = get_cached_template_id(host, template_name, repo_name, version)
                         if template_id:
                             # Create fabric (pass template name and version per API signature)
                             fabric_create_start = datetime.now(timezone.utc)
@@ -2681,16 +3274,20 @@ def run_configuration(config_data: dict, event_name: str, event_id: Optional[int
                         logger.error(f"Event '{event_name}': {msg}")
                         errors.append(msg)
                 
-                # Wait for tasks to complete after each template
+                # Wait for tasks to complete after each template (only check if there are running tasks)
                 for host in host_tokens.keys():
+                    if host in failed_hosts:
+                        continue
                     try:
-                        result = check_tasks(host, host_tokens[host], display_progress=False)
-                        if result is not None:
-                            elapsed_time, success = result if isinstance(result, tuple) else (result, True)
-                            if not success:
-                                msg = f"Timed out waiting for tasks on host {host} after template creation"
-                                logger.warning(f"Event '{event_name}': {msg}")
-                                errors.append(msg)
+                        running_count = get_running_task_count(host, host_tokens[host])
+                        if running_count > 0:
+                            result = check_tasks(host, host_tokens[host], display_progress=False)
+                            if result is not None:
+                                elapsed_time, success = result if isinstance(result, tuple) else (result, True)
+                                if not success:
+                                    msg = f"Timed out waiting for tasks on host {host} after template creation"
+                                    logger.warning(f"Event '{event_name}': {msg}")
+                                    errors.append(msg)
                     except Exception as e:
                         msg = f"Error waiting for tasks on host {host}: {e}"
                         logger.warning(f"Event '{event_name}': {msg}")
@@ -2712,171 +3309,180 @@ def run_configuration(config_data: dict, event_name: str, event_id: Optional[int
         if ssh_profile_id:
             # Execute SSH profiles before Install Workspace
             try:
-                conn = sqlite3.connect(DB_PATH)
-                c = conn.cursor()
-                
-                try:
-                    # Get SSH profile
-                    logger.info(f"Event '{event_name}': Loading SSH profile with id {ssh_profile_id}")
-                    c.execute('''
-                        SELECT name, commands, ssh_key_id
-                        FROM ssh_command_profiles
-                        WHERE id = ?
-                    ''', (ssh_profile_id,))
-                    profile_row = c.fetchone()
+                conn = db_connect_with_retry()
+                if not conn:
+                    logger.error(f"Event '{event_name}': Failed to connect to database for SSH profile loading")
+                else:
+                    c = conn.cursor()
                     
-                    if profile_row:
-                        profile_name = profile_row[0]
-                        commands = profile_row[1]
-                        ssh_key_id = profile_row[2]
-                        logger.info(f"Event '{event_name}': SSH profile '{profile_name}' loaded, ssh_key_id={ssh_key_id}")
+                    try:
+                        # Get SSH profile
+                        logger.info(f"Event '{event_name}': Loading SSH profile with id {ssh_profile_id}")
+                        c.execute('''
+                            SELECT name, commands, ssh_key_id
+                            FROM ssh_command_profiles
+                            WHERE id = ?
+                        ''', (ssh_profile_id,))
+                        profile_row = c.fetchone()
                         
-                        # Initialize SSH execution tracking
-                        ssh_execution_details = {
-                            "profile_id": ssh_profile_id,
-                            "profile_name": profile_name,
-                            "wait_time_seconds": ssh_wait_time,
-                            "commands": [cmd.strip() for cmd in commands.split('\n') if cmd.strip()],
-                            "hosts": []
-                        }
-                        
-                        if ssh_key_id:
-                            # Get SSH key
-                            c.execute('''
-                                SELECT private_key_encrypted
-                                FROM ssh_keys
-                                WHERE id = ?
-                            ''', (ssh_key_id,))
-                            key_row = c.fetchone()
+                        if profile_row:
+                            profile_name = profile_row[0]
+                            commands = profile_row[1]
+                            ssh_key_id = profile_row[2]
+                            logger.info(f"Event '{event_name}': SSH profile '{profile_name}' loaded, ssh_key_id={ssh_key_id}")
                             
-                            if key_row:
-                                encrypted_private_key = key_row[0]
-                                # Get encryption password from event_nhi_passwords if available (for scheduled events)
-                                # or from config_data.nhiDecryptPassword (for manual runs)
-                                encryption_password = None
-                                if event_id:
-                                    c.execute('''
-                                        SELECT password_encrypted
-                                        FROM event_nhi_passwords
-                                        WHERE event_id = ?
-                                    ''', (event_id,))
-                                    pwd_row = c.fetchone()
-                                    if pwd_row:
-                                        encryption_password = decrypt_with_server_secret(pwd_row[0])
-                                elif is_manual_run:
-                                    # For manual runs, use the decrypt password from config_data
-                                    encryption_password = config_data.get('nhiDecryptPassword')
-                                    if not encryption_password:
-                                        logger.warning(f"Event '{event_name}': nhiDecryptPassword not found in config_data for manual run")
-                                    else:
-                                        logger.info(f"Event '{event_name}': Using nhiDecryptPassword from config_data for SSH key decryption")
+                            # Initialize SSH execution tracking
+                            ssh_execution_details = {
+                                "profile_id": ssh_profile_id,
+                                "profile_name": profile_name,
+                                "wait_time_seconds": ssh_wait_time,
+                                "commands": [cmd.strip() for cmd in commands.split('\n') if cmd.strip()],
+                                "hosts": []
+                            }
+                            
+                            if ssh_key_id:
+                                # Get SSH key
+                                c.execute('''
+                                    SELECT private_key_encrypted
+                                    FROM ssh_keys
+                                    WHERE id = ?
+                                ''', (ssh_key_id,))
+                                key_row = c.fetchone()
                                 
-                                if encryption_password:
-                                    logger.info(f"Event '{event_name}': Decrypting SSH key and executing commands")
-                                    try:
-                                        private_key = decrypt_client_secret(encrypted_private_key, encryption_password)
-                                        
-                                        # Execute SSH commands on each host (skip failed hosts)
-                                        for host in host_tokens.keys():
-                                            # Skip hosts that failed during template creation
-                                            if host in failed_hosts:
-                                                logger.info(f"Event '{event_name}': Skipping SSH execution on failed host {host}")
-                                                continue
+                                if key_row:
+                                    encrypted_private_key = key_row[0]
+                                    # Get encryption password from event_nhi_passwords if available (for scheduled events)
+                                    # or from config_data.nhiDecryptPassword (for manual runs)
+                                    encryption_password = None
+                                    if event_id:
+                                        c.execute('''
+                                            SELECT password_encrypted
+                                            FROM event_nhi_passwords
+                                            WHERE event_id = ?
+                                        ''', (event_id,))
+                                        pwd_row = c.fetchone()
+                                        if pwd_row:
+                                            encryption_password = decrypt_with_server_secret(pwd_row[0])
+                                    elif is_manual_run:
+                                        # For manual runs, use the decrypt password from config_data
+                                        encryption_password = config_data.get('nhiDecryptPassword')
+                                        if not encryption_password:
+                                            logger.warning(f"Event '{event_name}': nhiDecryptPassword not found in config_data for manual run")
+                                        else:
+                                            logger.info(f"Event '{event_name}': Using nhiDecryptPassword from config_data for SSH key decryption")
+                                    
+                                    if encryption_password:
+                                        logger.info(f"Event '{event_name}': Decrypting SSH key and executing commands")
+                                        try:
+                                            private_key = decrypt_client_secret(encrypted_private_key, encryption_password)
                                             
-                                            host_result = {
-                                                "host": host,
-                                                "success": False,
-                                                "commands_executed": 0,
-                                                "commands_failed": 0,
-                                                "error": None
-                                            }
-                                            try:
-                                                # Parse commands
-                                                command_list = [cmd.strip() for cmd in commands.split('\n') if cmd.strip()]
+                                            # Execute SSH commands on each host (skip failed hosts)
+                                            for host in host_tokens.keys():
+                                                # Skip hosts that failed during template creation
+                                                if host in failed_hosts:
+                                                    logger.info(f"Event '{event_name}': Skipping SSH execution on failed host {host}")
+                                                    continue
                                                 
-                                                if command_list:
-                                                    ssh_client = paramiko.SSHClient()
-                                                    ssh_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+                                                host_result = {
+                                                    "host": host,
+                                                    "success": False,
+                                                    "commands_executed": 0,
+                                                    "commands_failed": 0,
+                                                    "error": None
+                                                }
+                                                try:
+                                                    # Parse commands
+                                                    command_list = [cmd.strip() for cmd in commands.split('\n') if cmd.strip()]
                                                     
-                                                    try:
-                                                        # Try different key formats
-                                                        private_key_obj = None
+                                                    if command_list:
+                                                        ssh_client = paramiko.SSHClient()
+                                                        ssh_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+                                                        
                                                         try:
-                                                            private_key_obj = paramiko.RSAKey.from_private_key(io.StringIO(private_key))
-                                                        except:
+                                                            # Try different key formats
+                                                            private_key_obj = None
                                                             try:
-                                                                private_key_obj = paramiko.Ed25519Key.from_private_key(io.StringIO(private_key))
+                                                                private_key_obj = paramiko.RSAKey.from_private_key(io.StringIO(private_key))
                                                             except:
                                                                 try:
-                                                                    private_key_obj = paramiko.DSSKey.from_private_key(io.StringIO(private_key))
+                                                                    private_key_obj = paramiko.Ed25519Key.from_private_key(io.StringIO(private_key))
                                                                 except:
                                                                     try:
-                                                                        private_key_obj = paramiko.ECDSAKey.from_private_key(io.StringIO(private_key))
+                                                                        private_key_obj = paramiko.DSSKey.from_private_key(io.StringIO(private_key))
                                                                     except:
-                                                                        private_key_obj = paramiko.ssh_private_key_from_string(private_key)
-                                                        
-                                                        if private_key_obj:
-                                                            ssh_client.connect(
-                                                                hostname=host,
-                                                                port=22,
-                                                                username='admin',
-                                                                pkey=private_key_obj,
-                                                                timeout=30,
-                                                                look_for_keys=False,
-                                                                allow_agent=False
-                                                            )
+                                                                        try:
+                                                                            private_key_obj = paramiko.ECDSAKey.from_private_key(io.StringIO(private_key))
+                                                                        except:
+                                                                            private_key_obj = paramiko.ssh_private_key_from_string(private_key)
                                                             
-                                                            # Execute commands
-                                                            for cmd in command_list:
-                                                                stdin, stdout, stderr = ssh_client.exec_command(cmd, timeout=300)
-                                                                exit_status = stdout.channel.recv_exit_status()
-                                                                stdout_text = stdout.read().decode('utf-8', errors='replace')
-                                                                stderr_text = stderr.read().decode('utf-8', errors='replace')
+                                                            if private_key_obj:
+                                                                ssh_client.connect(
+                                                                    hostname=host,
+                                                                    port=22,
+                                                                    username='admin',
+                                                                    pkey=private_key_obj,
+                                                                    timeout=30,
+                                                                    look_for_keys=False,
+                                                                    allow_agent=False
+                                                                )
                                                                 
-                                                                host_result["commands_executed"] += 1
-                                                                
-                                                                if exit_status != 0:
-                                                                    host_result["commands_failed"] += 1
-                                                                    msg = f"SSH command '{cmd}' on {host} exited with status {exit_status}"
-                                                                    logger.warning(f"Event '{event_name}': {msg}")
-                                                                    errors.append(msg)
-                                                                
-                                                                # Check for error indicators
-                                                                output_lower = (stdout_text + stderr_text).lower()
-                                                                error_indicators = ['error', 'failed', 'failure', 'exception', 'cannot', 'unable', 'denied']
-                                                                if any(indicator in output_lower for indicator in error_indicators):
-                                                                    if exit_status == 0:
-                                                                        msg = f"Warning: Potential error detected in SSH command '{cmd}' output on {host}"
+                                                                # Execute commands
+                                                                for cmd in command_list:
+                                                                    stdin, stdout, stderr = ssh_client.exec_command(cmd, timeout=300)
+                                                                    exit_status = stdout.channel.recv_exit_status()
+                                                                    stdout_text = stdout.read().decode('utf-8', errors='replace')
+                                                                    stderr_text = stderr.read().decode('utf-8', errors='replace')
+                                                                    
+                                                                    host_result["commands_executed"] += 1
+                                                                    
+                                                                    if exit_status != 0:
+                                                                        host_result["commands_failed"] += 1
+                                                                        msg = f"SSH command '{cmd}' on {host} exited with status {exit_status}"
                                                                         logger.warning(f"Event '{event_name}': {msg}")
                                                                         errors.append(msg)
+                                                                    
+                                                                    # Check for error indicators
+                                                                    output_lower = (stdout_text + stderr_text).lower()
+                                                                    error_indicators = ['error', 'failed', 'failure', 'exception', 'cannot', 'unable', 'denied']
+                                                                    if any(indicator in output_lower for indicator in error_indicators):
+                                                                        if exit_status == 0:
+                                                                            msg = f"Warning: Potential error detected in SSH command '{cmd}' output on {host}"
+                                                                            logger.warning(f"Event '{event_name}': {msg}")
+                                                                            errors.append(msg)
+                                                                    
+                                                                    # Wait after each command (including the last one)
+                                                                    if ssh_wait_time > 0:
+                                                                        time.sleep(ssh_wait_time)
                                                                 
-                                                                # Wait after each command (including the last one)
-                                                                if ssh_wait_time > 0:
-                                                                    time.sleep(ssh_wait_time)
-                                                            
-                                                            host_result["success"] = host_result["commands_failed"] == 0
-                                                            if host_result["success"]:
-                                                                logger.info(f"Event '{event_name}': SSH commands executed successfully on {host}")
-                                                            else:
-                                                                logger.warning(f"Event '{event_name}': SSH commands failed on {host}: {host_result['commands_failed']} command(s) failed")
-                                                    except Exception as e:
-                                                        msg = f"Error executing SSH commands on {host}: {e}"
-                                                        host_result["error"] = str(e)
-                                                        logger.error(f"Event '{event_name}': {msg}")
-                                                        errors.append(msg)
-                                                    finally:
-                                                        ssh_client.close()
-                                            except Exception as e:
-                                                msg = f"Error connecting via SSH to {host}: {e}"
-                                                host_result["error"] = str(e)
-                                                logger.error(f"Event '{event_name}': {msg}")
-                                                errors.append(msg)
-                                            
-                                            ssh_execution_details["hosts"].append(host_result)
-                                    except ValueError as e:
-                                        msg = f"Failed to decrypt SSH key: {e}"
-                                        logger.error(f"Event '{event_name}': {msg}")
-                                        errors.append(msg)
+                                                                host_result["success"] = host_result["commands_failed"] == 0
+                                                                if host_result["success"]:
+                                                                    logger.info(f"Event '{event_name}': SSH commands executed successfully on {host}")
+                                                                else:
+                                                                    logger.warning(f"Event '{event_name}': SSH commands failed on {host}: {host_result['commands_failed']} command(s) failed")
+                                                                    # Mark host as failed - stop processing for this host
+                                                                    failed_hosts.add(host)
+                                                        except Exception as e:
+                                                            msg = f"Error executing SSH commands on {host}: {e}"
+                                                            host_result["error"] = str(e)
+                                                            logger.error(f"Event '{event_name}': {msg}")
+                                                            errors.append(msg)
+                                                            # Mark host as failed - stop processing for this host
+                                                            failed_hosts.add(host)
+                                                        finally:
+                                                            ssh_client.close()
+                                                except Exception as e:
+                                                    msg = f"Error connecting via SSH to {host}: {e}"
+                                                    host_result["error"] = str(e)
+                                                    logger.error(f"Event '{event_name}': {msg}")
+                                                    errors.append(msg)
+                                                    # Mark host as failed - stop processing for this host
+                                                    failed_hosts.add(host)
+                                                
+                                                ssh_execution_details["hosts"].append(host_result)
+                                        except ValueError as e:
+                                            msg = f"Failed to decrypt SSH key: {e}"
+                                            logger.error(f"Event '{event_name}': {msg}")
+                                            errors.append(msg)
                                 else:
                                     msg = "Encryption password not available for SSH key decryption"
                                     logger.warning(f"Event '{event_name}': {msg}")
@@ -2886,23 +3492,36 @@ def run_configuration(config_data: dict, event_name: str, event_id: Optional[int
                                 logger.warning(f"Event '{event_name}': {msg}")
                                 errors.append(msg)
                         else:
-                            msg = "SSH key not assigned to profile"
+                            msg = f"SSH command profile with id {ssh_profile_id} not found"
                             logger.warning(f"Event '{event_name}': {msg}")
                             errors.append(msg)
-                    else:
-                        msg = f"SSH command profile with id {ssh_profile_id} not found"
-                        logger.warning(f"Event '{event_name}': {msg}")
-                        errors.append(msg)
-                except sqlite3.Error as e:
-                    logger.error(f"Event '{event_name}': Database error loading SSH profile: {e}")
-                    errors.append(f"Database error loading SSH profile: {e}")
-                finally:
-                    conn.close()
+                    except sqlite3.Error as e:
+                        logger.error(f"Event '{event_name}': Database error loading SSH profile: {e}")
+                        errors.append(f"Database error loading SSH profile: {e}")
+                    finally:
+                        if conn:
+                            conn.close()
             except Exception as e:
                 logger.error(f"Event '{event_name}': Error executing SSH profiles: {e}")
                 errors.append(f"Error executing SSH profiles: {e}")
+                # If SSH execution fails completely, stop the run
+                if ssh_profile_id:
+                    logger.error(f"Event '{event_name}': SSH execution failed, stopping run")
+                    raise RuntimeError(f"SSH execution failed: {e}")
         
         # Step 5: Install selected workspace
+        # Only proceed if SSH execution succeeded (or was not required)
+        # Check if all hosts failed during SSH execution
+        if ssh_profile_id and ssh_execution_details:
+            ssh_failed_hosts = {h["host"] for h in ssh_execution_details["hosts"] if not h.get("success", False)}
+            if ssh_failed_hosts:
+                # If SSH failed on all hosts, stop the run
+                if ssh_failed_hosts == set(host_tokens.keys()):
+                    logger.error(f"Event '{event_name}': SSH execution failed on all hosts, stopping run")
+                    raise RuntimeError("SSH execution failed on all hosts")
+                # Otherwise, mark failed hosts and continue (some hosts succeeded)
+                failed_hosts.update(ssh_failed_hosts)
+        
         installation_details = []  # Track installation details
         if install_select:
             template_name, version = install_select.split('|||')
@@ -2932,7 +3551,8 @@ def run_configuration(config_data: dict, event_name: str, event_id: Optional[int
                     def install_on_host(host):
                         """Install fabric on a single host"""
                         try:
-                            template_id = get_template(host, host_tokens[host], template_name, repo_name, version)
+                            # Use cached template ID instead of fetching again
+                            template_id = get_cached_template_id(host, template_name, repo_name, version)
                             if template_id:
                                 # install_fabric expects template name and version, not id
                                 install_start = datetime.now(timezone.utc)
@@ -3043,96 +3663,99 @@ def run_configuration(config_data: dict, event_name: str, event_id: Optional[int
         
         # Update execution record in database
         if execution_record_id is not None:
-            conn = sqlite3.connect(DB_PATH)
-            c = conn.cursor()
-            try:
-                if errors:
-                    status = 'error'
-                    message = "Auto-run completed with errors"
-                else:
-                    status = 'success'
-                    message = "Auto-run execution completed successfully"
-                
-                execution_details_json = json.dumps({
-                    "hosts": [h.get('host') for h in hosts if isinstance(h, dict)] if isinstance(hosts, list) else [],
-                    "hosts_count": len(hosts),
-                    "templates": [
-                        {
-                            "repo_name": t.get('repo_name'),
-                            "template_name": t.get('template_name'),
-                            "version": t.get('version')
-                        } for t in (templates_list or []) if isinstance(t, dict)
-                    ],
-                    "templates_count": len(templates_list),
-                    "fabric_creations": fabric_creation_details,
-                    "fabric_creations_count": len(fabric_creation_details),
-                    "installed": (
-                        {
-                            "repo_name": repo_name if 'repo_name' in locals() else '',
-                            "template_name": template_name if 'template_name' in locals() else '',
-                            "version": version if 'version' in locals() else ''
-                        } if install_select else None
-                    ),
-                    "installations": installation_details,
-                    "installations_count": len(installation_details),
-                    "install_select": install_select,
-                    "ssh_profile": ssh_execution_details if ssh_execution_details else None,
-                    "duration_seconds": (completed_at - started_at).total_seconds(),
-                    "started_at": started_at.isoformat(),
-                    "completed_at": completed_at.isoformat()
-                })
-                
-                if is_manual_run:
-                    # Update manual_runs table
-                    c.execute('''
-                        UPDATE manual_runs
-                        SET status = ?, message = ?, errors = ?, completed_at = ?, execution_details = ?
-                        WHERE id = ?
-                    ''', (
-                        status,
-                        message,
-                        json.dumps(errors) if errors else None,
-                        completed_at.isoformat(),
-                        execution_details_json,
-                        execution_record_id
-                    ))
-                else:
-                    # Update event_executions table
-                    c.execute('''
-                        UPDATE event_executions
-                        SET status = ?, message = ?, errors = ?, completed_at = ?, execution_details = ?
-                        WHERE id = ?
-                    ''', (
-                        status,
-                        message,
-                        json.dumps(errors) if errors else None,
-                        completed_at.isoformat(),
-                        execution_details_json,
-                        execution_record_id
-                    ))
-                    # Audit: event run finished
-                    try:
-                        duration = int((completed_at - started_at).total_seconds())
-                        if errors:
-                            log_audit(
-                                "event_run_failed",
-                                details=f"event_id={event_id} event_name={event_name} duration_s={duration} errors_count={len(errors)}",
-                                ip_address=None
-                            )
-                        else:
-                            log_audit(
-                                "event_run_succeeded",
-                                details=f"event_id={event_id} event_name={event_name} duration_s={duration} hosts_count={len(hosts)}",
-                                ip_address=None
-                            )
-                    except Exception:
-                        pass
-                
-                conn.commit()
-            except sqlite3.Error as e:
-                logger.error(f"Failed to update execution record: {e}")
-            finally:
-                conn.close()
+            conn = db_connect_with_retry()
+            if not conn:
+                logger.error(f"Event '{event_name}': Failed to connect to database for execution record update")
+            else:
+                c = conn.cursor()
+                try:
+                    if errors:
+                        status = 'error'
+                        message = "Auto-run completed with errors"
+                    else:
+                        status = 'success'
+                        message = "Auto-run execution completed successfully"
+                    
+                    execution_details_json = json.dumps({
+                        "hosts": [h.get('host') for h in hosts if isinstance(h, dict)] if isinstance(hosts, list) else [],
+                        "hosts_count": len(hosts),
+                        "templates": [
+                            {
+                                "repo_name": t.get('repo_name'),
+                                "template_name": t.get('template_name'),
+                                "version": t.get('version')
+                            } for t in (templates_list or []) if isinstance(t, dict)
+                        ],
+                        "templates_count": len(templates_list),
+                        "fabric_creations": fabric_creation_details,
+                        "fabric_creations_count": len(fabric_creation_details),
+                        "installed": (
+                            {
+                                "repo_name": repo_name if 'repo_name' in locals() else '',
+                                "template_name": template_name if 'template_name' in locals() else '',
+                                "version": version if 'version' in locals() else ''
+                            } if install_select else None
+                        ),
+                        "installations": installation_details,
+                        "installations_count": len(installation_details),
+                        "install_select": install_select,
+                        "ssh_profile": ssh_execution_details if ssh_execution_details else None,
+                        "duration_seconds": (completed_at - started_at).total_seconds(),
+                        "started_at": started_at.isoformat(),
+                        "completed_at": completed_at.isoformat()
+                    })
+                    
+                    if is_manual_run:
+                        # Update manual_runs table
+                        c.execute('''
+                            UPDATE manual_runs
+                            SET status = ?, message = ?, errors = ?, completed_at = ?, execution_details = ?
+                            WHERE id = ?
+                        ''', (
+                            status,
+                            message,
+                            json.dumps(errors) if errors else None,
+                            completed_at.isoformat(),
+                            execution_details_json,
+                            execution_record_id
+                        ))
+                    else:
+                        # Update event_executions table
+                        c.execute('''
+                            UPDATE event_executions
+                            SET status = ?, message = ?, errors = ?, completed_at = ?, execution_details = ?
+                            WHERE id = ?
+                        ''', (
+                            status,
+                            message,
+                            json.dumps(errors) if errors else None,
+                            completed_at.isoformat(),
+                            execution_details_json,
+                            execution_record_id
+                        ))
+                        # Audit: event run finished
+                        try:
+                            duration = int((completed_at - started_at).total_seconds())
+                            if errors:
+                                log_audit(
+                                    "event_run_failed",
+                                    details=f"event_id={event_id} event_name={event_name} duration_s={duration} errors_count={len(errors)}",
+                                    ip_address=None
+                                )
+                            else:
+                                log_audit(
+                                    "event_run_succeeded",
+                                    details=f"event_id={event_id} event_name={event_name} duration_s={duration} hosts_count={len(hosts)}",
+                                    ip_address=None
+                                )
+                        except Exception:
+                            pass
+                    
+                    conn.commit()
+                except sqlite3.Error as e:
+                    logger.error(f"Failed to update execution record: {e}")
+                finally:
+                    conn.close()
         
         if errors:
             logger.error(f"Auto-run execution completed with errors for event: {event_name}")
@@ -3144,48 +3767,51 @@ def run_configuration(config_data: dict, event_name: str, event_id: Optional[int
         # Update execution record with error
         completed_at = datetime.now(timezone.utc)
         if execution_record_id is not None:
-            conn = sqlite3.connect(DB_PATH)
-            c = conn.cursor()
-            try:
-                c.execute('''
-                    UPDATE event_executions
-                    SET status = ?, message = ?, errors = ?, completed_at = ?, execution_details = ?
-                    WHERE id = ?
-                ''', (
-                    'error',
-                    str(e),
-                    json.dumps([str(e)]),
-                    completed_at.isoformat(),
-                    json.dumps({
-                        "hosts": [h.get('host') for h in hosts] if 'hosts' in locals() and isinstance(hosts, list) else [],
-                        "templates": [
-                            {
-                                "repo_name": t.get('repo_name'),
-                                "template_name": t.get('template_name'),
-                                "version": t.get('version')
-                            } for t in (templates_list or []) if isinstance(t, dict)
-                        ] if 'templates_list' in locals() else [],
-                        "install_select": install_select if 'install_select' in locals() else '',
-                        "ssh_profile": ssh_execution_details if 'ssh_execution_details' in locals() and ssh_execution_details else None,
-                        "duration_seconds": (completed_at - started_at).total_seconds()
-                    }),
-                    execution_record_id
-                ))
-                conn.commit()
-                # Audit: event run failed (exception path)
+            conn = db_connect_with_retry()
+            if not conn:
+                logger.error(f"Event '{event_name}': Failed to connect to database for error record update")
+            else:
+                c = conn.cursor()
                 try:
-                    duration = int((completed_at - started_at).total_seconds())
-                    log_audit(
-                        "event_run_failed",
-                        details=f"event_id={event_id} event_name={event_name} duration_s={duration} error={str(e)}",
-                        ip_address=None
-                    )
-                except Exception:
-                    pass
-            except sqlite3.Error as db_err:
-                logger.error(f"Failed to update execution record with error: {db_err}")
-            finally:
-                conn.close()
+                    c.execute('''
+                        UPDATE event_executions
+                        SET status = ?, message = ?, errors = ?, completed_at = ?, execution_details = ?
+                        WHERE id = ?
+                    ''', (
+                        'error',
+                        str(e),
+                        json.dumps([str(e)]),
+                        completed_at.isoformat(),
+                        json.dumps({
+                            "hosts": [h.get('host') for h in hosts] if 'hosts' in locals() and isinstance(hosts, list) else [],
+                            "templates": [
+                                {
+                                    "repo_name": t.get('repo_name'),
+                                    "template_name": t.get('template_name'),
+                                    "version": t.get('version')
+                                } for t in (templates_list or []) if isinstance(t, dict)
+                            ] if 'templates_list' in locals() else [],
+                            "install_select": install_select if 'install_select' in locals() else '',
+                            "ssh_profile": ssh_execution_details if 'ssh_execution_details' in locals() and ssh_execution_details else None,
+                            "duration_seconds": (completed_at - started_at).total_seconds()
+                        }),
+                        execution_record_id
+                    ))
+                    conn.commit()
+                    # Audit: event run failed (exception path)
+                    try:
+                        duration = int((completed_at - started_at).total_seconds())
+                        log_audit(
+                            "event_run_failed",
+                            details=f"event_id={event_id} event_name={event_name} duration_s={duration} error={str(e)}",
+                            ip_address=None
+                        )
+                    except Exception:
+                        pass
+                except sqlite3.Error as db_err:
+                    logger.error(f"Failed to update execution record with error: {db_err}")
+                finally:
+                    conn.close()
         
         return {"status": "error", "message": str(e), "errors": [str(e)], "event": event_name}
 
@@ -3218,7 +3844,9 @@ def save_ssh_key(req: SaveSshKeyReq):
     if not req.encryption_password or not req.encryption_password.strip():
         raise HTTPException(400, "Encryption password is required")
     
-    conn = sqlite3.connect(DB_PATH)
+    conn = db_connect_with_retry()
+    if not conn:
+        raise HTTPException(500, "Database connection failed")
     c = conn.cursor()
     
     try:
@@ -3307,7 +3935,9 @@ async def get_ssh_key(ssh_key_id: int, request: Request):
         if not encryption_password:
             raise HTTPException(400, "Encryption password is required")
         
-        conn = sqlite3.connect(DB_PATH)
+        conn = db_connect_with_retry()
+        if not conn:
+            raise HTTPException(500, "Database connection failed")
         c = conn.cursor()
         
         try:
@@ -3345,7 +3975,9 @@ async def get_ssh_key(ssh_key_id: int, request: Request):
 @app.get("/ssh-keys/list")
 def list_ssh_keys():
     """List all SSH keys (without decrypting private keys)"""
-    conn = sqlite3.connect(DB_PATH)
+    conn = db_connect_with_retry()
+    if not conn:
+        raise HTTPException(500, "Database connection failed")
     c = conn.cursor()
     
     try:
@@ -3373,7 +4005,9 @@ def list_ssh_keys():
 @app.delete("/ssh-keys/delete/{ssh_key_id}")
 def delete_ssh_key(ssh_key_id: int):
     """Delete an SSH key"""
-    conn = sqlite3.connect(DB_PATH)
+    conn = db_connect_with_retry()
+    if not conn:
+        raise HTTPException(500, "Database connection failed")
     c = conn.cursor()
     
     try:
@@ -3423,7 +4057,22 @@ def save_ssh_command_profile(req: SaveSshCommandProfileReq):
     if not req.commands or not req.commands.strip():
         raise HTTPException(400, "Commands are required")
     
-    conn = sqlite3.connect(DB_PATH)
+    # Validate command length limits
+    commands_list = [cmd.strip() for cmd in req.commands.strip().split('\n') if cmd.strip()]
+    if len(commands_list) > MAX_SSH_COMMANDS:
+        raise HTTPException(400, f"Maximum {MAX_SSH_COMMANDS} commands allowed")
+    
+    total_length = sum(len(cmd) for cmd in commands_list)
+    if total_length > MAX_TOTAL_COMMANDS_SIZE:
+        raise HTTPException(400, f"Total commands size exceeds {MAX_TOTAL_COMMANDS_SIZE} characters")
+    
+    for cmd in commands_list:
+        if len(cmd) > MAX_SSH_COMMAND_LENGTH:
+            raise HTTPException(400, f"Command exceeds maximum length of {MAX_SSH_COMMAND_LENGTH} characters: {cmd[:50]}...")
+    
+    conn = db_connect_with_retry()
+    if not conn:
+        raise HTTPException(500, "Database connection failed")
     c = conn.cursor()
     
     try:
@@ -3482,7 +4131,9 @@ def save_ssh_command_profile(req: SaveSshCommandProfileReq):
 @app.get("/ssh-command-profiles/get/{profile_id}")
 def get_ssh_command_profile(profile_id: int):
     """Retrieve an SSH command profile by ID"""
-    conn = sqlite3.connect(DB_PATH)
+    conn = db_connect_with_retry()
+    if not conn:
+        raise HTTPException(500, "Database connection failed")
     c = conn.cursor()
     
     try:
@@ -3526,7 +4177,9 @@ def get_ssh_command_profile(profile_id: int):
 @app.get("/ssh-command-profiles/list")
 def list_ssh_command_profiles():
     """List all SSH command profiles"""
-    conn = sqlite3.connect(DB_PATH)
+    conn = db_connect_with_retry()
+    if not conn:
+        raise HTTPException(500, "Database connection failed")
     c = conn.cursor()
     
     try:
@@ -3558,7 +4211,9 @@ def list_ssh_command_profiles():
 @app.delete("/ssh-command-profiles/delete/{profile_id}")
 def delete_ssh_command_profile(profile_id: int):
     """Delete an SSH command profile"""
-    conn = sqlite3.connect(DB_PATH)
+    conn = db_connect_with_retry()
+    if not conn:
+        raise HTTPException(500, "Database connection failed")
     c = conn.cursor()
     
     try:
@@ -3604,7 +4259,9 @@ async def validate_ssh_password(req: dict):
         if not encryption_password:
             return {"valid": False, "error": "Password is required"}
         
-        conn = sqlite3.connect(DB_PATH)
+        conn = db_connect_with_retry()
+        if not conn:
+            return {"valid": False, "error": "Database connection failed"}
         c = conn.cursor()
         
         try:
@@ -3663,7 +4320,9 @@ async def execute_ssh_profile(req: ExecuteSshProfileReq):
     """Execute SSH commands from a profile on a fabric host"""
     try:
         # Get SSH profile
-        conn = sqlite3.connect(DB_PATH)
+        conn = db_connect_with_retry()
+        if not conn:
+            raise HTTPException(500, "Database connection failed")
         c = conn.cursor()
         
         try:
@@ -3721,6 +4380,10 @@ async def execute_ssh_profile(req: ExecuteSshProfileReq):
             ssh_client = paramiko.SSHClient()
             ssh_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
             
+            # Overall operation timeout: 10 minutes (600 seconds)
+            # This covers connection + all command executions + wait times
+            SSH_OPERATION_TIMEOUT = 600
+            
             try:
                 # Create key object from private key string - try different formats
                 private_key_obj = None
@@ -3749,20 +4412,20 @@ async def execute_ssh_profile(req: ExecuteSshProfileReq):
                 if not private_key_obj:
                     raise HTTPException(500, "Failed to create SSH key object")
                 
-                # Connect to host
+                # Connect to host with timeout
                 ssh_client.connect(
                     hostname=req.fabric_host,
                     port=req.ssh_port,
                     username='admin',  # Default FabricStudio username
                     pkey=private_key_obj,
-                    timeout=30,
+                    timeout=30,  # Connection timeout: 30 seconds
                     look_for_keys=False,
                     allow_agent=False
                 )
                 
-                # Execute each command
+                # Execute each command with timeout
                 for idx, cmd in enumerate(command_list):
-                    stdin, stdout, stderr = ssh_client.exec_command(cmd, timeout=300)
+                    stdin, stdout, stderr = ssh_client.exec_command(cmd, timeout=300)  # Command timeout: 5 minutes
                     exit_status = stdout.channel.recv_exit_status()
                     
                     stdout_text = stdout.read().decode('utf-8', errors='replace')
@@ -3796,6 +4459,8 @@ async def execute_ssh_profile(req: ExecuteSshProfileReq):
                 raise HTTPException(401, f"SSH authentication failed: {str(e)}")
             except paramiko.SSHException as e:
                 raise HTTPException(500, f"SSH connection error: {str(e)}")
+            except socket.timeout:
+                raise HTTPException(504, f"SSH operation timed out after {SSH_OPERATION_TIMEOUT} seconds")
             except Exception as e:
                 raise HTTPException(500, f"Error executing SSH commands: {str(e)}")
             finally:
@@ -3871,22 +4536,20 @@ class GetNhiReq(BaseModel):
 @app.post("/nhi/save")
 def save_nhi(req: SaveNhiReq, request: Request):
     """Save or update an NHI credential"""
-    import re
-    
-    if not req.name or not req.name.strip():
-        raise HTTPException(400, "Name is required")
-    
-    # Validate name: alphanumeric, dash, underscore only
-    name_stripped = req.name.strip()
-    if not re.match(r'^[a-zA-Z0-9_-]+$', name_stripped):
-        raise HTTPException(400, "Name must contain only alphanumeric characters, dashes, and underscores")
-    
-    if not req.client_id or not req.client_id.strip():
-        raise HTTPException(400, "Client ID is required")
+    # Validate inputs
+    name_stripped = validate_name(req.name, "Name")
+    req.client_id = validate_client_id(req.client_id)
     if not req.encryption_password or not req.encryption_password.strip():
         raise HTTPException(400, "Encryption password is required")
     
-    conn = sqlite3.connect(DB_PATH)
+    # Validate fabric_hosts if provided
+    hosts_to_process = []
+    if req.fabric_hosts and req.fabric_hosts.strip():
+        hosts_to_process = validate_fabric_hosts_list(req.fabric_hosts)
+    
+    conn = db_connect_with_retry()
+    if not conn:
+        raise HTTPException(500, "Database connection failed")
     c = conn.cursor()
     
     try:
@@ -3897,13 +4560,11 @@ def save_nhi(req: SaveNhiReq, request: Request):
             # Create requires a client secret
             if not provided_client_secret:
                 raise HTTPException(400, "Client Secret is required for creating a new credential")
+            provided_client_secret = validate_client_secret(provided_client_secret)
             encrypted_secret = encrypt_client_secret(provided_client_secret, req.encryption_password)
-        
-        # Get tokens for all fabric_hosts if provided
-        # Parse hosts (space-separated)
-        hosts_to_process = []
-        if req.fabric_hosts and req.fabric_hosts.strip():
-            hosts_to_process = [h.strip() for h in req.fabric_hosts.strip().split() if h.strip()]
+        elif provided_client_secret:
+            # Update with new secret - validate it
+            provided_client_secret = validate_client_secret(provided_client_secret)
         
         if req.id is not None:
             # Update existing credential
@@ -4043,7 +4704,9 @@ def save_nhi(req: SaveNhiReq, request: Request):
 @app.get("/nhi/list")
 def list_nhi():
     """List all NHI credentials (without decrypting secrets)"""
-    conn = sqlite3.connect(DB_PATH)
+    conn = db_connect_with_retry()
+    if not conn:
+        raise HTTPException(500, "Database connection failed")
     c = conn.cursor()
     
     try:
@@ -4120,10 +4783,13 @@ async def get_nhi(nhi_id: int, request: Request):
         if not encryption_password:
             raise HTTPException(400, "Encryption password is required")
         
-        conn = sqlite3.connect(DB_PATH)
+        conn = db_connect_with_retry()
+        if not conn:
+            raise HTTPException(500, "Database connection failed")
         c = conn.cursor()
         
         try:
+            # Fetch credential and tokens in parallel queries (SQLite allows this)
             c.execute('''
                 SELECT name, client_id, client_secret_encrypted, created_at, updated_at
                 FROM nhi_credentials
@@ -4134,15 +4800,6 @@ async def get_nhi(nhi_id: int, request: Request):
             if not row:
                 raise HTTPException(404, f"NHI credential with id {nhi_id} not found")
             
-            # Decrypt client_secret for storing in session (needed for token refresh)
-            # We don't return it to the frontend, but store it encrypted in the session
-            try:
-                decrypted_client_secret = decrypt_client_secret(row[2], encryption_password)
-            except ValueError as e:
-                raise HTTPException(400, str(e))
-            
-            client_id = row[1]
-            
             # Get all tokens for this credential (decrypted)
             c.execute('''
                 SELECT fabric_host, token_encrypted, token_expires_at
@@ -4152,24 +4809,43 @@ async def get_nhi(nhi_id: int, request: Request):
             ''', (nhi_id,))
             token_rows = c.fetchall()
             
-            # Don't return tokens to frontend - they're stored server-side in the session
-            # Just collect host list for display purposes
+            # Decrypt client_secret for storing in session (needed for token refresh)
+            # We don't return it to the frontend, but store it encrypted in the session
+            try:
+                decrypted_client_secret = decrypt_client_secret(row[2], encryption_password)
+            except ValueError as e:
+                raise HTTPException(400, str(e))
+            
+            client_id = row[1]
+            
+            # Process tokens efficiently - combine validation and decryption in one pass
+            from datetime import datetime
+            now = datetime.now()
             hosts_with_tokens = []
+            tokens_by_host_for_session = {}
+            
             for token_row in token_rows:
                 fabric_host = token_row[0]
                 token_encrypted = token_row[1]
                 token_expires_at = token_row[2]
                 
-                # Check if token is valid (for display purposes only)
+                # Check if token is valid
                 try:
-                    from datetime import datetime
                     expires_at = datetime.fromisoformat(token_expires_at)
-                    now = datetime.now()
                     if expires_at > now:
-                        # Token is valid - add to host list
+                        # Token is valid - add to host list and decrypt for session
                         hosts_with_tokens.append(fabric_host)
-                except:
-                    # If date parsing fails, skip this token
+                        try:
+                            decrypted_token = decrypt_client_secret(token_encrypted, encryption_password)
+                            tokens_by_host_for_session[fabric_host] = {
+                                "token": decrypted_token,
+                                "expires_at": token_expires_at
+                            }
+                        except ValueError:
+                            # Decryption failed, skip this token
+                            pass
+                except (ValueError, TypeError):
+                    # Date parsing failed, skip this token
                     pass
             
             result = {
@@ -4183,29 +4859,6 @@ async def get_nhi(nhi_id: int, request: Request):
             }
             
             # Create session with tokens and credentials (for automatic token refresh)
-            # Decrypt tokens for storing in session
-            tokens_by_host_for_session = {}
-            for token_row in token_rows:
-                fabric_host = token_row[0]
-                token_encrypted = token_row[1]
-                token_expires_at = token_row[2]
-                
-                # Decrypt and check if valid for session storage
-                try:
-                    from datetime import datetime
-                    expires_at = datetime.fromisoformat(token_expires_at)
-                    now = datetime.now()
-                    if expires_at > now:
-                        # Token is valid, decrypt it for session storage
-                        decrypted_token = decrypt_client_secret(token_encrypted, encryption_password)
-                        tokens_by_host_for_session[fabric_host] = {
-                            "token": decrypted_token,
-                            "expires_at": token_expires_at
-                        }
-                except:
-                    # If decryption or date parsing fails, skip this token
-                    pass
-            
             session_id, session_key, expires_at = create_session(
                 nhi_id, 
                 encryption_password, 
@@ -4261,7 +4914,9 @@ async def update_nhi_token(request: Request, nhi_id: int):
     if expires_in is None:
         raise HTTPException(400, "expires_in is required")
     
-    conn = sqlite3.connect(DB_PATH)
+    conn = db_connect_with_retry()
+    if not conn:
+        raise HTTPException(500, "Database connection failed")
     c = conn.cursor()
     
     try:
@@ -4299,7 +4954,9 @@ async def update_nhi_token(request: Request, nhi_id: int):
 @app.delete("/nhi/delete/{nhi_id}")
 def delete_nhi(nhi_id: int):
     """Delete an NHI credential by ID"""
-    conn = sqlite3.connect(DB_PATH)
+    conn = db_connect_with_retry()
+    if not conn:
+        raise HTTPException(500, "Database connection failed")
     c = conn.cursor()
     
     try:
@@ -4314,8 +4971,11 @@ def delete_nhi(nhi_id: int):
         conn.commit()
         
         return {"status": "ok", "message": f"NHI credential {nhi_id} deleted successfully"}
+    except HTTPException:
+        raise
     except sqlite3.Error as e:
         conn.rollback()
+        logger.error(f"Error deleting NHI credential: {e}")
         raise HTTPException(500, f"Database error: {str(e)}")
     finally:
         conn.close()
@@ -4603,7 +5263,9 @@ def export_server_logs(level: Optional[str] = None, logger_name: Optional[str] =
 @app.delete("/nhi/delete/{nhi_id}")
 def delete_nhi(nhi_id: int):
     """Delete an NHI credential by ID"""
-    conn = sqlite3.connect(DB_PATH)
+    conn = db_connect_with_retry()
+    if not conn:
+        raise HTTPException(500, "Database connection failed")
     c = conn.cursor()
     
     try:
@@ -4640,7 +5302,9 @@ def create_session_endpoint(req: CreateSessionReq):
         raise HTTPException(400, "Encryption password is required")
     
     # Verify NHI credential exists
-    conn = sqlite3.connect(DB_PATH)
+    conn = db_connect_with_retry()
+    if not conn:
+        raise HTTPException(500, "Database connection failed")
     c = conn.cursor()
     try:
         c.execute('SELECT id FROM nhi_credentials WHERE id = ?', (req.nhi_credential_id,))
@@ -4797,7 +5461,10 @@ def revoke_session_endpoint(request: Request):
 def refresh_nhi_tokens():
     """Refresh NHI tokens from nhi_tokens table for credentials with stored event passwords"""
     try:
-        conn = sqlite3.connect(DB_PATH)
+        conn = db_connect_with_retry()
+        if not conn:
+            logger.error("Failed to connect to database for NHI token refresh")
+            return 0
         c = conn.cursor()
         try:
             now = datetime.now()
@@ -4910,7 +5577,10 @@ def refresh_expiring_tokens():
     nhi_refreshed_count = 0
     
     try:
-        conn = sqlite3.connect(DB_PATH)
+        conn = db_connect_with_retry()
+        if not conn:
+            logger.error("Failed to connect to database for token refresh")
+            return
         c = conn.cursor()
         try:
             # Get all active sessions
@@ -4969,16 +5639,60 @@ def check_and_run_token_refresh():
             refresh_expiring_tokens()
         except Exception as e:
             logger.error(f"Error in token refresh scheduler: {e}", exc_info=True)
-            time.sleep(60)  # Wait 1 minute before retrying on error
+            time.sleep(60)  # Wait before retrying on error
+
+def cleanup_old_executions(days_to_keep: int = 90):
+    """Clean up execution records older than specified days"""
+    try:
+        cutoff_date = (datetime.now(timezone.utc) - timedelta(days=days_to_keep)).isoformat()
+        conn = db_connect_with_retry()
+        if not conn:
+            logger.error("Failed to connect to database for execution cleanup")
+            return
+        
+        c = conn.cursor()
+        try:
+            # Delete old event executions (only completed ones)
+            c.execute('''
+                DELETE FROM event_executions 
+                WHERE completed_at IS NOT NULL AND completed_at < ?
+            ''', (cutoff_date,))
+            event_deleted = c.rowcount
+            
+            # Delete old manual runs (only completed ones)
+            c.execute('''
+                DELETE FROM manual_runs 
+                WHERE completed_at IS NOT NULL AND completed_at < ?
+            ''', (cutoff_date,))
+            manual_deleted = c.rowcount
+            
+            conn.commit()
+            
+            if event_deleted > 0 or manual_deleted > 0:
+                logger.info(f"Cleaned up {event_deleted} old event executions and {manual_deleted} old manual runs (older than {days_to_keep} days)")
+        except sqlite3.Error as e:
+            logger.error(f"Error cleaning up execution records: {e}")
+            conn.rollback()
+        finally:
+            conn.close()
+    except Exception as e:
+        logger.error(f"Error in execution cleanup: {e}", exc_info=True)
+
+def cleanup_executions_periodically():
+    """Background thread to periodically clean up old execution records"""
+    while True:
+        try:
+            time.sleep(3600 * 24)  # Run once per day
+            cleanup_old_executions(days_to_keep=90)
+        except Exception as e:
+            logger.error(f"Error in execution cleanup thread: {e}", exc_info=True)
+            time.sleep(3600)  # Wait 1 hour before retrying on error
 
 # Track events that have been executed to prevent duplicates
-executed_events = set()
-
 # Background scheduler to check for events that need to run
 def check_and_run_events():
     """Check for events that should run now and execute them"""
-    global executed_events
-    
+    global _executed_events
     logger.info("Event scheduler started")
     
     while True:
@@ -4988,7 +5702,12 @@ def check_and_run_events():
             current_date = now.date()
             current_time = now.time().replace(second=0, microsecond=0)  # Round to minute
             
-            conn = sqlite3.connect(DB_PATH)
+            conn = db_connect_with_retry()
+            if not conn:
+                logger.error("Failed to connect to database in scheduler")
+                time.sleep(60)
+                continue
+            
             c = conn.cursor()
             
             # Find events that should run now (auto_run enabled, date matches, time matches or no time specified)
@@ -5045,22 +5764,31 @@ def check_and_run_events():
                     if all_events:
                         logger.debug(f"  Available events: {[(evt_id, evt_name, evt_date, evt_time) for evt_id, evt_name, evt_date, evt_time, _ in all_events]}")
             
-            # Clean up executed events from previous days
+            # Clean up executed events from previous days (thread-safe)
             if events_to_run:
-                # Clean up based on date format
-                executed_events = {e for e in executed_events if str(e).startswith(current_date_str)}
+                with _executed_events_lock:
+                    _executed_events = {e for e in _executed_events if str(e).startswith(current_date_str)}
             
             for event_id, event_name, event_date, event_time in events_to_run:
                 # Create unique key for this event execution
-                event_key = f"{event_date}_{event_time or 'all'}_{event_id}"
+                # Normalize event_time to HH:MM format to prevent duplicates (e.g., "18:43:00" -> "18:43")
+                normalized_time = 'all'
+                if event_time:
+                    # Extract HH:MM from event_time (handles both "HH:MM" and "HH:MM:SS" formats)
+                    time_parts = event_time.strip().split(':')
+                    if len(time_parts) >= 2:
+                        normalized_time = f"{time_parts[0]}:{time_parts[1]}"
+                event_key = f"{event_date}_{normalized_time}_{event_id}"
                 
-                # Skip if already executed
-                if event_key in executed_events:
-                    logger.debug(f"Skipping event {event_id} - already executed (key: {event_key})")
-                    continue
+                # Skip if already executed (thread-safe check)
+                with _executed_events_lock:
+                    if event_key in _executed_events:
+                        logger.debug(f"Skipping event {event_id} - already executed (key: {event_key})")
+                        continue
+                    
+                    # Mark as executed before starting (to prevent duplicate if scheduler runs again)
+                    _executed_events.add(event_key)
                 
-                # Mark as executed before starting (to prevent duplicate if scheduler runs again)
-                executed_events.add(event_key)
                 logger.info(f"Executing event {event_id}: {event_name} (key: {event_key})")
                 
                 try:
@@ -5070,8 +5798,9 @@ def check_and_run_events():
                     thread.start()
                 except Exception as e:
                     logger.error(f"Error starting execution thread for event {event_id}: {e}", exc_info=True)
-                    # Remove from executed set if we failed to start
-                    executed_events.discard(event_key)
+                    # Remove from executed set if we failed to start (thread-safe)
+                    with _executed_events_lock:
+                        _executed_events.discard(event_key)
             
             conn.close()
             
@@ -5086,7 +5815,11 @@ def check_and_run_events():
 def execute_event_internal(event_id: int, event_name: str = None):
     """Internal function to execute an event"""
     try:
-        conn = sqlite3.connect(DB_PATH)
+        conn = db_connect_with_retry()
+        if not conn:
+            logger.error(f"Failed to connect to database for event {event_id}")
+            return
+        
         c = conn.cursor()
         
         c.execute('''
@@ -5106,8 +5839,71 @@ def execute_event_internal(event_id: int, event_name: str = None):
             except json.JSONDecodeError as je:
                 logger.error(f"Error parsing configuration JSON for event {event_id}: {je}", exc_info=True)
                 # Update execution record with error
-                completed_at = datetime.now()
-                conn = sqlite3.connect(DB_PATH)
+                completed_at = datetime.now(timezone.utc)
+                conn = db_connect_with_retry()
+                if conn:
+                    c = conn.cursor()
+                    try:
+                        # Find the latest running execution record
+                        c.execute('SELECT id FROM event_executions WHERE event_id = ? AND status = ? ORDER BY id DESC LIMIT 1', (event_id, 'running'))
+                        exec_row = c.fetchone()
+                        if exec_row:
+                            c.execute('''
+                                UPDATE event_executions
+                                SET status = ?, message = ?, errors = ?, completed_at = ?
+                                WHERE id = ?
+                            ''', (
+                                'error',
+                                f"Invalid configuration JSON: {str(je)}",
+                                json.dumps([f"Invalid configuration JSON: {str(je)}"]),
+                                completed_at.isoformat(),
+                                exec_row[0]
+                            ))
+                            conn.commit()
+                    except sqlite3.Error as db_err:
+                        logger.error(f"Failed to update execution record with JSON error: {db_err}")
+                    finally:
+                        conn.close()
+                return
+            
+            try:
+                run_configuration(config_data, event_name, event_id)
+                pass
+            except Exception as run_err:
+                logger.error(f"Error in run_configuration for event {event_id}: {run_err}", exc_info=True)
+                # Update execution record with error if run_configuration didn't update it
+                completed_at = datetime.now(timezone.utc)
+                conn = db_connect_with_retry()
+                if conn:
+                    c = conn.cursor()
+                    try:
+                        # Check if record was already updated (run_configuration might have updated it)
+                        c.execute('SELECT id, status FROM event_executions WHERE event_id = ? ORDER BY id DESC LIMIT 1', (event_id,))
+                        exec_row = c.fetchone()
+                        if exec_row and exec_row[1] == 'running':
+                            # Still in running state, update it
+                            c.execute('''
+                                UPDATE event_executions
+                                SET status = ?, message = ?, errors = ?, completed_at = ?
+                                WHERE id = ?
+                            ''', (
+                                'error',
+                                f"Execution failed: {str(run_err)}",
+                                json.dumps([str(run_err)]),
+                                completed_at.isoformat(),
+                                exec_row[0]
+                            ))
+                            conn.commit()
+                    except sqlite3.Error as db_err:
+                        logger.error(f"Failed to update execution record with run error: {db_err}")
+                    finally:
+                        conn.close()
+        else:
+            logger.warning(f"Event {event_id} not found or auto_run is disabled")
+            # Update execution record if it exists
+            completed_at = datetime.now(timezone.utc)
+            conn = db_connect_with_retry()
+            if conn:
                 c = conn.cursor()
                 try:
                     # Find the latest running execution record
@@ -5120,54 +5916,22 @@ def execute_event_internal(event_id: int, event_name: str = None):
                             WHERE id = ?
                         ''', (
                             'error',
-                            f"Invalid configuration JSON: {str(je)}",
-                            json.dumps([f"Invalid configuration JSON: {str(je)}"]),
+                            "Event not found or auto_run is disabled",
+                            json.dumps(["Event not found or auto_run is disabled"]),
                             completed_at.isoformat(),
                             exec_row[0]
                         ))
                         conn.commit()
                 except sqlite3.Error as db_err:
-                    logger.error(f"Failed to update execution record with JSON error: {db_err}")
+                    logger.error(f"Failed to update execution record: {db_err}")
                 finally:
                     conn.close()
-                return
-            
-            try:
-                run_configuration(config_data, event_name, event_id)
-                pass
-            except Exception as run_err:
-                logger.error(f"Error in run_configuration for event {event_id}: {run_err}", exc_info=True)
-                # Update execution record with error if run_configuration didn't update it
-                completed_at = datetime.now()
-                conn = sqlite3.connect(DB_PATH)
-                c = conn.cursor()
-                try:
-                    # Check if record was already updated (run_configuration might have updated it)
-                    c.execute('SELECT id, status FROM event_executions WHERE event_id = ? ORDER BY id DESC LIMIT 1', (event_id,))
-                    exec_row = c.fetchone()
-                    if exec_row and exec_row[1] == 'running':
-                        # Still in running state, update it
-                        c.execute('''
-                            UPDATE event_executions
-                            SET status = ?, message = ?, errors = ?, completed_at = ?
-                            WHERE id = ?
-                        ''', (
-                            'error',
-                            f"Execution failed: {str(run_err)}",
-                            json.dumps([str(run_err)]),
-                            completed_at.isoformat(),
-                            exec_row[0]
-                        ))
-                        conn.commit()
-                except sqlite3.Error as db_err:
-                    logger.error(f"Failed to update execution record with run error: {db_err}")
-                finally:
-                    conn.close()
-        else:
-            logger.warning(f"Event {event_id} not found or auto_run is disabled")
-            # Update execution record if it exists
-            completed_at = datetime.now()
-            conn = sqlite3.connect(DB_PATH)
+    except Exception as e:
+        logger.error(f"Error executing event {event_id}: {e}", exc_info=True)
+        # Update execution record with error
+        completed_at = datetime.now(timezone.utc)
+        conn = db_connect_with_retry()
+        if conn:
             c = conn.cursor()
             try:
                 # Find the latest running execution record
@@ -5180,53 +5944,28 @@ def execute_event_internal(event_id: int, event_name: str = None):
                         WHERE id = ?
                     ''', (
                         'error',
-                        "Event not found or auto_run is disabled",
-                        json.dumps(["Event not found or auto_run is disabled"]),
+                        f"Execution failed: {str(e)}",
+                        json.dumps([str(e)]),
                         completed_at.isoformat(),
                         exec_row[0]
                     ))
                     conn.commit()
             except sqlite3.Error as db_err:
-                logger.error(f"Failed to update execution record: {db_err}")
+                logger.error(f"Failed to update execution record with exception: {db_err}")
             finally:
                 conn.close()
-    except Exception as e:
-        logger.error(f"Error executing event {event_id}: {e}", exc_info=True)
-        # Update execution record with error
-        completed_at = datetime.now()
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        try:
-            # Find the latest running execution record
-            c.execute('SELECT id FROM event_executions WHERE event_id = ? AND status = ? ORDER BY id DESC LIMIT 1', (event_id, 'running'))
-            exec_row = c.fetchone()
-            if exec_row:
-                c.execute('''
-                    UPDATE event_executions
-                    SET status = ?, message = ?, errors = ?, completed_at = ?
-                    WHERE id = ?
-                ''', (
-                    'error',
-                    f"Execution failed: {str(e)}",
-                    json.dumps([str(e)]),
-                    completed_at.isoformat(),
-                    exec_row[0]
-                ))
-                conn.commit()
-        except sqlite3.Error as db_err:
-            logger.error(f"Failed to update execution record with exception: {db_err}")
-        finally:
-            conn.close()
 
 
 # Start scheduler in background thread on startup
 scheduler_thread = None
 token_refresh_thread = None
+cleanup_thread = None
+backup_thread = None
 
 @app.on_event("startup")
 def start_scheduler():
     """Start the background scheduler on application startup"""
-    global scheduler_thread, token_refresh_thread
+    global scheduler_thread, token_refresh_thread, cleanup_thread, backup_thread
     if scheduler_thread is None or not scheduler_thread.is_alive():
         scheduler_thread = threading.Thread(target=check_and_run_events)
         scheduler_thread.daemon = True  # Allow main process to exit
@@ -5243,5 +5982,88 @@ def start_scheduler():
         logger.info("Token refresh thread started")
     else:
         logger.warning("Token refresh thread already running")
+    
+    # Start execution cleanup background task
+    if cleanup_thread is None or not cleanup_thread.is_alive():
+        cleanup_thread = threading.Thread(target=cleanup_executions_periodically)
+        cleanup_thread.daemon = True
+        cleanup_thread.start()
+        logger.info("Execution cleanup thread started")
+    else:
+        logger.warning("Execution cleanup thread already running")
+    
+    # Start database backup background task
+    if backup_thread is None or not backup_thread.is_alive():
+        backup_thread = threading.Thread(target=backup_database_periodically)
+        backup_thread.daemon = True
+        backup_thread.start()
+        logger.info("Database backup thread started")
+    else:
+        logger.warning("Database backup thread already running")
+    
+    # Start audit log worker thread
+    _start_audit_log_worker()
+    
+    # Create initial backup on startup
+    try:
+        backup_path = backup_database()
+        if backup_path:
+            logger.info(f"Initial database backup created: {backup_path}")
+    except Exception as e:
+        logger.warning(f"Failed to create initial backup: {e}")
+
+# Catch-all route for static files (images, fonts, etc.) - must be last
+# This route only handles files that don't match any API routes above
+@app.get("/{file_path:path}")
+async def serve_static_files(file_path: str):
+    """
+    Serve static files from frontend directory.
+    This catch-all route only handles files that don't match API routes.
+    """
+    import os
+    # Only serve files with static file extensions
+    static_extensions = ('.html', '.css', '.js', '.svg', '.png', '.jpg', '.jpeg', '.ico', '.woff2', '.woff', '.ttf', '.eot')
+    if not file_path or not file_path.endswith(static_extensions):
+        raise HTTPException(404, "Not found")
+    
+    # Don't serve files that look like API routes (even with extensions)
+    if file_path.startswith(('api/', 'auth/', 'system/', 'user/', 'runtime/', 'model/', 
+                             'repo/', 'tasks/', 'preparation/', 'cache/', 'config/', 
+                             'event/', 'run/', 'ssh-keys/', 'ssh-command-profiles/', 
+                             'ssh-profiles/', 'nhi/', 'audit-logs/', 'server-logs/', 
+                             'health', 'docs', 'redoc', 'openapi.json')):
+        raise HTTPException(404, "Not found")
+    
+    # Construct file path
+    full_path = os.path.join("frontend", file_path)
+    
+    # Security: prevent directory traversal
+    if not os.path.normpath(full_path).startswith(os.path.normpath("frontend")):
+        raise HTTPException(403, "Forbidden")
+    
+    # Check if file exists
+    if not os.path.exists(full_path) or not os.path.isfile(full_path):
+        raise HTTPException(404, "File not found")
+    
+    # Determine media type
+    media_type = "application/octet-stream"
+    if file_path.endswith('.html'):
+        media_type = "text/html"
+    elif file_path.endswith('.css'):
+        media_type = "text/css"
+    elif file_path.endswith('.js'):
+        media_type = "application/javascript"
+    elif file_path.endswith('.svg'):
+        media_type = "image/svg+xml"
+    elif file_path.endswith('.png'):
+        media_type = "image/png"
+    elif file_path.endswith('.jpg') or file_path.endswith('.jpeg'):
+        media_type = "image/jpeg"
+    elif file_path.endswith('.ico'):
+        media_type = "image/x-icon"
+    elif file_path.endswith('.woff2'):
+        media_type = "font/woff2"
+    
+    return FileResponse(full_path, media_type=media_type)
 
 

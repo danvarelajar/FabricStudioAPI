@@ -4,14 +4,36 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>FabricStudio Assistant</title>
-    <link rel="icon" type="image/x-icon" href="/frontend/images/favicon.ico">
+    <link rel="icon" type="image/x-icon" href="/images/favicon.ico">
     <link rel="stylesheet" href="styles.css">
+    <!-- dayjs for reliable date/time handling -->
+    <script src="https://cdn.jsdelivr.net/npm/dayjs@1.11.10/dayjs.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/dayjs@1.11.10/plugin/utc.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/dayjs@1.11.10/plugin/timezone.js"></script>
+    <script>
+      // Initialize dayjs plugins
+      // Plugins from CDN are exposed as global variables
+      if (typeof dayjs !== 'undefined') {
+        // UTC plugin
+        if (typeof dayjs_plugin_utc !== 'undefined') {
+          dayjs.extend(dayjs_plugin_utc);
+        } else if (typeof window.dayjs_plugin_utc !== 'undefined') {
+          dayjs.extend(window.dayjs_plugin_utc);
+        }
+        // Timezone plugin
+        if (typeof dayjs_plugin_timezone !== 'undefined') {
+          dayjs.extend(dayjs_plugin_timezone);
+        } else if (typeof window.dayjs_plugin_timezone !== 'undefined') {
+          dayjs.extend(window.dayjs_plugin_timezone);
+        }
+      }
+    </script>
   </head>
   <body>
     <div class="app-container">
       <aside class="sidebar">
         <h2 class="sidebar-title">
-          <img src="/frontend/images/Fortinet-logomark-rgb-red.svg" alt="Fortinet" style="height: 56px; width: auto; vertical-align: middle; margin-right: -8px; margin-left: -20px;" />
+          <img src="/images/Fortinet-logomark-rgb-red.svg" alt="Fortinet" style="height: 56px; width: auto; vertical-align: middle; margin-right: -8px; margin-left: -20px;" />
           <span style="margin-left: 4px;">FabricStudio Assistant</span>
         </h2>
         <nav class="sidebar-nav">
@@ -64,7 +86,7 @@
     <!-- Loading overlay -->
     <div id="loadingOverlay" class="loading-overlay">
       <div class="loading-logo-container">
-        <img src="/frontend/images/Fortinet-logomark-rgb-red.svg" alt="Fortinet" class="loading-logo" id="loadingLogo">
+        <img src="/images/Fortinet-logomark-rgb-red.svg" alt="Fortinet" class="loading-logo" id="loadingLogo">
         <div class="loading-text" id="loadingText">Loading configuration...</div>
         <div class="loading-spinner"></div>
       </div>

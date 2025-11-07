@@ -3,7 +3,7 @@
 /* Inter Font Family */
 @font-face {
   font-family: 'Inter';
-  src: url('/frontend/fonts/inter-regular.woff2') format('woff2');
+  src: url('/fonts/inter-regular.woff2') format('woff2');
   font-weight: 400;
   font-style: normal;
   font-display: swap;
@@ -11,7 +11,7 @@
 
 @font-face {
   font-family: 'Inter';
-  src: url('/frontend/fonts/inter-bold.woff2') format('woff2');
+  src: url('/fonts/inter-bold.woff2') format('woff2');
   font-weight: 700;
   font-style: normal;
   font-display: swap;

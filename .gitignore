@@ -17,6 +17,8 @@ ENV/
 *.db-journal
 *.db-shm
 *.db-wal
+data/
+data/**
 
 # IDE
 .vscode/
@@ -43,4 +45,7 @@ build/
 
 # OpenAPI JSON files
 FS_2.0.4_OpenAPI.json
+
+# App specs
+app_specs/
 
