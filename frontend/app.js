@@ -4254,7 +4254,7 @@ async function populateConfigEditForm(name, config) {
   if (tplFormList) tplFormList.innerHTML = '';
   
   // Build cached templates structure from config templates
-  // This allows us to populate dropdowns without calling the cache endpoint
+  // This allows us to populate dropdowns for existing rows without calling the cache endpoint
   window.editCachedTemplates = [];
   if (config.templates && config.templates.length > 0) {
     // Build a structure similar to cached templates from the config data
@@ -4267,6 +4267,21 @@ async function populateConfigEditForm(name, config) {
         });
       }
     });
+  }
+  
+  // Load full cache if not already loaded (needed for adding new rows)
+  if (!window.cachedTemplates || window.cachedTemplates.length === 0) {
+    (async () => {
+      try {
+        const cacheRes = await api('/cache/templates');
+        if (cacheRes.ok) {
+          const cacheData = await cacheRes.json();
+          window.cachedTemplates = cacheData.templates || [];
+        }
+      } catch (error) {
+        console.error('Error loading cached templates for edit form:', error);
+      }
+    })();
   }
   
   // Enable Add Row button
@@ -4526,15 +4541,37 @@ function addEditTplRow(prefill) {
   optRepoPh.textContent = 'Select repo';
   r.appendChild(optRepoPh);
   
-  // Get unique repositories from cached templates
-  const cachedTemplates = window.editCachedTemplates || [];
-  const repos = Array.from(new Set(cachedTemplates.map(t => t.repo_name).filter(Boolean))).sort();
-  repos.forEach(repoName => {
-    const opt = document.createElement('option');
-    opt.value = repoName;
-    opt.textContent = repoName;
-    r.appendChild(opt);
-  });
+  // Populate repositories from cache
+  const populateReposFromCache = () => {
+    const cachedTemplates = window.cachedTemplates || [];
+    const repos = Array.from(new Set(cachedTemplates.map(t => t.repo_name).filter(Boolean))).sort();
+    repos.forEach(repoName => {
+      const opt = document.createElement('option');
+      opt.value = repoName;
+      opt.textContent = repoName;
+      r.appendChild(opt);
+    });
+  };
+  
+  // Load cache if not already loaded, then populate repos
+  if (!window.cachedTemplates || window.cachedTemplates.length === 0) {
+    // Load cache asynchronously, then populate
+    (async () => {
+      try {
+        const cacheRes = await api('/cache/templates');
+        if (cacheRes.ok) {
+          const cacheData = await cacheRes.json();
+          window.cachedTemplates = cacheData.templates || [];
+          populateReposFromCache();
+        }
+      } catch (error) {
+        console.error('Error loading cached templates:', error);
+      }
+    })();
+  } else {
+    // Cache already loaded - populate immediately
+    populateReposFromCache();
+  }
   
   // Template filtered dropdown
   const templateFiltered = createFilteredDropdown('Select template', '250px');
@@ -4583,8 +4620,8 @@ function addEditTplRow(prefill) {
     if (!repoName) return;
     
     // Get unique template names for this repo from cache
-    // Use window.editCachedTemplates which is set globally in populateConfigEditForm
-    const cacheToUse = window.editCachedTemplates || [];
+    // Use window.cachedTemplates (full cache) to show all available templates
+    const cacheToUse = window.cachedTemplates || [];
     const templatesForRepo = cacheToUse.filter(t => t.repo_name === repoName);
     const uniqueNames = Array.from(new Set(templatesForRepo.map(t => t.template_name).filter(Boolean))).sort();
     
@@ -4619,8 +4656,8 @@ function addEditTplRow(prefill) {
     }
     
     // Get versions for this repo+template from cache
-    // Use window.editCachedTemplates which is set in populateConfigEditForm
-    const cacheToUse = window.editCachedTemplates || [];
+    // Use window.cachedTemplates (full cache) to show all available versions
+    const cacheToUse = window.cachedTemplates || [];
     
     const matchingTemplates = cacheToUse.filter(t => {
       const repoMatch = t.repo_name === repoName;
