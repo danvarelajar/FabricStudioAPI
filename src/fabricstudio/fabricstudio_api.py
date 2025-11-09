@@ -488,14 +488,15 @@ def change_password(fabric_host, access_token, user_id, password):
         
     except requests.RequestException as exc:
         logger.error("Error updating guest user password: %s", exc, exc_info=True)
-        return None
+        raise RuntimeError(f"Failed to change password: {exc}")
     
     if response.status_code == 200:
         logger.info("Password updated for user_id %s", user_id)
-        return None
+        return True
     else:
-        logger.error("Error updating guest user password: %s - %s", response.status_code, response.text)
-        return None
+        error_msg = f"Failed to change password: HTTP {response.status_code} - {response.text}"
+        logger.error("Error updating guest user password: %s", error_msg)
+        raise RuntimeError(error_msg)
 
 
 def reset_fabric(fabric_host, access_token):
@@ -541,6 +542,16 @@ def batch_delete(fabric_host, access_token):
 
 
 def refresh_repositories(fabric_host, access_token):
+    """
+    Refresh all remote repositories on host.
+    
+    Args:
+        fabric_host: Fabric host address
+        access_token: Access token for authentication
+    
+    Returns:
+        True if successful, False otherwise
+    """
     logger.info("Refreshing all remote repositories on host %s", fabric_host)
     url = f"https://{fabric_host}/api/v1/system/repository/remote:refresh-all"
     headers = {
@@ -554,14 +565,16 @@ def refresh_repositories(fabric_host, access_token):
         response = requests.post(url, headers=headers, json=data, verify=False, timeout=30)
     except requests.RequestException as exc:
         logger.error("Error in refresh all repositories: %s", exc)
-        return None
+        return False
+    
     if response.status_code == 200:
         check_tasks(fabric_host, access_token)
         logger.info("Refresh all repositories successful")
-        return None
+        return True
     else:
-        logger.error("Error in refresh all repositories: %s - %s", response.status_code, response.text)
-        return None
+        error_msg = f"{response.status_code} - {response.text}"
+        logger.error("Error in refresh all repositories: %s", error_msg)
+        return False
 
 
 def get_repositoryId(fabric_host, access_token, repo_name):
@@ -591,10 +604,36 @@ def get_repositoryId(fabric_host, access_token, repo_name):
     except requests.RequestException as exc:
         logger.error("Error finding Repository Id: %s", exc)
         return None
+    if response.status_code == 200:
+        try:
+            data = response.json()
+        except ValueError:
+            logger.error("Error parsing repository lookup response as JSON")
+            return None
+        objects = data.get('object', [])
+        if not objects:
+            logger.info("Repository '%s' not found", repo_name)
+            return None
+        repo_id = objects[0].get('id')
+        logger.info("Repository '%s' resolved to id %s via direct query", repo_name, repo_id)
+        return repo_id
+    else:
+        logger.error("Error finding Repository Id: %s - %s", response.status_code, response.text)
+        return None
 
 
 def list_repositories(fabric_host, access_token):
-    """Return list of remote repositories (objects)."""
+    """
+    Return list of remote repositories (objects).
+    
+    Args:
+        fabric_host: Fabric host address
+        access_token: Access token for authentication
+    
+    Returns:
+        List of repository objects
+    """
+    # Fetch from API
     url = f"https://{fabric_host}/api/v1/system/repository/remote"
     headers = {
         "Authorization": f"Bearer {access_token}",
@@ -613,23 +652,9 @@ def list_repositories(fabric_host, access_token):
     except ValueError:
         logger.error("Error parsing repositories response as JSON")
         return []
-    return data.get('object', [])
-    if response.status_code == 200:
-        try:
-            data = response.json()
-        except ValueError:
-            logger.error("Error parsing repository lookup response as JSON")
-            return None
-        objects = data.get('object', [])
-        if not objects:
-            logger.info("Repository '%s' not found", repo_name)
-            return None
-        repo_id = objects[0].get('id')
-        logger.info("Repository '%s' resolved to id %s", repo_name, repo_id)
-        return repo_id
-    else:
-        logger.error("Error finding Repository Id: %s - %s", response.status_code, response.text)
-        return None
+    
+    repos = data.get('object', [])
+    return repos
 
 
 def get_template(fabric_host, access_token, template, repo_name, version):
@@ -768,6 +793,23 @@ def create_fabric(fabric_host, access_token, template_id, template, version):
         from datetime import datetime, timezone
         creation_start_time = datetime.now(timezone.utc)
         
+        # Check if response contains created fabric information
+        created_fabric_id = None
+        try:
+            response_data = response.json()
+            # API might return the created fabric in 'object' or directly
+            if isinstance(response_data, dict):
+                created_obj = response_data.get('object')
+                if isinstance(created_obj, dict):
+                    created_fabric_id = created_obj.get('id')
+                elif isinstance(created_obj, list) and len(created_obj) > 0:
+                    created_fabric_id = created_obj[0].get('id')
+                # Also check if fabric ID is at root level
+                if not created_fabric_id:
+                    created_fabric_id = response_data.get('id')
+        except (ValueError, AttributeError):
+            pass  # Response might not be JSON or might not contain fabric info
+        
         result = check_tasks(fabric_host, access_token)
         if result is None:
             logger.error("Error checking tasks after fabric creation")
@@ -784,6 +826,76 @@ def create_fabric(fabric_host, access_token, template_id, template, version):
             logger.warning("Found %d task errors after fabric creation for '%s'", len(task_errors), template)
             return (False, error_messages)
         
+        # Verify fabric was actually created by checking if it exists
+        # This is important because the API might return 200 OK but the fabric creation could still fail
+        # List all fabrics and check for the one we created (by ID if available, or by name+version)
+        template_name_lower = (template or "").strip().lower()
+        fabric_exists = False
+        fabric_id_verified = None
+        fabric_name_verified = None
+        
+        for attempt in range(3):  # Try up to 3 times
+            if attempt > 0:
+                time.sleep(2)  # Wait 2 seconds between retries
+            
+            try:
+                # List all fabrics instead of using select (more reliable)
+                url_list = f"https://{fabric_host}/api/v1/model/fabric"
+                verify_response = requests.get(url_list, headers=headers, verify=False, timeout=30)
+                if verify_response.status_code == 200:
+                    verify_data = verify_response.json()
+                    verify_objects = verify_data.get('object', [])
+                    
+                    # First, try to find by ID if we got it from the response
+                    if created_fabric_id:
+                        for item in verify_objects:
+                            if item.get('id') == created_fabric_id:
+                                fabric_exists = True
+                                fabric_id_verified = created_fabric_id
+                                fabric_name_verified = item.get('name')
+                                logger.info("Verified fabric exists by ID %s: '%s' v%s", created_fabric_id, fabric_name_verified, item.get('version'))
+                                break
+                    
+                    # If not found by ID, try by name and version
+                    if not fabric_exists:
+                        for item in verify_objects:
+                            item_name = (item.get('name') or "").strip().lower()
+                            item_version = item.get('version')
+                            if item_name == template_name_lower and item_version == version:
+                                fabric_exists = True
+                                fabric_id_verified = item.get('id')
+                                fabric_name_verified = item.get('name')
+                                logger.info("Verified fabric '%s' v%s exists (id: %s)", fabric_name_verified, version, fabric_id_verified)
+                                break
+                    
+                    # If still not found, log all fabrics with matching version for debugging
+                    if not fabric_exists and attempt == 2:
+                        fabrics_with_version = [item for item in verify_objects if item.get('version') == version]
+                        if fabrics_with_version:
+                            fabric_names = [f"{item.get('name')} (id: {item.get('id')})" for item in fabrics_with_version]
+                            logger.warning("Fabric '%s' v%s not found, but found %d fabric(s) with version %s: %s", 
+                                         template, version, len(fabrics_with_version), version, ', '.join(fabric_names))
+                        else:
+                            all_fabric_names = [f"{item.get('name')} v{item.get('version')}" for item in verify_objects[:10]]
+                            logger.warning("Fabric '%s' v%s not found. Sample of existing fabrics: %s", 
+                                         template, version, ', '.join(all_fabric_names) if all_fabric_names else 'none')
+                    
+                    if fabric_exists:
+                        break
+                else:
+                    if attempt == 2:  # Only log warning on last attempt
+                        logger.warning("Could not verify fabric creation - status %s: %s", verify_response.status_code, verify_response.text)
+            except requests.RequestException as exc:
+                if attempt == 2:  # Only log warning on last attempt
+                    logger.warning("Could not verify fabric exists after creation: %s", exc)
+        
+        if not fabric_exists:
+            error_msg = f"Fabric '{template}' v{version} was not created - verification failed. Fabric does not exist after creation (checked 3 times)."
+            if created_fabric_id:
+                error_msg += f" API returned fabric ID {created_fabric_id} but fabric not found."
+            logger.error(error_msg)
+            return (False, [error_msg])
+        
         logger.info("Fabric created from template_id %s", template_id)
         return (True, [])
     else:
@@ -794,7 +906,9 @@ def create_fabric(fabric_host, access_token, template_id, template, version):
 
 def install_fabric(fabric_host, access_token, template, version):
     logger.info("Installing fabric '%s' version %s on host %s", template, version, fabric_host)
-    url_fabric_id = (f"https://{fabric_host}/api/v1/model/fabric?select=name={template}")
+    # List all fabrics instead of using select (more reliable)
+    # The select parameter might not work correctly, so we'll filter client-side
+    url_fabric_id = f"https://{fabric_host}/api/v1/model/fabric"
     headers = {
         "Authorization": f"Bearer {access_token}",
         "Cache-Control": "no-cache"
@@ -816,16 +930,32 @@ def install_fabric(fabric_host, access_token, template, version):
         return (False, [error_msg])
     objects = data.get('object', [])
     
-    # Filter fabrics by name and version more carefully
-    matching_fabrics = [item for item in objects if item.get('version') == version]
+    # Filter fabrics by both name (case-insensitive) and version
+    template_name_lower = (template or "").strip().lower()
+    matching_fabrics = []
+    for item in objects:
+        item_name = (item.get('name') or "").strip().lower()
+        item_version = item.get('version')
+        if item_name == template_name_lower and item_version == version:
+            matching_fabrics.append(item)
     
     if not matching_fabrics:
-        # No fabric found with matching version
-        available_versions = [item.get('version') for item in objects if item.get('name') == template]
-        if available_versions:
-            error_msg = f"Fabric '{template}' found but version '{version}' not found. Available versions: {', '.join(str(v) for v in available_versions)}"
+        # No fabric found with matching name and version
+        # Check if fabric exists with different version
+        fabrics_with_name = [item for item in objects if (item.get('name') or "").strip().lower() == template_name_lower]
+        if fabrics_with_name:
+            available_versions = [item.get('version') for item in fabrics_with_name if item.get('version')]
+            if available_versions:
+                error_msg = f"Fabric '{template}' found but version '{version}' not found. Available versions: {', '.join(str(v) for v in available_versions)}"
+            else:
+                error_msg = f"Fabric '{template}' found but has no version information"
         else:
-            error_msg = f"Fabric '{template}' not found"
+            # List some available fabric names for debugging
+            available_names = [item.get('name') for item in objects[:10] if item.get('name')]
+            if available_names:
+                error_msg = f"Fabric '{template}' not found. Sample of available fabrics: {', '.join(available_names)}"
+            else:
+                error_msg = f"Fabric '{template}' not found. No fabrics available on this host."
         logger.error(error_msg)
         return (False, [error_msg])
     

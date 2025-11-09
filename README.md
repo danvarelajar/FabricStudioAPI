@@ -4,6 +4,7 @@ A FastAPI-based web application for managing FabricStudio configurations, NHI cr
 
 ## Features
 
+- **User Authentication**: Secure user authentication with encrypted password storage
 - **FabricStudio Runs**: Configure and manage FabricStudio hosts, authenticate, and create/run workspaces
 - **SSH Profile Execution**: Execute SSH commands on fabric hosts before workspace installation, with configurable wait times between commands
 - **NHI Management**: Store and manage NHI credentials with encrypted client secrets
@@ -22,124 +23,148 @@ A FastAPI-based web application for managing FabricStudio configurations, NHI cr
 
 ### Prerequisites
 
-- Python 3.8+
-- pip
+- Docker and Docker Compose installed
+- For Mac: **Colima** (lightweight Docker alternative) - see setup instructions below
 
-### Installation
+### Quick Start
 
-1. Clone the repository:
+1. **Clone the repository:**
 ```bash
 git clone <repository-url>
 cd FabricStudioAPI
 ```
 
-2. Install dependencies:
-```bash
-pip install -r requirements.txt
-```
-
-3. Initialize the database:
-```bash
-python src/init_empty_db.py
-```
-
-Or the database will be automatically created when you first run the application.
-
-### Running the Application
-
-**Option 1: Run locally (without Docker)**
-```bash
-./scripts/run-local.sh
-```
-
-Or manually:
-```bash
-export PYTHONPATH=$(pwd)/src
-export FS_SERVER_SECRET=$(openssl rand -base64 32)
-uvicorn src.app:app --reload --host 0.0.0.0 --port 8000
-```
-
-**Option 2: Run with Docker (Recommended)**
-
-This project uses **Colima** (a lightweight Docker alternative for Mac) instead of Docker Desktop. See [Docker Deployment](#docker-deployment) section below for details.
-
-The application will be available at `http://localhost:8000`
-
-## Docker Deployment
-
-This project uses **Colima** as a lightweight Docker alternative for Mac. Colima is much lighter than Docker Desktop (~200MB vs 1GB+) and works seamlessly with Docker commands.
-
-### Prerequisites
-
-- Colima installed (see setup instructions below)
-- Docker Compose installed
-
-### Quick Setup
-
-1. **Install Colima (one command):**
-   ```bash
-   ./setup-colima.sh
-   ```
-
 2. **Set up environment variables:**
-   ```bash
-   cp env.example .env
-   # Edit .env and set FS_SERVER_SECRET (generate with: openssl rand -base64 32)
-   ```
+```bash
+cp .env.example .env
+# Edit .env and set your configuration values (see Configuration section below)
+```
 
 3. **Start the application:**
-   ```bash
-   ./scripts/docker-start.sh
-   ```
-   
-   **To rebuild without cache:**
-   ```bash
-   ./scripts/docker-start.sh --rebuild
-   ```
+```bash
+./scripts/docker-start.sh
+```
 
-### Manual Setup
+The application will be available at `http://localhost:8000` (or the port configured in `.env`)
 
-If you prefer to set up manually:
+**Note:** If you've configured a different port or enabled HTTPS, adjust the URL accordingly:
+- HTTP: `http://localhost:PORT`
+- HTTPS: `https://localhost:PORT`
 
-1. **Install Colima:**
+### Initial Users
+
+On first deployment, the application automatically creates initial users defined in `scripts/create_users.py`. By default, the following user is created:
+
+- **Username**: `admin`
+- **Password**: `FortinetAssistant1!`
+
+**To customize initial users:**
+1. Edit `scripts/create_users.py`
+2. Modify the `INITIAL_USERS` list with your desired usernames and passwords
+3. Rebuild and restart the container:
    ```bash
-   ./scripts/setup-colima.sh
-   ```
-
-2. **Create environment file:**
-   ```bash
-   cp env.example .env
-   # Edit .env and set FS_SERVER_SECRET
-   ```
-
-3. **Build and start:**
-   ```bash
+   docker-compose down
    docker-compose build
    docker-compose up -d
    ```
 
-### Building the Docker Image
+**To manually create or update users:**
+```bash
+docker-compose exec fabricstudio-api python scripts/create_users.py
+```
 
-To build the Docker image:
+**To reset a user password:**
+```bash
+docker-compose exec fabricstudio-api python scripts/reset_user_password.py <username>
+```
+
+## Container Deployment
+
+This project uses Docker for deployment. On Mac, **Colima** (a lightweight Docker alternative) is recommended instead of Docker Desktop (~200MB vs 1GB+).
+
+### Prerequisites
+
+- Docker and Docker Compose installed
+- For Mac: Install Colima (see below)
+
+### Mac Setup (Colima)
+
+**Install Colima (one command):**
+```bash
+./scripts/setup-colima.sh
+```
+
+This installs Colima and sets it up automatically. Colima works seamlessly with Docker commands.
+
+### Configuration
+
+1. **Create environment file:**
+   ```bash
+   cp .env.example .env
+   ```
+
+2. **Edit `.env` and configure:**
+   
+   **Required:**
+   - `FS_SERVER_SECRET`: Generate with `openssl rand -base64 32` (CRITICAL for encryption)
+   
+   **Server Configuration:**
+   - `HOSTNAME`: Hostname to bind to (default: `0.0.0.0`)
+   - `PORT`: Port to listen on (default: `8000`)
+   - `HTTPS_ENABLED`: Set to `true` to enable HTTPS (default: `false`)
+   - `SSL_CERT_PATH`: Path to SSL certificate (default: `/app/certs/cert.pem`)
+   - `SSL_KEY_PATH`: Path to SSL private key (default: `/app/certs/key.pem`)
+   
+   **FabricStudio API:**
+   - `LEAD_FABRIC_HOST`: Primary FabricStudio host
+   - `CLIENT_ID`: OAuth Client ID
+   - `CLIENT_SECRET`: OAuth Client Secret
+   
+   **CORS (Optional):**
+   - `CORS_ALLOW_ORIGINS`: Comma-separated list of allowed origins (auto-generated if not set)
+   
+   See `.env.example` for all available options with descriptions.
+
+### Starting the Application
+
+**Using the helper script (recommended):**
+```bash
+./scripts/docker-start.sh
+```
+
+**To rebuild without cache:**
+```bash
+./scripts/docker-start.sh --rebuild
+```
+
+**Manual commands:**
+```bash
+docker-compose build
+docker-compose up -d
+```
+
+### Building the Container Image
+
+**Standard build:**
 ```bash
 docker-compose build
 ```
 
-To rebuild from scratch (no cache):
+**Rebuild from scratch (no cache):**
 ```bash
 docker-compose build --no-cache
-docker-compose down  # Stop existing containers
-docker-compose up -d  # Start with new image
+docker-compose down
+docker-compose up -d
 ```
 
 **Using the helper script:**
 ```bash
-./docker-start.sh --rebuild
+./scripts/docker-start.sh --rebuild
 ```
 
-This will rebuild without cache and restart containers automatically.
+This rebuilds without cache and restarts containers automatically.
 
-### Starting/Stopping the Container
+### Managing the Container
 
 **Start:**
 ```bash
@@ -151,8 +176,10 @@ docker-compose up -d
 docker-compose down
 ```
 
-**Restart (to pick up code changes):**
+**Restart (to pick up configuration changes):**
 ```bash
+docker-compose restart
+# Or:
 docker-compose down
 docker-compose up -d
 ```
@@ -162,7 +189,19 @@ docker-compose up -d
 docker-compose logs -f
 ```
 
-### Troubleshooting Docker Build Issues
+**View logs for specific service:**
+```bash
+docker-compose logs -f fabricstudio-api
+```
+
+**Execute commands in container:**
+```bash
+docker-compose exec fabricstudio-api <command>
+# Example:
+docker-compose exec fabricstudio-api python scripts/create_users.py
+```
+
+### Troubleshooting
 
 **If changes aren't reflected after rebuilding:**
 
@@ -178,15 +217,21 @@ docker-compose logs -f
    - Or use incognito/private browsing mode
    - The application sets no-cache headers for all frontend files to prevent caching
 
-3. **Verify the new image is being used:**
+3. **Verify container status:**
    ```bash
    docker-compose ps  # Check container status
-   docker-compose logs -f  # Check logs for errors
+   docker-compose logs -f fabricstudio-api  # Check logs for errors
    ```
 
-4. **Check if files are in the build context:**
-   - Ensure `.dockerignore` isn't excluding files you've changed
-   - Frontend files should be in `frontend/` directory
+4. **Check environment variables:**
+   ```bash
+   docker-compose exec fabricstudio-api env | grep -E "HOSTNAME|PORT|HTTPS"
+   ```
+
+5. **Verify configuration:**
+   - Ensure `.env` file exists and has correct values
+   - Check that `FS_SERVER_SECRET` is set (required for encryption)
+   - Verify `HOSTNAME` and `PORT` match your access URL
 
 ### Database Persistence
 
@@ -197,12 +242,116 @@ The database and logs are stored in the `./data` and `./logs` directories, which
 
 **Important:** Backup the `./data` directory regularly!
 
+**⚠️ CRITICAL: Preserving Data During Docker Rebuilds**
+
+The database (including NHI credentials and SSH credentials) is stored in `./data/fabricstudio_ui.db` and is persisted via a Docker volume mount (`./data:/app/data`).
+
+**To preserve data when rebuilding:**
+```bash
+# ✅ SAFE - Preserves data
+docker-compose down        # Stop containers (keeps volumes)
+docker-compose build       # Rebuild image
+docker-compose up -d       # Start with existing data
+```
+
+**⚠️ DANGEROUS - Deletes all data:**
+```bash
+# ❌ This removes volumes and deletes the database!
+docker-compose down -v     # ⚠️ DO NOT USE unless you want to delete all data
+docker-compose rm -v       # ⚠️ Also removes volumes
+```
+
+**Always backup before rebuild:**
+```bash
+# Backup database before any rebuild
+cp data/fabricstudio_ui.db data/fabricstudio_ui.db.backup.$(date +%Y%m%d_%H%M%S)
+```
+
+**Verify data persistence:**
+```bash
+# Check database exists and has data
+ls -lh data/fabricstudio_ui.db
+sqlite3 data/fabricstudio_ui.db "SELECT COUNT(*) FROM nhi_credentials;"
+sqlite3 data/fabricstudio_ui.db "SELECT COUNT(*) FROM ssh_keys;"
+```
+
+### Server Configuration
+
+The application can be configured via environment variables in `.env`:
+
+**Basic Configuration:**
+- `HOSTNAME`: Hostname to bind to (default: `0.0.0.0`)
+- `PORT`: Port to listen on (default: `8000`)
+
+**HTTPS Configuration:**
+- `HTTPS_ENABLED`: Set to `true` to enable HTTPS (default: `false`)
+- `SSL_CERT_PATH`: Path to SSL certificate file (default: `/app/certs/cert.pem`)
+- `SSL_KEY_PATH`: Path to SSL private key file (default: `/app/certs/key.pem`)
+
+**To enable HTTPS:**
+
+1. **Create certificates directory:**
+   ```bash
+   mkdir -p certs
+   ```
+
+2. **Place your SSL certificates:**
+   ```bash
+   cp your-cert.pem certs/cert.pem
+   cp your-key.pem certs/key.pem
+   ```
+
+3. **Update `.env`:**
+   ```bash
+   HTTPS_ENABLED=true
+   ```
+
+4. **Restart the container:**
+   ```bash
+   docker-compose down
+   docker-compose up -d
+   ```
+
+The certificates are automatically mounted from `./certs` to `/app/certs` in the container (read-only for security).
+
+**To change the port:**
+```bash
+# In .env file
+PORT=9000
+```
+
+After changing port or HTTPS settings, restart the container:
+```bash
+docker-compose restart
+# Or:
+docker-compose down
+docker-compose up -d
+```
+
+### CORS Configuration
+
+CORS (Cross-Origin Resource Sharing) is automatically configured based on your server settings:
+
+**Auto-generated (default):**
+- If `CORS_ALLOW_ORIGINS` is not set, origins are auto-generated from `HOSTNAME`, `PORT`, and `HTTPS_ENABLED`
+- Includes localhost variants for development
+- Includes the configured hostname if not `0.0.0.0`
+
+**Explicit configuration:**
+- Set `CORS_ALLOW_ORIGINS` in `.env` with comma-separated origins:
+  ```bash
+  CORS_ALLOW_ORIGINS=http://example.com:8000,https://example.com,http://localhost:3000
+  ```
+
+**Note:** CSRF protection is session-based and works with any hostname, so it doesn't need CORS configuration.
+
 ### Security Notes
 
 - The `FS_SERVER_SECRET` environment variable is **required** for encrypting sensitive data in the database
-- Never commit `.env` file to version control
+- Never commit `.env` file to version control (use `.env.example` as a template)
 - The container runs as a non-root user for enhanced security
 - All sensitive data (passwords, tokens) are encrypted before storage
+- SSL certificates are mounted read-only (`:ro` flag) for additional security
 
 For more detailed Docker documentation, see [DOCKER.md](DOCKER.md).
 
@@ -233,25 +382,35 @@ If you rotate your Client Secret, update the corresponding NHI credential in the
 The application uses SQLite for data storage. The database file `fabricstudio_ui.db` is created automatically when the application starts, or you can initialize it manually using `init_empty_db.py`.
 
 The database contains the following tables:
+- `users`: User accounts for authentication (with encrypted passwords)
+- `sessions`: Server-side session storage for user authentication and token management
 - `configurations`: Saved FabricStudio configurations
 - `event_schedules`: Scheduled events
 - `event_executions`: Execution history for scheduled events (including SSH execution details)
 - `nhi_credentials`: NHI credential storage (with encrypted secrets)
 - `nhi_tokens`: Encrypted tokens per host per credential
-- `sessions`: Server-side session storage for token management
 - `cached_templates`: Cached template information
+- `cached_repositories`: Cached repository information per host
 - `ssh_keys`: SSH key pairs (public keys and encrypted private keys)
 - `ssh_command_profiles`: SSH command profiles with optional SSH key association
+- `audit_logs`: Audit trail of user actions
 
 ## Project Structure
 
 ```
 FabricStudioAPI/
-├── app.py                 # FastAPI application and API endpoints
-├── init_empty_db.py       # Database initialization script
-├── fabricstudio/
-│   ├── auth.py           # Authentication utilities
-│   └── fabricstudio_api.py # FabricStudio API client
+├── src/
+│   ├── app.py                 # FastAPI application and API endpoints
+│   ├── init_empty_db.py       # Database initialization script
+│   └── fabricstudio/
+│       ├── auth.py           # Authentication utilities
+│       └── fabricstudio_api.py # FabricStudio API client
+├── scripts/
+│   ├── create_users.py       # User creation/management script
+│   ├── reset_user_password.py # Password reset utility
+│   ├── docker-start.sh       # Container startup helper script
+│   ├── docker-entrypoint.sh  # Container entrypoint script
+│   └── setup-colima.sh       # Colima setup script (Mac)
 ├── frontend/
 │   ├── index.html        # Main HTML file
 │   ├── app.js            # Frontend JavaScript
@@ -265,20 +424,28 @@ FabricStudioAPI/
 │   └── fonts/            # Custom font files (Inter)
 │       ├── inter-regular.woff2
 │       └── inter-bold.woff2
-└── requirements.txt       # Python dependencies
+├── data/                 # Database and persistent data (created at runtime)
+├── logs/                 # Application logs (created at runtime)
+├── Dockerfile            # Docker image definition
+├── docker-compose.yml    # Docker Compose configuration
+├── .env                  # Environment variables (not in git)
+└── requirements.txt      # Python dependencies
 ```
 
 ## Security
 
+- **User Authentication**: Secure password-based authentication with bcrypt password hashing
 - **Session-Based Token Management**: Tokens are stored server-side in encrypted sessions, never exposed to the frontend
 - **Automatic Token Refresh**: Tokens refresh automatically before expiration (5 minutes before) to prevent interruptions
 - **NHI Credential Security**: Client secrets are encrypted using Fernet (symmetric encryption) and never returned to the frontend
 - **SSH Key Security**: Private SSH keys are encrypted using Fernet before storage and are never returned to the frontend
 - **Token Encryption**: All tokens are encrypted before storage in the database
 - **Password-Based Key Derivation**: Passwords are used to derive encryption keys using PBKDF2 (100,000 iterations)
+- **Password Hashing**: User passwords are hashed using bcrypt before storage
 - **HTTP-Only Cookies**: Session cookies are HTTP-only, preventing JavaScript access
 - **Secure Session Keys**: Session keys are derived from encryption passwords and session IDs
 - **SSH Command Execution**: SSH commands are executed securely using Paramiko, with error validation and output checking
+- **Audit Logging**: User actions are logged for security auditing
 
 ### Token Management
 

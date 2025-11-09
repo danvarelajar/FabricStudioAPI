@@ -43,6 +43,11 @@ class Config:
     AUDIT_LOG_BATCH_SIZE = int(os.environ.get("AUDIT_LOG_BATCH_SIZE", "50"))
     AUDIT_LOG_BATCH_TIMEOUT = float(os.environ.get("AUDIT_LOG_BATCH_TIMEOUT", "5.0"))
     
+    # App Log Configuration (for DatabaseLogHandler)
+    APP_LOG_BATCH_SIZE = int(os.environ.get("APP_LOG_BATCH_SIZE", "100"))
+    APP_LOG_BATCH_TIMEOUT = float(os.environ.get("APP_LOG_BATCH_TIMEOUT", "2.0"))
+    APP_LOG_QUEUE_SIZE = int(os.environ.get("APP_LOG_QUEUE_SIZE", "2000"))
+    
     # Cleanup Configuration
     CLEANUP_EXECUTION_RETENTION_DAYS = int(os.environ.get("CLEANUP_EXECUTION_RETENTION_DAYS", "90"))
     
@@ -57,4 +62,27 @@ class Config:
     
     # Frontend Configuration
     FRONTEND_REQUEST_TIMEOUT = int(os.environ.get("FRONTEND_REQUEST_TIMEOUT", "30000"))  # 30 seconds
+    
+    # Repository Cache Configuration
+    REPO_CACHE_TTL_HOURS = int(os.environ.get("REPO_CACHE_TTL_HOURS", "1"))  # 1 hour TTL
+    REPO_REFRESH_INTERVAL_HOURS = int(os.environ.get("REPO_REFRESH_INTERVAL_HOURS", "1"))  # Refresh every hour
+    
+    # Template Cache Configuration
+    TEMPLATE_CACHE_TTL_HOURS = int(os.environ.get("TEMPLATE_CACHE_TTL_HOURS", "1"))  # 1 hour TTL
+    TEMPLATE_CACHE_REFRESH_INTERVAL_HOURS = int(os.environ.get("TEMPLATE_CACHE_REFRESH_INTERVAL_HOURS", "1"))  # Refresh every hour
+    
+    # Lead Fabric Host Configuration (for background repository refresh)
+    LEAD_FABRIC_HOST = os.environ.get("LEAD_FABRIC_HOST", "").strip()
+    LEAD_CLIENT_ID = os.environ.get("CLIENT_ID", "").strip()
+    LEAD_CLIENT_SECRET = os.environ.get("CLIENT_SECRET", "").strip()
+    
+    # CORS configuration
+    # Allow origins from environment variable (comma-separated list)
+    # If not set, will auto-generate based on HOSTNAME and PORT
+    CORS_ALLOW_ORIGINS = os.environ.get("CORS_ALLOW_ORIGINS", "").strip()
+    
+    # Server configuration for CORS
+    HOSTNAME = os.environ.get("HOSTNAME", "0.0.0.0").strip()
+    PORT = os.environ.get("PORT", "8000").strip()
+    HTTPS_ENABLED = os.environ.get("HTTPS_ENABLED", "false").strip().lower() in ("true", "1", "yes")
 

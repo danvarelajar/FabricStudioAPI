@@ -27,6 +27,7 @@ class CSRFProtectionMiddleware(BaseHTTPMiddleware):
         "/redoc",  # API documentation
         "/openapi.json",  # OpenAPI schema
         "/auth/session/create",  # Session creation endpoint
+        "/auth/login",  # Login endpoint - users can't have CSRF token before login
     }
     
     def _is_exempt(self, path: str) -> bool:

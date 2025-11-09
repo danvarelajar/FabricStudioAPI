@@ -37,27 +37,33 @@ COPY --chown=fabricstudio:fabricstudio frontend/ ./frontend/
 COPY --chown=fabricstudio:fabricstudio src/ ./src/
 COPY --chown=fabricstudio:fabricstudio requirements.txt ./
 
-# Create directories for database and logs with proper permissions
-RUN mkdir -p /app/data /app/logs && \
-    chown -R fabricstudio:fabricstudio /app/data /app/logs /app
+# Create directories for database, logs, and certificates with proper permissions
+RUN mkdir -p /app/data /app/logs /app/certs && \
+    chown -R fabricstudio:fabricstudio /app/data /app/logs /app/certs /app
 
 # Set environment variables
+# Note: DB_PATH is set in docker-compose.yml to ensure correct path in container
+# docker-compose.yml environment section takes precedence over Dockerfile ENV
 ENV PATH=/usr/local/bin:$PATH \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONPATH=/app/src \
-    DB_PATH=/app/data/fabricstudio_ui.db
+    PYTHONPATH=/app/src
 
 # Switch to non-root user
 USER fabricstudio
 
-# Expose port
+# Expose port (default 8000, can be overridden via PORT env var)
 EXPOSE 8000
 
 # Health check (use dedicated health endpoint)
+# Port will be read from PORT environment variable at runtime
 HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
-    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')" || exit 1
+    CMD python -c "import os, urllib.request; port=os.getenv('PORT', '8000'); protocol='https' if os.getenv('HTTPS_ENABLED', 'false').lower() == 'true' else 'http'; urllib.request.urlopen(f'{protocol}://localhost:{port}/health')" || exit 1
 
-# Run the application
-CMD ["uvicorn", "src.app:app", "--host", "0.0.0.0", "--port", "8000"]
+# Copy startup script
+COPY --chown=fabricstudio:fabricstudio scripts/docker-entrypoint.sh /app/docker-entrypoint.sh
+RUN chmod +x /app/docker-entrypoint.sh
+
+# Run the application via entrypoint script
+ENTRYPOINT ["/app/docker-entrypoint.sh"]
 

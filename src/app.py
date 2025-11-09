@@ -19,6 +19,7 @@ import time
 import socket
 import logging
 import queue
+import sys
 from cryptography.fernet import Fernet
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
@@ -45,7 +46,7 @@ logger = logging.getLogger(__name__)
 
 from .fabricstudio.auth import get_access_token
 from .fabricstudio.fabricstudio_api import (
-    query_hostname, change_hostname, get_userId, change_password,
+    query_hostname, change_hostname, get_userId, change_password as change_fabricstudio_password,
     reset_fabric, batch_delete, refresh_repositories,
     get_template, create_fabric, install_fabric, check_tasks, get_running_task_count,
     get_recent_task_errors,
@@ -206,6 +207,52 @@ app.add_middleware(RateLimitMiddleware)
 # Add CSRF protection middleware (after rate limiting)
 app.add_middleware(CSRFProtectionMiddleware)
 
+# Authentication middleware
+class AuthenticationMiddleware(BaseHTTPMiddleware):
+    """Middleware to require authentication for all endpoints except login and static files"""
+    async def dispatch(self, request: Request, call_next):
+        # Allow access to login, health check, and static files without authentication
+        path = request.url.path
+        if path in ["/auth/login", "/login", "/health", "/docs", "/redoc", "/openapi.json"] or \
+           path.startswith("/static/") or \
+           path.endswith((".woff2", ".ico", ".svg")) or \
+           path in ["/images/", "/fonts/"]:
+            response = await call_next(request)
+            return response
+        
+        # Check for session cookie
+        session = get_session_from_request(request)
+        is_authenticated = session and session.get('user_id')
+        
+        # For root path and HTML/JS/CSS files, check authentication
+        if path == "/" or path.endswith((".html", ".js", ".css")):
+            if path == "/login.html" or path == "/login":
+                # Login page is always accessible
+                response = await call_next(request)
+                return response
+            # For other HTML/JS/CSS and root, check authentication
+            if not is_authenticated:
+                # Redirect to login page for HTML/frontend requests
+                from fastapi.responses import RedirectResponse
+                return RedirectResponse(url="/login", status_code=302)
+            # Authenticated - proceed
+            response = await call_next(request)
+            return response
+        
+        # For API endpoints, check authentication
+        if not is_authenticated:
+            # For API endpoints, return 401 JSON
+            return JSONResponse(
+                status_code=401,
+                content={"detail": "Authentication required"}
+            )
+        
+        # Valid session - proceed
+        response = await call_next(request)
+        return response
+
+app.add_middleware(AuthenticationMiddleware)
+
 # HTTP request logging middleware removed - now using INFO log handler instead
 
 # Exception handler for request validation errors
@@ -224,65 +271,211 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
         content={"detail": exc.errors()}
     )
 
-# Helper function to extract access_token from session
-def get_access_token_from_request(request: Request, fabric_host: str = None) -> Optional[str]:
+# Helper function to extract access_token from nhi_tokens table
+def get_access_token_from_request(request: Request, fabric_host: str = None, nhi_credential_id: Optional[int] = None) -> Optional[str]:
     """
-    Extract access_token from session.
-    Returns the token string or None if not found.
+    Extract access_token from nhi_tokens table (encrypted with FS_SERVER_SECRET).
+    If token doesn't exist or is expired, automatically retrieves a new token using the selected NHI credential.
+    Returns the token string or None if not found and cannot be retrieved.
+    
+    Args:
+        request: FastAPI request object (used to get session and selected NHI credential)
+        fabric_host: Fabric host address (required)
+        nhi_credential_id: Optional NHI credential ID to use (if not provided, uses selected credential from session)
     """
-    # Get token from session (requires fabric_host)
-    if fabric_host:
+    if not fabric_host:
+        return None
+    
+    # Get selected NHI credential ID from session if not provided
+    if not nhi_credential_id:
         session = get_session_from_request(request)
-        if session:
-            session_key = get_session_key_temp(session['session_id'])
-            if session_key:
+        if session and session.get('nhi_credential_id'):
+            nhi_credential_id = session.get('nhi_credential_id')
+            logger.debug(f"Using NHI credential {nhi_credential_id} from session for {fabric_host}")
+    
+    if not nhi_credential_id:
+        logger.warning(f"No NHI credential selected in session for fabric_host {fabric_host}")
+        return None
+    
+    # Get token from nhi_tokens table (encrypted with FS_SERVER_SECRET)
+    try:
+        conn = db_connect_with_retry()
+        if not conn:
+            logger.error("Database connection failed when retrieving token")
+            return None
+        
+        c = conn.cursor()
+        now = datetime.now()
+        
+        # Get token for this specific NHI credential and fabric_host
+        c.execute('''
+            SELECT token_encrypted, token_expires_at
+            FROM nhi_tokens
+            WHERE nhi_credential_id = ? AND fabric_host = ?
+            ORDER BY token_expires_at DESC
+            LIMIT 1
+        ''', (nhi_credential_id, fabric_host))
+        
+        token_row = c.fetchone()
+        
+        if token_row:
+            token_encrypted, token_expires_at_str = token_row
+            if token_expires_at_str:
                 try:
-                    tokens = decrypt_tokens_from_session(session['tokens_encrypted'], session_key)
-                    token_info = tokens.get(fabric_host)
-                    
-                    if token_info:
-                        # Check if token expired or expiring soon - refresh if needed
-                        needs_refresh = False
-                        if not is_token_valid(token_info):
-                            # Token expired - try to refresh
-                            # Token expired - refresh silently
-                            needs_refresh = True
-                        elif is_token_expiring_soon(token_info, minutes=1):
-                            # Token expiring soon - refresh proactively
-                            needs_refresh = True
-                        
-                        if needs_refresh:
-                            if refresh_token_for_host(session['session_id'], fabric_host):
-                                # Re-read session to get updated tokens
-                                updated_session = get_session(session['session_id'])
-                                if updated_session:
-                                    tokens = decrypt_tokens_from_session(updated_session['tokens_encrypted'], session_key)
-                                    token_info = tokens.get(fabric_host)
-                                    if token_info and is_token_valid(token_info):
-                                        update_session_activity(session['session_id'])
-                                        return token_info.get('token')
-                                    else:
-                                        logger.error(f"Token refresh failed for {fabric_host} - refreshed token still invalid")
-                                        return None
-                                else:
-                                    logger.error(f"Failed to retrieve updated session after refresh")
-                                    return None
-                            else:
-                                logger.error(f"Failed to refresh token for {fabric_host}")
-                                return None
-                        
-                        update_session_activity(session['session_id'])
-                        return token_info.get('token')
-                except Exception as e:
-                    logger.error(f"Error getting token from session: {e}")
+                    expires_at = datetime.fromisoformat(token_expires_at_str)
+                    if expires_at > now:
+                        # Token is valid, decrypt it
+                        try:
+                            decrypted_token = decrypt_with_server_secret(token_encrypted)
+                            logger.debug(f"Retrieved valid token from nhi_tokens for {fabric_host}")
+                            conn.close()
+                            return decrypted_token
+                        except Exception as e:
+                            logger.error(f"Failed to decrypt token from nhi_tokens: {e}")
+                            # Token exists but can't be decrypted - try to get a new one (fall through)
+                    else:
+                        logger.debug(f"Token from nhi_tokens for {fabric_host} has expired")
+                except (ValueError, TypeError) as e:
+                    logger.error(f"Invalid token expiration date format: {e}")
+        else:
+            logger.debug(f"No valid token found in nhi_tokens for {fabric_host}")
+        
+        # Token not found or expired - try to automatically retrieve it using the selected NHI credential
+        logger.info(f"Attempting to automatically retrieve token for {fabric_host} using NHI credential {nhi_credential_id}")
+        
+        # Get NHI credential details
+        c.execute('''
+            SELECT id, client_id, client_secret_encrypted
+            FROM nhi_credentials
+            WHERE id = ?
+        ''', (nhi_credential_id,))
+        
+        credential_row = c.fetchone()
+        
+        if not credential_row:
+            logger.warning(f"NHI credential {nhi_credential_id} not found")
+            conn.close()
+            return None
+        
+        cred_id, client_id, client_secret_encrypted = credential_row
+        
+        # Decrypt client_secret
+        try:
+            client_secret = decrypt_with_server_secret(client_secret_encrypted)
+        except Exception as e:
+            logger.error(f"Failed to decrypt client_secret for NHI credential {cred_id}: {e}")
+            conn.close()
+            return None
+        
+        # Get new token
+        try:
+            token_data = get_access_token(client_id, client_secret, fabric_host)
+            if not token_data or not isinstance(token_data, dict) or not token_data.get("access_token"):
+                logger.error(f"Failed to get new token for {fabric_host}")
+                conn.close()
+                return None
+            
+            # Encrypt and store the new token
+            token_encrypted = encrypt_with_server_secret(token_data.get("access_token"))
+            expires_in = token_data.get("expires_in")
+            if expires_in:
+                expires_at = datetime.now() + timedelta(seconds=expires_in)
+                token_expires_at = expires_at.isoformat()
+                
+                # Store token in nhi_tokens
+                c.execute('''
+                    INSERT OR REPLACE INTO nhi_tokens 
+                    (nhi_credential_id, fabric_host, token_encrypted, token_expires_at, updated_at)
+                    VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+                ''', (cred_id, fabric_host, token_encrypted, token_expires_at))
+                conn.commit()
+                logger.info(f"Automatically retrieved and stored new token for {fabric_host} using NHI credential {cred_id} (expires at {token_expires_at})")
+                
+                # Return the decrypted token
+                decrypted_token = decrypt_with_server_secret(token_encrypted)
+                conn.close()
+                return decrypted_token
+            else:
+                logger.warning(f"No expiration time in token response for {fabric_host}")
+                conn.close()
+                return None
+        except Exception as e:
+            logger.error(f"Error retrieving token for {fabric_host}: {e}", exc_info=True)
+            conn.close()
+            return None
+            
+    except Exception as e:
+        logger.error(f"Error retrieving token from nhi_tokens: {e}", exc_info=True)
+        return None
+
+def get_access_token_for_host(fabric_host: str, nhi_credential_id: Optional[int] = None) -> Optional[str]:
+    """
+    Get access token for a fabric host from nhi_tokens table (for background tasks).
+    This is similar to get_access_token_from_request but doesn't require a request object.
+    
+    Args:
+        fabric_host: Fabric host address
+        nhi_credential_id: Optional NHI credential ID to use
+    
+    Returns:
+        Access token string or None if not found
+    """
+    if not fabric_host:
+        return None
+    
+    try:
+        conn = db_connect_with_retry()
+        if not conn:
+            return None
+        
+        c = conn.cursor()
+        now = datetime.now(timezone.utc)
+        
+        # Build query based on whether nhi_credential_id is provided
+        if nhi_credential_id:
+            c.execute('''
+                SELECT token_encrypted, token_expires_at
+                FROM nhi_tokens
+                WHERE nhi_credential_id = ? AND fabric_host = ?
+                ORDER BY token_expires_at DESC
+                LIMIT 1
+            ''', (nhi_credential_id, fabric_host))
+        else:
+            # Get most recent valid token for this fabric_host
+            c.execute('''
+                SELECT token_encrypted, token_expires_at
+                FROM nhi_tokens
+                WHERE fabric_host = ? AND token_expires_at > ?
+                ORDER BY token_expires_at DESC
+                LIMIT 1
+            ''', (fabric_host, now.isoformat()))
+        
+        token_row = c.fetchone()
+        conn.close()
+        
+        if token_row:
+            token_encrypted, token_expires_at_str = token_row
+            if token_expires_at_str:
+                try:
+                    expires_at = datetime.fromisoformat(token_expires_at_str)
+                    if expires_at > now:
+                        # Token is valid, decrypt it
+                        try:
+                            decrypted_token = decrypt_with_server_secret(token_encrypted)
+                            return decrypted_token
+                        except Exception as e:
+                            logger.error(f"Failed to decrypt token from nhi_tokens for {fabric_host}: {e}")
+                            return None
+                except (ValueError, TypeError) as e:
+                    logger.error(f"Invalid token expiration date format for {fabric_host}: {e}")
+                    return None
+    except Exception as e:
+        logger.error(f"Error retrieving token from nhi_tokens for {fabric_host}: {e}")
     
     return None
 
 # Database setup - use Config module
 DB_PATH = Config.DB_PATH
-
-# Thread lock for database operations to prevent SQLite locking issues
-_db_lock = threading.Lock()
 
 # Connection pool limit to prevent exhaustion
 from threading import Semaphore
@@ -316,47 +509,129 @@ def db_connect_with_retry(timeout=None, max_retries=None, retry_delay=None):
     finally:
         _db_semaphore.release()
 
-# Custom logging handler to capture INFO logs to database
+# App log queue for batch writes (replaces synchronous DatabaseLogHandler)
+_app_log_queue = queue.Queue(maxsize=Config.APP_LOG_QUEUE_SIZE)
+_app_log_thread = None
+_app_log_thread_lock = threading.Lock()
+
+def _app_log_worker():
+    """Background thread to batch write app logs to database"""
+    batch = []
+    batch_size = Config.APP_LOG_BATCH_SIZE
+    batch_timeout = Config.APP_LOG_BATCH_TIMEOUT
+    last_write = time.time()
+    
+    while True:
+        try:
+            # Try to get an item from queue with timeout
+            try:
+                item = _app_log_queue.get(timeout=1.0)
+                if item is None:  # Shutdown signal
+                    # Write remaining batch before exiting
+                    if batch:
+                        _write_app_log_batch(batch)
+                    break
+                
+                batch.append(item)
+                _app_log_queue.task_done()
+            except queue.Empty:
+                pass
+            
+            # Write batch if it's full or timeout reached
+            now = time.time()
+            if len(batch) >= batch_size or (batch and (now - last_write) >= batch_timeout):
+                if batch:
+                    _write_app_log_batch(batch)
+                    batch = []
+                    last_write = now
+        except Exception as e:
+            # Use print to avoid recursion (can't use logger here)
+            print(f"Error in app log worker: {e}", file=sys.stderr)
+            time.sleep(0.1)  # Brief pause on error
+
+def _write_app_log_batch(batch: list):
+    """Write a batch of app logs to the database"""
+    if not batch:
+        return
+    
+    conn = None
+    try:
+        conn = db_connect_with_retry(timeout=10.0, max_retries=5, retry_delay=0.05)
+        if not conn:
+            # Silently fail - can't log this without recursion
+            return
+        
+        c = conn.cursor()
+        
+        # Insert all entries in batch
+        c.executemany('''
+            INSERT INTO app_logs (level, logger_name, message, created_at)
+            VALUES (?, ?, ?, ?)
+        ''', [
+            (item['level'], item['logger_name'], item['message'], item['created_at'])
+            for item in batch
+        ])
+        conn.commit()
+    except sqlite3.OperationalError as e:
+        if "database is locked" in str(e).lower():
+            # Put items back in queue (at front) for retry
+            for item in reversed(batch):
+                try:
+                    _app_log_queue.put_nowait(item)
+                except queue.Full:
+                    # Queue is full, drop entry (can't log this)
+                    pass
+        # Silently fail on other errors to avoid recursion
+    except Exception:
+        # Silently fail to avoid recursion
+        pass
+    finally:
+        if conn:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+def _start_app_log_worker():
+    """Start the app log worker thread if not already running"""
+    global _app_log_thread
+    with _app_log_thread_lock:
+        if _app_log_thread is None or not _app_log_thread.is_alive():
+            _app_log_thread = threading.Thread(target=_app_log_worker, daemon=True)
+            _app_log_thread.start()
+
+# Custom logging handler to capture INFO logs to database (batched writes)
 class DatabaseLogHandler(logging.Handler):
-    """Custom logging handler that writes INFO level logs to database"""
+    """Custom logging handler that writes INFO level logs to database via batched queue"""
     
     def emit(self, record):
         try:
             # Only log INFO level messages
             if record.levelno == logging.INFO:
-                # Use lock to prevent concurrent database access
-                with _db_lock:
-                    conn = None
-                    try:
-                        conn = db_connect_with_retry(timeout=10.0, max_retries=5, retry_delay=0.05)
-                        if not conn:
-                            return  # Silently fail if can't connect
-                        
-                        c = conn.cursor()
-                        # Format log message
-                        message = self.format(record)
-                        logger_name = record.name
-                        level = record.levelname
-                        created_at = datetime.now(timezone.utc).isoformat()
-                        
-                        c.execute('''
-                            INSERT INTO app_logs (level, logger_name, message, created_at)
-                            VALUES (?, ?, ?, ?)
-                        ''', (level, logger_name, message, created_at))
-                        conn.commit()
-                    except sqlite3.OperationalError as e:
-                        if "database is locked" not in str(e).lower():
-                            # Only log non-locking errors
-                            pass
-                    except Exception:
-                        pass
-                    finally:
-                        if conn:
-                            try:
-                                conn.close()
-                            except Exception:
-                                pass
+                # Ensure worker thread is running
+                _start_app_log_worker()
+                
+                # Format log message
+                message = self.format(record)
+                logger_name = record.name
+                level = record.levelname
+                created_at = datetime.now(timezone.utc).isoformat()
+                
+                log_entry = {
+                    'level': level,
+                    'logger_name': logger_name,
+                    'message': message,
+                    'created_at': created_at
+                }
+                
+                # Add to queue (non-blocking)
+                try:
+                    _app_log_queue.put_nowait(log_entry)
+                except queue.Full:
+                    # Queue is full, drop entry (can't log this to avoid recursion)
+                    pass
         except Exception:
+            # Silently fail to avoid recursion
             pass
 
 # Input validation patterns and functions
@@ -675,16 +950,23 @@ def init_db():
             template_name TEXT NOT NULL,
             version TEXT,
             cached_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            expires_at TIMESTAMP NOT NULL,
             UNIQUE(repo_name, template_name, version)
         )
     ''')
     
-    # Migrate existing table if it has fabric_host column (drop and recreate)
+    # Migrate existing table if it has fabric_host column or missing expires_at (drop and recreate)
     c.execute("PRAGMA table_info(cached_templates)")
     columns = [column[1] for column in c.fetchall()]
-    if 'fabric_host' in columns:
+    if 'fabric_host' in columns or 'expires_at' not in columns:
         try:
-            # Drop old table and recreate without fabric_host
+            # Backup existing data if expires_at is missing
+            existing_data = []
+            if 'expires_at' not in columns:
+                c.execute('SELECT repo_id, repo_name, template_id, template_name, version, cached_at FROM cached_templates')
+                existing_data = c.fetchall()
+            
+            # Drop old table and recreate with expires_at
             c.execute('DROP TABLE IF EXISTS cached_templates')
             c.execute('''
                 CREATE TABLE cached_templates (
@@ -695,29 +977,128 @@ def init_db():
                     template_name TEXT NOT NULL,
                     version TEXT,
                     cached_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    expires_at TIMESTAMP NOT NULL,
                     UNIQUE(repo_name, template_name, version)
                 )
             ''')
+            
+            # Restore existing data with expires_at set to cached_at + default TTL
+            if existing_data:
+                from datetime import datetime, timedelta, timezone
+                now = datetime.now(timezone.utc)
+                default_expires = (now + timedelta(hours=Config.TEMPLATE_CACHE_TTL_HOURS)).isoformat()
+                for row in existing_data:
+                    repo_id, repo_name, template_id, template_name, version, cached_at = row
+                    expires_at = default_expires
+                    if cached_at:
+                        try:
+                            cached_dt = datetime.fromisoformat(cached_at) if isinstance(cached_at, str) else cached_at
+                            if cached_dt.tzinfo is None:
+                                cached_dt = cached_dt.replace(tzinfo=timezone.utc)
+                            expires_at = (cached_dt + timedelta(hours=Config.TEMPLATE_CACHE_TTL_HOURS)).isoformat()
+                        except:
+                            pass
+                    c.execute('''
+                        INSERT INTO cached_templates 
+                        (repo_id, repo_name, template_id, template_name, version, cached_at, expires_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ''', (repo_id, repo_name, template_id, template_name, version, cached_at, expires_at))
+            
             conn.commit()
         except sqlite3.OperationalError as e:
             print(f"Warning: Could not migrate cached_templates table: {e}")
     
     conn.commit()
     
-    # Create table to store encrypted NHI passwords per event (for auto-run)
-    # Uses a server-managed secret to encrypt/decrypt
+    # Create table to store NHI credential ID per event (for auto-run)
+    # No password needed - credentials are encrypted with FS_SERVER_SECRET
     c = conn.cursor()
     c.execute('''
         CREATE TABLE IF NOT EXISTS event_nhi_passwords (
             event_id INTEGER PRIMARY KEY,
             nhi_credential_id INTEGER NOT NULL,
-            password_encrypted TEXT NOT NULL,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (event_id) REFERENCES event_schedules(id) ON DELETE CASCADE,
             FOREIGN KEY (nhi_credential_id) REFERENCES nhi_credentials(id) ON DELETE CASCADE
         )
     ''')
+    
+    # Migrate existing table to remove password_encrypted column
+    try:
+        c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='event_nhi_passwords'")
+        if c.fetchone():
+            # Check if password_encrypted column exists
+            c.execute("PRAGMA table_info(event_nhi_passwords)")
+            columns_info = c.fetchall()
+            columns = [row[1] for row in columns_info]
+            logger.info(f"event_nhi_passwords table columns: {columns}")
+            
+            # Check if password_encrypted column exists
+            password_col_exists = 'password_encrypted' in columns
+            
+            if password_col_exists:
+                logger.info("Migrating event_nhi_passwords table to remove password_encrypted column")
+                try:
+                    # Disable foreign keys temporarily for migration
+                    c.execute('PRAGMA foreign_keys=OFF')
+                    # Begin transaction
+                    c.execute('BEGIN TRANSACTION')
+                    
+                    # Clean up any leftover table from previous failed migration
+                    c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='event_nhi_passwords_new'")
+                    if c.fetchone():
+                        logger.info("Cleaning up leftover event_nhi_passwords_new table from previous migration")
+                        c.execute('DROP TABLE event_nhi_passwords_new')
+                    
+                    # Create new table without password_encrypted
+                    c.execute('''
+                        CREATE TABLE event_nhi_passwords_new (
+                            event_id INTEGER PRIMARY KEY,
+                            nhi_credential_id INTEGER NOT NULL,
+                            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                            FOREIGN KEY (event_id) REFERENCES event_schedules(id) ON DELETE CASCADE,
+                            FOREIGN KEY (nhi_credential_id) REFERENCES nhi_credentials(id) ON DELETE CASCADE
+                        )
+                    ''')
+                    # Copy data (excluding password_encrypted)
+                    c.execute('''
+                        INSERT INTO event_nhi_passwords_new 
+                        (event_id, nhi_credential_id, created_at, updated_at)
+                        SELECT event_id, nhi_credential_id, created_at, updated_at
+                        FROM event_nhi_passwords
+                    ''')
+                    # Drop old table
+                    c.execute('DROP TABLE event_nhi_passwords')
+                    # Rename new table
+                    c.execute('ALTER TABLE event_nhi_passwords_new RENAME TO event_nhi_passwords')
+                    # Commit transaction
+                    c.execute('COMMIT')
+                    # Re-enable foreign keys
+                    c.execute('PRAGMA foreign_keys=ON')
+                    conn.commit()
+                    logger.info("Successfully migrated event_nhi_passwords table - removed password_encrypted column")
+                except Exception as migration_error:
+                    try:
+                        c.execute('ROLLBACK')
+                    except:
+                        pass
+                    try:
+                        c.execute('PRAGMA foreign_keys=ON')
+                    except:
+                        pass
+                    conn.rollback()
+                    logger.error(f"Error during event_nhi_passwords migration: {migration_error}", exc_info=True)
+                    # Don't raise - allow app to continue, but log the error
+            else:
+                logger.info("event_nhi_passwords table does not have password_encrypted column - no migration needed")
+    except Exception as e:
+        logger.error(f"Could not migrate event_nhi_passwords table: {e}", exc_info=True)
+        try:
+            conn.rollback()
+        except:
+            pass
     
     # Create audit_logs table to track all application activities
     c.execute('''
@@ -769,7 +1150,8 @@ def init_db():
     c.execute('''
         CREATE TABLE IF NOT EXISTS sessions (
             session_id TEXT PRIMARY KEY,
-            nhi_credential_id INTEGER NOT NULL,
+            user_id INTEGER,
+            nhi_credential_id INTEGER,
             tokens_encrypted TEXT NOT NULL,
             session_key_hash TEXT NOT NULL,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -780,7 +1162,89 @@ def init_db():
     ''')
     c.execute('CREATE INDEX IF NOT EXISTS idx_sessions_expires_at ON sessions(expires_at)')
     c.execute('CREATE INDEX IF NOT EXISTS idx_sessions_nhi_credential_id ON sessions(nhi_credential_id)')
-
+    
+    # Migrate sessions table if needed - check if user_id column exists
+    c.execute("PRAGMA table_info(sessions)")
+    columns = {col[1]: col for col in c.fetchall()}
+    
+    # Check if we need to migrate - if user_id doesn't exist, we need to recreate the table
+    needs_migration = False
+    if 'user_id' not in columns:
+        needs_migration = True
+        logger.info("Sessions table missing user_id column - migration needed")
+    else:
+        # Test if we can insert NULL for nhi_credential_id (to check if constraint allows it)
+        try:
+            test_session_id = 'migration_test_' + str(int(time.time() * 1000))
+            c.execute('''
+                INSERT INTO sessions 
+                (session_id, user_id, nhi_credential_id, tokens_encrypted, session_key_hash, expires_at)
+                VALUES (?, ?, NULL, '', '', ?)
+            ''', (test_session_id, 999999, (datetime.now(timezone.utc) + timedelta(days=30)).isoformat()))
+            c.execute('DELETE FROM sessions WHERE session_id = ?', (test_session_id,))
+            conn.commit()
+            logger.info("Sessions table allows NULL for nhi_credential_id - no migration needed")
+        except sqlite3.IntegrityError:
+            needs_migration = True
+            logger.info("Sessions table does not allow NULL for nhi_credential_id - migration needed")
+            conn.rollback()
+        except Exception as e:
+            logger.warning(f"Could not test sessions table schema: {e}")
+            # Assume migration is needed to be safe
+            needs_migration = True
+    
+    if needs_migration:
+        logger.info("Migrating sessions table to add user_id and allow NULL for nhi_credential_id")
+        try:
+            # Create new table with correct schema
+            c.execute('''
+                CREATE TABLE IF NOT EXISTS sessions_new (
+                    session_id TEXT PRIMARY KEY,
+                    user_id INTEGER,
+                    nhi_credential_id INTEGER,
+                    tokens_encrypted TEXT NOT NULL,
+                    session_key_hash TEXT NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    last_used TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    expires_at TIMESTAMP NOT NULL
+                )
+            ''')
+            # Copy data from old table if it exists and has data
+            try:
+                c.execute('SELECT COUNT(*) FROM sessions')
+                count = c.fetchone()[0]
+                if count > 0:
+                    # Copy existing data
+                    c.execute('''
+                        INSERT INTO sessions_new 
+                        (session_id, user_id, nhi_credential_id, tokens_encrypted, session_key_hash, created_at, last_used, expires_at)
+                        SELECT 
+                            session_id, 
+                            COALESCE(user_id, NULL) as user_id,
+                            nhi_credential_id,
+                            tokens_encrypted, 
+                            session_key_hash, 
+                            created_at, 
+                            last_used, 
+                            expires_at
+                        FROM sessions
+                    ''')
+            except Exception as copy_error:
+                logger.warning(f"Could not copy existing session data: {copy_error}")
+            
+            # Drop old table and rename new one
+            c.execute('DROP TABLE IF EXISTS sessions')
+            c.execute('ALTER TABLE sessions_new RENAME TO sessions')
+            # Recreate indexes
+            c.execute('CREATE INDEX IF NOT EXISTS idx_sessions_expires_at ON sessions(expires_at)')
+            c.execute('CREATE INDEX IF NOT EXISTS idx_sessions_nhi_credential_id ON sessions(nhi_credential_id)')
+            c.execute('CREATE INDEX IF NOT EXISTS idx_sessions_user_id ON sessions(user_id)')
+            conn.commit()
+            logger.info("Sessions table migration completed successfully")
+        except Exception as e:
+            logger.error(f"Error migrating sessions table: {e}", exc_info=True)
+            conn.rollback()
+    
     # Create application logs table (replaces http_logs)
     c.execute('''
         CREATE TABLE IF NOT EXISTS app_logs (
@@ -803,12 +1267,85 @@ def init_db():
     c.execute('CREATE INDEX IF NOT EXISTS idx_event_executions_started_at ON event_executions(started_at DESC)')
     c.execute('CREATE INDEX IF NOT EXISTS idx_sessions_last_used ON sessions(last_used)')
     c.execute('CREATE INDEX IF NOT EXISTS idx_cached_templates_repo_name ON cached_templates(repo_name, template_name)')
+    c.execute('CREATE INDEX IF NOT EXISTS idx_cached_templates_expires ON cached_templates(expires_at)')
+    
+    # Create repository cache table (per host)
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS cached_repositories (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            fabric_host TEXT NOT NULL,
+            repo_id TEXT NOT NULL,
+            repo_name TEXT NOT NULL,
+            repo_data TEXT NOT NULL,
+            cached_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            expires_at TIMESTAMP NOT NULL,
+            UNIQUE(fabric_host, repo_id)
+        )
+    ''')
+    c.execute('CREATE INDEX IF NOT EXISTS idx_cached_repositories_host ON cached_repositories(fabric_host)')
+    c.execute('CREATE INDEX IF NOT EXISTS idx_cached_repositories_expires ON cached_repositories(expires_at)')
+    
+    # Create repository refresh tracking table
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS repository_refresh_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            fabric_host TEXT NOT NULL,
+            status TEXT NOT NULL,
+            started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            completed_at TIMESTAMP,
+            error_message TEXT,
+            repositories_count INTEGER
+        )
+    ''')
+    c.execute('CREATE INDEX IF NOT EXISTS idx_repo_refresh_host ON repository_refresh_logs(fabric_host)')
+    c.execute('CREATE INDEX IF NOT EXISTS idx_repo_refresh_started ON repository_refresh_logs(started_at DESC)')
+    
+    # Create users table for authentication
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT NOT NULL UNIQUE,
+            password_encrypted TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    c.execute('CREATE INDEX IF NOT EXISTS idx_users_username ON users(username)')
+    
+    # Note: Sessions table migration is handled above (lines 831-892)
+    # It ensures user_id exists and nhi_credential_id can be NULL
     
     # Drop old http_logs table if it exists (replaced by app_logs)
     c.execute('DROP TABLE IF EXISTS http_logs')
     
     conn.commit()
     conn.close()
+    
+    # Create initial users if they don't exist (using create_user function for consistency)
+    # Users are defined in scripts/create_users.py - import and use that logic
+    try:
+        import sys
+        import os
+        # Add project root to path to allow importing scripts
+        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        if project_root not in sys.path:
+            sys.path.insert(0, project_root)
+        from scripts.create_users import ensure_initial_users
+        ensure_initial_users()
+    except (ImportError, Exception) as e:
+        # Fallback: if script can't be imported, use direct creation
+        logger.warning(f"Could not import create_users script ({e}), using fallback user creation")
+        initial_users = [
+            ("admin", "FortinetAssistant1!")
+        ]
+        for username, password in initial_users:
+            try:
+                user = get_user_by_username(username)
+                if not user:
+                    create_user(username, password)
+                    logger.info(f"Created initial user: {username}")
+            except Exception as e:
+                logger.warning(f"Failed to create initial user {username}: {e}")
 
 # Encryption/Decryption functions for NHI credentials
 def derive_key_from_password(password: str, salt: bytes = None) -> bytes:
@@ -865,6 +1402,95 @@ def decrypt_with_server_secret(ciphertext_b64: str) -> str:
     dec = f.decrypt(enc_bytes)
     return dec.decode()
 
+# User authentication functions
+def hash_password(password: str) -> str:
+    """Hash a password using bcrypt-like approach with server secret"""
+    # Use PBKDF2 with server secret as salt for password hashing
+    kdf = PBKDF2HMAC(
+        algorithm=hashes.SHA256(),
+        length=32,
+        salt=b'fabricstudio_user_password_salt_2024',
+        iterations=100000,
+        backend=default_backend()
+    )
+    hashed = base64.urlsafe_b64encode(kdf.derive(password.encode()))
+    # Encrypt the hash with server secret for additional security
+    return encrypt_with_server_secret(hashed.decode())
+
+def verify_password(password: str, password_encrypted: str) -> bool:
+    """Verify a password against encrypted hash"""
+    try:
+        decrypted_hash = decrypt_with_server_secret(password_encrypted)
+        kdf = PBKDF2HMAC(
+            algorithm=hashes.SHA256(),
+            length=32,
+            salt=b'fabricstudio_user_password_salt_2024',
+            iterations=100000,
+            backend=default_backend()
+        )
+        password_hash = base64.urlsafe_b64encode(kdf.derive(password.encode())).decode()
+        return password_hash == decrypted_hash
+    except Exception as e:
+        logger.error(f"Password verification error: {e}", exc_info=True)
+        # If decryption fails, it's likely because FS_SERVER_SECRET changed
+        # This means all existing passwords need to be reset
+        return False
+
+def get_user_by_username(username: str) -> Optional[dict]:
+    """Get user by username"""
+    conn = db_connect_with_retry()
+    if not conn:
+        return None
+    c = conn.cursor()
+    try:
+        c.execute('SELECT id, username, password_encrypted FROM users WHERE username = ?', (username,))
+        row = c.fetchone()
+        if not row:
+            return None
+        return {
+            "id": row[0],
+            "username": row[1],
+            "password_encrypted": row[2]
+        }
+    finally:
+        conn.close()
+
+def create_user(username: str, password: str) -> int:
+    """Create a new user"""
+    conn = db_connect_with_retry()
+    if not conn:
+        raise RuntimeError("Failed to connect to database")
+    c = conn.cursor()
+    try:
+        password_encrypted = hash_password(password)
+        c.execute('''
+            INSERT INTO users (username, password_encrypted)
+            VALUES (?, ?)
+        ''', (username, password_encrypted))
+        conn.commit()
+        return c.lastrowid
+    except sqlite3.IntegrityError:
+        raise ValueError(f"Username '{username}' already exists")
+    finally:
+        conn.close()
+
+def update_user_password(user_id: int, new_password: str):
+    """Update user password"""
+    conn = db_connect_with_retry()
+    if not conn:
+        raise RuntimeError("Failed to connect to database")
+    c = conn.cursor()
+    try:
+        password_encrypted = hash_password(new_password)
+        c.execute('''
+            UPDATE users 
+            SET password_encrypted = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+        ''', (password_encrypted, user_id))
+        conn.commit()
+    finally:
+        conn.close()
+
 # Audit log queue for batch writes
 _audit_log_queue = queue.Queue(maxsize=1000)
 _audit_log_thread = None
@@ -873,8 +1499,8 @@ _audit_log_thread_lock = threading.Lock()
 def _audit_log_worker():
     """Background thread to batch write audit logs to database"""
     batch = []
-    batch_size = 50  # Write in batches of 50
-    batch_timeout = 2.0  # Or every 2 seconds, whichever comes first
+    batch_size = Config.AUDIT_LOG_BATCH_SIZE
+    batch_timeout = Config.AUDIT_LOG_BATCH_TIMEOUT
     last_write = time.time()
     
     while True:
@@ -979,10 +1605,26 @@ def _start_audit_log_worker():
             logger.info("Audit log worker thread started")
 
 # Audit logging helper function
-def log_audit(action: str, user: str = None, details: str = None, ip_address: str = None):
-    """Log an audit event to the database via queue (batched writes)"""
+def log_audit(action: str, user: str = None, details: str = None, ip_address: str = None, request: Request = None):
+    """Log an audit event to the database via queue (batched writes)
+    
+    Args:
+        action: The action being logged
+        user: Username (optional, will be extracted from request if not provided)
+        details: Additional details about the action
+        ip_address: IP address (optional, will be extracted from request if not provided)
+        request: FastAPI Request object (optional, used to extract user and IP if not provided)
+    """
     # Ensure worker thread is running
     _start_audit_log_worker()
+    
+    # Extract user from request if not provided
+    if user is None and request is not None:
+        user = get_current_username(request)
+    
+    # Extract IP from request if not provided
+    if ip_address is None and request is not None:
+        ip_address = get_client_ip(request)
     
     # Prepare log entry
     now_utc = datetime.now(timezone.utc)
@@ -1000,6 +1642,26 @@ def log_audit(action: str, user: str = None, details: str = None, ip_address: st
     except queue.Full:
         # Queue is full, log warning and drop entry
         logger.warning(f"Audit log queue full, dropping audit log entry: {action}")
+
+def get_current_username(request: Request) -> Optional[str]:
+    """Get the current logged-in username from the request session"""
+    try:
+        session = get_session_from_request(request)
+        if session and session.get('user_id'):
+            user_id = session['user_id']
+            conn = db_connect_with_retry()
+            if conn:
+                try:
+                    c = conn.cursor()
+                    c.execute('SELECT username FROM users WHERE id = ?', (user_id,))
+                    row = c.fetchone()
+                    if row:
+                        return row[0]
+                finally:
+                    conn.close()
+    except Exception:
+        pass
+    return None
 
 def get_client_ip(request: Request) -> str:
     """Extract client IP address from request"""
@@ -1092,12 +1754,12 @@ def refresh_token_for_host(session_id: str, fabric_host: str) -> bool:
         try:
             session = get_session(session_id)
             if not session:
-                logger.warning(f"Session {session_id} not found for token refresh")
+                logger.warning("Session not found for token refresh")
                 return False
             
             session_key = get_session_key_temp(session_id)
             if not session_key:
-                logger.warning(f"Session key not found for session {session_id}")
+                logger.warning("Session key not found for token refresh")
                 return False
             
             # Decrypt tokens to get credentials
@@ -1105,20 +1767,20 @@ def refresh_token_for_host(session_id: str, fabric_host: str) -> bool:
             credentials = tokens.get('_credentials')
             
             if not credentials:
-                logger.warning(f"No credentials stored in session {session_id} for token refresh")
+                logger.warning("No credentials stored in session for token refresh")
                 return False
             
             client_id = credentials.get('client_id')
             client_secret = credentials.get('client_secret')
             
             if not client_id or not client_secret:
-                logger.warning(f"Missing client_id or client_secret in session {session_id}")
+                logger.warning("Missing client_id or client_secret in session for token refresh")
                 return False
             
             # Get new token from FabricStudio API
             token_data = get_access_token(client_id, client_secret, fabric_host)
             if not token_data or not isinstance(token_data, dict) or not token_data.get("access_token"):
-                logger.error(f"Failed to get new token for {fabric_host} in session {session_id}")
+                logger.error(f"Failed to get new token for {fabric_host}")
                 return False
             
             # Update token in session
@@ -1140,7 +1802,7 @@ def refresh_token_for_host(session_id: str, fabric_host: str) -> bool:
                     WHERE session_id = ?
                 ''', (tokens_encrypted, session_id))
                 conn.commit()
-                logger.info(f"Token refreshed successfully for {fabric_host} in session {session_id}")
+                logger.info(f"Token refreshed successfully for {fabric_host}")
                 return True
             except sqlite3.Error as e:
                 logger.error(f"Database error refreshing token: {e}")
@@ -1149,7 +1811,7 @@ def refresh_token_for_host(session_id: str, fabric_host: str) -> bool:
             finally:
                 conn.close()
         except Exception as e:
-            logger.error(f"Error refreshing token for {fabric_host} in session {session_id}: {e}", exc_info=True)
+            logger.error(f"Error refreshing token for {fabric_host}: {e}", exc_info=True)
             return False
 
 def calculate_expires_in(expires_at_str: str) -> int:
@@ -1161,8 +1823,33 @@ def calculate_expires_in(expires_at_str: str) -> int:
     except:
         return 3600  # Default 1 hour
 
+def create_user_session(user_id: int) -> tuple:
+    """Create a new user session and return (session_id, expires_at)"""
+    session_id = generate_session_id()
+    
+    # Session-based expiration: no fixed expiration, but we'll set a far future date
+    # and update it on activity. For session-based, we'll extend on each activity.
+    # Set initial expiration to 30 days from now (will be extended on activity)
+    expires_at = datetime.now(timezone.utc) + timedelta(days=30)
+    
+    conn = db_connect_with_retry()
+    if not conn:
+        raise RuntimeError("Failed to connect to database for session creation")
+    c = conn.cursor()
+    try:
+        c.execute('''
+            INSERT INTO sessions 
+            (session_id, user_id, nhi_credential_id, tokens_encrypted, session_key_hash, expires_at)
+            VALUES (?, ?, NULL, '', '', ?)
+        ''', (session_id, user_id, expires_at.isoformat()))
+        conn.commit()
+    finally:
+        conn.close()
+    
+    return session_id, expires_at
+
 def create_session(nhi_credential_id: int, encryption_password: str, tokens_by_host: dict = None, client_id: str = None, client_secret: str = None) -> tuple:
-    """Create a new session and return (session_id, session_key, expires_at)"""
+    """Create a new session and return (session_id, session_key, expires_at) - DEPRECATED: Use create_user_session"""
     session_id = generate_session_id()
     session_key = derive_session_key(encryption_password, session_id)
     session_key_hash = hash_session_key(session_key)
@@ -1213,12 +1900,12 @@ def get_session(session_id: str) -> Optional[dict]:
     """Get session data from database"""
     conn = db_connect_with_retry()
     if not conn:
-        logger.error(f"Failed to connect to database for session {session_id}")
+        logger.error("Failed to connect to database for session retrieval")
         return None
     c = conn.cursor()
     try:
         c.execute('''
-            SELECT session_id, nhi_credential_id, tokens_encrypted, session_key_hash, 
+            SELECT session_id, user_id, nhi_credential_id, tokens_encrypted, session_key_hash, 
                    created_at, last_used, expires_at
             FROM sessions
             WHERE session_id = ?
@@ -1227,7 +1914,7 @@ def get_session(session_id: str) -> Optional[dict]:
         if not row:
             return None
         
-        expires_at_str = row[6]
+        expires_at_str = row[7]
         expires_at = datetime.fromisoformat(expires_at_str)
         # If naive datetime, assume UTC (from old code)
         if expires_at.tzinfo is None:
@@ -1240,14 +1927,25 @@ def get_session(session_id: str) -> Optional[dict]:
             delete_session(session_id)
             return None
         
+        # For session-based expiration, extend session on activity (30 days from now)
+        # Update last_used and extend expiration
+        new_expires_at = datetime.now(timezone.utc) + timedelta(days=30)
+        c.execute('''
+            UPDATE sessions 
+            SET last_used = CURRENT_TIMESTAMP, expires_at = ?
+            WHERE session_id = ?
+        ''', (new_expires_at.isoformat(), session_id))
+        conn.commit()
+        
         return {
             "session_id": row[0],
-            "nhi_credential_id": row[1],
-            "tokens_encrypted": row[2],
-            "session_key_hash": row[3],
-            "created_at": row[4],
-            "last_used": row[5],
-            "expires_at": row[6]  # Return original string, will be formatted in endpoint
+            "user_id": row[1],
+            "nhi_credential_id": row[2],
+            "tokens_encrypted": row[3],
+            "session_key_hash": row[4],
+            "created_at": row[5],
+            "last_used": row[6],
+            "expires_at": new_expires_at.isoformat()  # Return updated expiration
         }
     finally:
         conn.close()
@@ -1269,6 +1967,27 @@ def update_session_activity(session_id: str):
     finally:
         conn.close()
 
+def update_session_nhi_credential(session_id: str, nhi_credential_id: Optional[int]):
+    """Update nhi_credential_id in session"""
+    conn = db_connect_with_retry()
+    if not conn:
+        logger.error(f"Failed to connect to database for session NHI credential update")
+        return False
+    c = conn.cursor()
+    try:
+        c.execute('''
+            UPDATE sessions 
+            SET nhi_credential_id = ?, last_used = CURRENT_TIMESTAMP
+            WHERE session_id = ?
+        ''', (nhi_credential_id, session_id))
+        conn.commit()
+        return True
+    except Exception as e:
+        logger.error(f"Error updating session NHI credential: {e}")
+        return False
+    finally:
+        conn.close()
+
 def update_session_tokens(session_id: str, tokens_encrypted: str):
     """Update tokens in session"""
     conn = db_connect_with_retry()
@@ -1287,8 +2006,8 @@ def update_session_tokens(session_id: str, tokens_encrypted: str):
         conn.close()
 
 def refresh_session(session_id: str) -> Optional[datetime]:
-    """Refresh session expiration time"""
-    expires_at = datetime.now(timezone.utc) + timedelta(hours=1)
+    """Refresh session expiration time - session-based: extend 30 days from now"""
+    expires_at = datetime.now(timezone.utc) + timedelta(days=30)
     conn = db_connect_with_retry()
     if not conn:
         logger.error(f"Failed to connect to database for session refresh")
@@ -1377,17 +2096,55 @@ formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(messag
 db_handler.setFormatter(formatter)
 logging.getLogger().addHandler(db_handler)
 
-# CORS middleware
+# CORS middleware - configure allowed origins
+def get_cors_origins():
+    """Get CORS allowed origins from config or environment"""
+    origins = []
+    
+    # If CORS_ALLOW_ORIGINS is explicitly set, use it
+    if Config.CORS_ALLOW_ORIGINS:
+        origins = [origin.strip() for origin in Config.CORS_ALLOW_ORIGINS.split(",") if origin.strip()]
+    else:
+        # Auto-generate origins based on HOSTNAME and PORT
+        protocol = "https" if Config.HTTPS_ENABLED else "http"
+        port = Config.PORT
+        
+        # Add localhost variants (common for development)
+        origins.extend([
+            f"http://localhost:{port}",
+            f"http://127.0.0.1:{port}",
+            f"https://localhost:{port}",
+            f"https://127.0.0.1:{port}",
+        ])
+        
+        # If HOSTNAME is not 0.0.0.0, add it as an origin
+        if Config.HOSTNAME and Config.HOSTNAME != "0.0.0.0":
+            origins.append(f"{protocol}://{Config.HOSTNAME}:{port}")
+            # Also add without port if it's a standard port
+            if (protocol == "http" and port == "80") or (protocol == "https" and port == "443"):
+                origins.append(f"{protocol}://{Config.HOSTNAME}")
+        
+        # Add common development ports for frontend frameworks
+        origins.extend([
+            "http://localhost:5173",  # Vite default
+            "http://localhost:3000",  # React default
+            "http://127.0.0.1:5500",  # Live Server
+            "http://localhost:8001",  # Alternative port
+        ])
+    
+    # Remove duplicates while preserving order
+    seen = set()
+    unique_origins = []
+    for origin in origins:
+        if origin not in seen:
+            seen.add(origin)
+            unique_origins.append(origin)
+    
+    return unique_origins
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5173",
-        "http://localhost:3000",
-        "http://127.0.0.1:5500",
-        "http://localhost:8001",
-        "http://localhost:8000",
-        "http://127.0.0.1:8000",
-    ],
+    allow_origins=get_cors_origins(),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -1469,7 +2226,16 @@ def serve_fortinet_logo():
         "Cache-Control": "public, max-age=3600"
     })
 
-# Root: serve the SPA index
+# Login page
+@app.get("/login")
+def login_page():
+    return FileResponse("frontend/login.html", headers={
+        "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+        "Pragma": "no-cache",
+        "Expires": "0",
+    })
+
+# Root: serve the SPA index (requires authentication)
 @app.get("/")
 def root():
     return FileResponse("frontend/index.html", headers={
@@ -1574,6 +2340,312 @@ class InstallFabricReq(BaseModel):
     version: str
 
 
+# User authentication endpoints
+class LoginReq(BaseModel):
+    username: str
+    password: str
+
+@app.post("/auth/login")
+def login(req: LoginReq):
+    """Login endpoint - authenticate user and create session"""
+    try:
+        user = get_user_by_username(req.username)
+        if not user:
+            logger.warning(f"Login attempt failed: user '{req.username}' not found")
+            raise HTTPException(401, "Invalid username or password")
+        
+        # Debug logging for password verification
+        logger.info(f"Login attempt for user '{req.username}': password length={len(req.password)}")
+        password_valid = verify_password(req.password, user['password_encrypted'])
+        logger.info(f"Password verification result for user '{req.username}': {password_valid}")
+        if not password_valid:
+            # Try to see if there's a decryption error
+            try:
+                from src.app import decrypt_with_server_secret
+                decrypt_with_server_secret(user['password_encrypted'])
+                logger.info(f"Password decryption successful, hash comparison failed")
+            except Exception as e:
+                logger.error(f"Password decryption failed: {e}", exc_info=True)
+        
+        if not password_valid:
+            logger.warning(f"Login attempt failed: invalid password for user '{req.username}'")
+            raise HTTPException(401, "Invalid username or password")
+        
+        # Create user session
+        try:
+            session_id, expires_at = create_user_session(user['id'])
+            logger.info(f"User '{req.username}' logged in successfully")
+        except Exception as e:
+            logger.error(f"Failed to create session for user '{req.username}': {e}", exc_info=True)
+            raise HTTPException(500, "Failed to create session")
+        
+        # Create response with cookie (session-based, no max_age for session cookie)
+        response = JSONResponse({
+            "status": "ok",
+            "username": user['username'],
+            "expires_at": expires_at.isoformat()
+        })
+        response.set_cookie(
+            key="fabricstudio_session",
+            value=session_id,
+            httponly=True,
+            secure=False,  # Set to True in production with HTTPS
+            samesite="lax"
+            # No max_age - session cookie, expires when browser closes
+        )
+        
+        # Audit log
+        try:
+            log_audit("user_login", user=user['username'], details=f"user_id={user['id']}")
+        except Exception:
+            pass
+        
+        return response
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Unexpected error during login: {e}", exc_info=True)
+        raise HTTPException(500, "Internal server error during login")
+
+@app.post("/auth/logout")
+def logout(request: Request):
+    """Logout endpoint - invalidate session"""
+    session = get_session_from_request(request)
+    if session:
+        delete_session(session['session_id'])
+        try:
+            # Get username from session
+            username = get_current_username(request)
+            log_audit("user_logout", user=username, request=request)
+        except Exception:
+            pass
+    
+    response = JSONResponse({"status": "ok"})
+    response.delete_cookie(key="fabricstudio_session")
+    return response
+
+# User Management endpoints
+def validate_password_policy(password: str) -> tuple[bool, str]:
+    """Validate password policy: 7 chars, 1 number, 1 special char"""
+    if len(password) < 7:
+        return False, "Password must be at least 7 characters long"
+    
+    has_number = any(c.isdigit() for c in password)
+    if not has_number:
+        return False, "Password must contain at least one number"
+    
+    special_chars = "!@#$%^&*()_+-=[]{}|;:,.<>?"
+    has_special = any(c in special_chars for c in password)
+    if not has_special:
+        return False, "Password must contain at least one special character (!@#$%^&*()_+-=[]{}|;:,.<>?)"
+    
+    return True, ""
+
+class ChangePasswordReq(BaseModel):
+    current_password: str
+    new_password: str
+
+@app.post("/user/change-password")
+def change_password(req: ChangePasswordReq, request: Request):
+    """Change user password - requires current password and validates new password policy"""
+    session = get_session_from_request(request)
+    if not session or not session.get('user_id'):
+        raise HTTPException(401, "Authentication required")
+    
+    user_id = session['user_id']
+    
+    # Get current user
+    conn = db_connect_with_retry()
+    if not conn:
+        raise HTTPException(500, "Database connection failed")
+    c = conn.cursor()
+    
+    try:
+        c.execute('SELECT username, password_encrypted FROM users WHERE id = ?', (user_id,))
+        user_row = c.fetchone()
+        if not user_row:
+            raise HTTPException(404, "User not found")
+        
+        username = user_row[0]
+        current_password_encrypted = user_row[1]
+        
+        # Verify current password
+        if not verify_password(req.current_password, current_password_encrypted):
+            raise HTTPException(400, "Current password is incorrect")
+        
+        # Validate new password policy
+        is_valid, error_msg = validate_password_policy(req.new_password)
+        if not is_valid:
+            raise HTTPException(400, error_msg)
+        
+        # Update password
+        update_user_password(user_id, req.new_password)
+        
+        # Audit log
+        try:
+            log_audit("user_password_changed", user=username, details=f"user_id={user_id}")
+        except Exception:
+            pass
+        
+        return {"status": "ok", "message": "Password changed successfully"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error changing password: {e}", exc_info=True)
+        raise HTTPException(500, f"Internal server error: {str(e)}")
+    finally:
+        conn.close()
+
+@app.get("/user/current")
+def get_current_user(request: Request):
+    """Get current user information"""
+    session = get_session_from_request(request)
+    if not session or not session.get('user_id'):
+        raise HTTPException(401, "Authentication required")
+    
+    user_id = session['user_id']
+    
+    conn = db_connect_with_retry()
+    if not conn:
+        raise HTTPException(500, "Database connection failed")
+    c = conn.cursor()
+    
+    try:
+        c.execute('SELECT id, username, created_at, updated_at FROM users WHERE id = ?', (user_id,))
+        user_row = c.fetchone()
+        if not user_row:
+            raise HTTPException(404, "User not found")
+        
+        return {
+            "id": user_row[0],
+            "username": user_row[1],
+            "created_at": user_row[2],
+            "updated_at": user_row[3]
+        }
+    finally:
+        conn.close()
+
+@app.get("/user/list")
+def list_users(request: Request):
+    """List all users"""
+    session = get_session_from_request(request)
+    if not session or not session.get('user_id'):
+        raise HTTPException(401, "Authentication required")
+    
+    conn = db_connect_with_retry()
+    if not conn:
+        raise HTTPException(500, "Database connection failed")
+    c = conn.cursor()
+    
+    try:
+        c.execute('SELECT id, username, created_at, updated_at FROM users ORDER BY username ASC')
+        rows = c.fetchall()
+        users = []
+        for row in rows:
+            users.append({
+                "id": row[0],
+                "username": row[1],
+                "created_at": row[2],
+                "updated_at": row[3]
+            })
+        return {"users": users}
+    finally:
+        conn.close()
+
+class CreateUserReq(BaseModel):
+    username: str
+    password: str
+
+@app.post("/user/create")
+def create_user_endpoint(req: CreateUserReq, request: Request):
+    """Create a new user"""
+    session = get_session_from_request(request)
+    if not session or not session.get('user_id'):
+        raise HTTPException(401, "Authentication required")
+    
+    # Validate username
+    if not req.username or not req.username.strip():
+        raise HTTPException(400, "Username is required")
+    
+    username = req.username.strip()
+    if len(username) > 100:
+        raise HTTPException(400, "Username exceeds maximum length of 100 characters")
+    if not re.match(r'^[a-zA-Z0-9_-]+$', username):
+        raise HTTPException(400, "Username must contain only alphanumeric characters, dashes, and underscores")
+    
+    # Validate password policy
+    is_valid, error_msg = validate_password_policy(req.password)
+    if not is_valid:
+        raise HTTPException(400, error_msg)
+    
+    try:
+        user_id = create_user(username, req.password)
+        
+        # Audit log
+        try:
+            current_username = get_current_username(request)
+            log_audit("user_created", user=current_username, details=f"created_user={username}, user_id={user_id}", request=request)
+        except Exception:
+            pass
+        
+        return {"status": "ok", "message": f"User '{username}' created successfully", "user_id": user_id}
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except Exception as e:
+        logger.error(f"Error creating user: {e}", exc_info=True)
+        raise HTTPException(500, "Failed to create user")
+
+@app.delete("/user/{user_id}")
+def delete_user(user_id: int, request: Request):
+    """Delete a user"""
+    session = get_session_from_request(request)
+    if not session or not session.get('user_id'):
+        raise HTTPException(401, "Authentication required")
+    
+    current_user_id = session['user_id']
+    
+    # Prevent users from deleting themselves
+    if user_id == current_user_id:
+        raise HTTPException(400, "You cannot delete your own account")
+    
+    conn = db_connect_with_retry()
+    if not conn:
+        raise HTTPException(500, "Database connection failed")
+    c = conn.cursor()
+    
+    try:
+        # Get username before deletion for audit log
+        c.execute('SELECT username FROM users WHERE id = ?', (user_id,))
+        user_row = c.fetchone()
+        if not user_row:
+            raise HTTPException(404, "User not found")
+        
+        username = user_row[0]
+        
+        # Delete user
+        c.execute('DELETE FROM users WHERE id = ?', (user_id,))
+        
+        if c.rowcount == 0:
+            raise HTTPException(404, "User not found")
+        
+        conn.commit()
+        
+        # Audit log
+        try:
+            current_username = get_current_username(request)
+            log_audit("user_deleted", user=current_username, details=f"deleted_user={username}, user_id={user_id}", request=request)
+        except Exception:
+            pass
+        
+        return {"status": "ok", "message": f"User '{username}' deleted successfully"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error deleting user: {e}", exc_info=True)
+        raise HTTPException(500, "Failed to delete user")
+    finally:
+        conn.close()
+
 @app.post("/auth/token")
 def auth_token(req: TokenReq):
     # Validate inputs
@@ -1615,14 +2687,20 @@ def set_hostname(request: Request, req: HostnameReq):
 
 @app.post("/user/password")
 def set_password(request: Request, req: UserPassReq):
-    token = get_access_token_from_request(request, req.fabric_host)
-    if not token:
-        raise HTTPException(401, "Missing access_token in session or Authorization header")
-    user_id = get_userId(req.fabric_host, token, req.username)
-    if not user_id:
-        raise HTTPException(404, "User not found")
-    change_password(req.fabric_host, token, user_id, req.new_password)
-    return {"status": "ok"}
+    try:
+        token = get_access_token_from_request(request, req.fabric_host)
+        if not token:
+            raise HTTPException(401, "Missing access_token in session or Authorization header")
+        user_id = get_userId(req.fabric_host, token, req.username)
+        if not user_id:
+            raise HTTPException(404, f"User '{req.username}' not found on host {req.fabric_host}")
+        change_fabricstudio_password(req.fabric_host, token, user_id, req.new_password)
+        return {"status": "ok"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error changing password for user '{req.username}' on host {req.fabric_host}: {e}", exc_info=True)
+        raise HTTPException(500, f"Failed to change password: {str(e)}")
 
 
 @app.post("/runtime/reset")
@@ -1651,27 +2729,46 @@ def repo_refresh(request: Request, fabric_host: str):
     token = get_access_token_from_request(request, fabric_host)
     if not token:
         raise HTTPException(401, "Missing access_token in session or Authorization header")
-    refresh_repositories(fabric_host, token)
-    return {"status": "ok"}
-
-
-@app.get("/repo/template")
-def repo_template(request: Request, fabric_host: str, template_name: str, repo_name: str, version: str):
-    fabric_host = validate_fabric_host(fabric_host)
-    template_name = validate_template_name(template_name)
-    version = validate_version(version)
-    # Validate repo_name
-    if not repo_name or not repo_name.strip():
-        raise HTTPException(400, "Repository name is required")
-    repo_name = repo_name.strip()
     
-    token = get_access_token_from_request(request, fabric_host)
-    if not token:
-        raise HTTPException(401, "Missing access_token in session or Authorization header")
-    tid = get_template(fabric_host, token, template_name, repo_name, version)
-    if tid is None:
-        raise HTTPException(404, "Template not found")
-    return {"template_id": tid}
+    # Log refresh start
+    refresh_id = log_repository_refresh(fabric_host, 'started')
+    
+    # Refresh repositories
+    success = refresh_repositories(fabric_host, token)
+    
+    # Invalidate repository cache after refresh (but keep template cache for durability)
+    conn = db_connect_with_retry()
+    if conn:
+        try:
+            c = conn.cursor()
+            c.execute('DELETE FROM cached_repositories WHERE fabric_host = ?', (fabric_host,))
+            # Don't delete template cache - it will be updated incrementally when templates are fetched
+            conn.commit()
+        except Exception as e:
+            logger.error(f"Error invalidating cache: {e}")
+        finally:
+            conn.close()
+    
+    # Log refresh completion
+    if success:
+        # Get repository count after refresh (don't use cache since we just invalidated it)
+        repos = list_repositories(fabric_host, token)
+        repo_count = len(repos) if repos else 0
+        log_repository_refresh(fabric_host, 'completed', repositories_count=repo_count)
+        return {"status": "ok", "message": "Repository refresh initiated"}
+    else:
+        log_repository_refresh(fabric_host, 'failed', error_message="Refresh request failed")
+        raise HTTPException(500, "Repository refresh failed")
+
+@app.get("/repo/refresh/status")
+def repo_refresh_status(fabric_host: str):
+    """Get the latest refresh status for a fabric host"""
+    fabric_host = validate_fabric_host(fabric_host)
+    status = get_latest_refresh_status(fabric_host)
+    if status:
+        return status
+    else:
+        return {"status": "unknown", "message": "No refresh history found"}
 
 
 @app.post("/model/fabric")
@@ -1698,7 +2795,7 @@ def model_fabric_create(request: Request, req: CreateFabricReq):
     
     if not success:
         try:
-            log_audit("fabric_create_error", details=f"host={req.fabric_host} template={req.template_name} version={req.version} errors={' ; '.join(errors) if errors else 'unknown'} duration_s={create_duration:.1f}", ip_address=get_client_ip(request))
+            log_audit("fabric_create_error", details=f"host={req.fabric_host} template={req.template_name} version={req.version} errors={' ; '.join(errors) if errors else 'unknown'} duration_s={create_duration:.1f}", request=request)
         except Exception:
             pass
         error_msg = "Failed to create fabric"
@@ -1708,7 +2805,7 @@ def model_fabric_create(request: Request, req: CreateFabricReq):
             error_msg += ": creation timed out or encountered an error"
         raise HTTPException(500, error_msg)
     try:
-        log_audit("fabric_created", details=f"host={req.fabric_host} template={req.template_name} version={req.version} duration_s={create_duration:.1f}", ip_address=get_client_ip(request))
+        log_audit("fabric_created", details=f"host={req.fabric_host} template={req.template_name} version={req.version} duration_s={create_duration:.1f}", request=request)
     except Exception:
         pass
     return {"status": "ok", "message": "Fabric created successfully"}
@@ -1738,7 +2835,7 @@ def model_fabric_install(request: Request, req: InstallFabricReq):
     
     if not success:
         try:
-            log_audit("fabric_install_error", details=f"host={req.fabric_host} template={req.template_name} version={req.version} errors={' ; '.join(errors) if errors else 'unknown'} duration_s={install_duration:.1f}", ip_address=get_client_ip(request))
+            log_audit("fabric_install_error", details=f"host={req.fabric_host} template={req.template_name} version={req.version} errors={' ; '.join(errors) if errors else 'unknown'} duration_s={install_duration:.1f}", request=request)
         except Exception:
             pass
         error_msg = "Failed to install fabric"
@@ -1748,7 +2845,7 @@ def model_fabric_install(request: Request, req: InstallFabricReq):
             error_msg += ": installation timed out or encountered an error"
         raise HTTPException(500, error_msg)
     try:
-        log_audit("fabric_installed", details=f"host={req.fabric_host} template={req.template_name} version={req.version} duration_s={install_duration:.1f}", ip_address=get_client_ip(request))
+        log_audit("fabric_installed", details=f"host={req.fabric_host} template={req.template_name} version={req.version} duration_s={install_duration:.1f}", request=request)
     except Exception:
         pass
     return {"status": "ok", "message": "Fabric installed successfully"}
@@ -1800,31 +2897,8 @@ def tasks_errors(request: Request, fabric_host: str, limit: int = 20, fabric_nam
     return {"errors": errors, "count": len(errors)}
 
 
-def _init_db():
-    cache_db_path = os.environ.get("CACHE_DB_PATH", "cache.db")
-    # In Docker, store cache.db in data directory (same location as main DB)
-    if DB_PATH and "/app/data" in DB_PATH:
-        cache_db_path = os.path.join(os.path.dirname(DB_PATH), "cache.db")
-    elif DB_PATH and DB_PATH != "fabricstudio_ui.db":
-        # If DB_PATH is customized, put cache.db in same directory
-        cache_db_path = os.path.join(os.path.dirname(DB_PATH), "cache.db")
-    conn = sqlite3.connect(cache_db_path)
-    cur = conn.cursor()
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS templates (
-            id INTEGER PRIMARY KEY,
-            name TEXT,
-            version TEXT,
-            repository_id INTEGER,
-            repository_name TEXT,
-            raw_json TEXT,
-            updated_at INTEGER
-        )
-        """
-    )
-    conn.commit()
-    return conn
+# Legacy _init_db() function removed - cache.db is deprecated
+# All template caching now uses cached_templates table in main database
 
 
 @app.post("/preparation/confirm")
@@ -1832,130 +2906,445 @@ def preparation_confirm(request: Request, fabric_host: str):
     token = get_access_token_from_request(request, fabric_host)
     if not token:
         raise HTTPException(401, "Missing access_token in session or Authorization header")
+    
+    # Log refresh start
+    log_repository_refresh(fabric_host, 'started')
+    
     # 1) refresh repos (async on host)
-    refresh_repositories(fabric_host, token)
+    success = refresh_repositories(fabric_host, token)
+    
     # Wait for background repo refresh tasks to complete to ensure templates are up to date
     try:
         check_tasks(fabric_host, token, display_progress=False)
     except Exception:
         # Best-effort wait; continue even if polling fails
         pass
+    
+    # Invalidate repository cache after refresh (but keep template cache for durability)
+    conn = db_connect_with_retry()
+    if conn:
+        try:
+            c = conn.cursor()
+            c.execute('DELETE FROM cached_repositories WHERE fabric_host = ?', (fabric_host,))
+            # Don't delete template cache - it will be updated incrementally when templates are fetched
+            conn.commit()
+        except Exception as e:
+            logger.error(f"Error invalidating cache: {e}")
+        finally:
+            conn.close()
+    
     # 2) fetch all templates across repos
     templates = list_all_templates(fabric_host, token)
-    # 3) store/refresh cache
-    conn = _init_db()
-    cur = conn.cursor()
-    # Only replace cache if we actually fetched templates
+    
+    # Cache the templates
     if templates:
-        cur.execute("DELETE FROM templates")
-    now = int(time.time())
-    for t in templates:
-        cur.execute(
-            "INSERT OR REPLACE INTO templates (id, name, version, repository_id, repository_name, raw_json, updated_at) VALUES (?,?,?,?,?,?,?)",
-            (
-                t.get('id'), t.get('name'), t.get('version'),
-                t.get('repository') or t.get('repository_id'), t.get('repository_name'),
-                str(t), now
-            )
-        )
-    conn.commit()
-    conn.close()
-    return {"count": len(templates)}
-
-
-@app.get("/cache/templates")
-def cache_templates_get():
-    conn = _init_db()
-    cur = conn.cursor()
-    cur.execute("SELECT id, name, version, repository_id, repository_name FROM templates")
-    rows = cur.fetchall()
-    conn.close()
-    templates = [
-        {
-            "template_id": r[0],
-            "template_name": r[1],
-            "version": r[2],
-            "repo_id": r[3],
-            "repo_name": r[4],
-        }
-        for r in rows
-    ]
-    return {"templates": templates}
-
-
-class CacheTemplatesReq(BaseModel):
-    templates: list
-
-
-@app.post("/cache/templates")
-def cache_templates_post(req: CacheTemplatesReq):
-    conn = _init_db()
-    cur = conn.cursor()
-    cur.execute("DELETE FROM templates")
-    now = int(time.time())
-    count = 0
-    for t in req.templates:
-        cur.execute(
-            "INSERT OR REPLACE INTO templates (id, name, version, repository_id, repository_name, raw_json, updated_at) VALUES (?,?,?,?,?,?,?)",
-            (
-                t.get('template_id'), t.get('template_name'), t.get('version'),
-                None, t.get('repo_name'), str(t), now
-            )
-        )
-        count += 1
-    conn.commit()
-    conn.close()
-    return {"count": count}
-
-
-@app.get("/repo/templates/list")
-def repo_templates_list_proxy(request: Request, fabric_host: str, repo_name: str):
-    token = get_access_token_from_request(request, fabric_host)
-    if not token:
-        raise HTTPException(401, "Missing access_token in session or Authorization header")
-    repo_id = get_repositoryId(fabric_host, token, repo_name)
-    if not repo_id:
-        # Fallback: list repos and try case-insensitive/alt-field match
+        cache_templates(templates)
+    
+    # Log refresh completion
+    if success:
         repos = list_repositories(fabric_host, token)
-        target = None
-        for r in repos:
-            name = (r.get("name") or "").strip()
-            code = (r.get("code") or "").strip()
-            if name.lower() == repo_name.strip().lower() or code.lower() == repo_name.strip().lower():
-                target = r
-                break
-        if target:
-            repo_id = target.get("id")
-        if not repo_id:
-            raise HTTPException(404, "Repository not found")
-    templates = list_templates_for_repo(fabric_host, token, repo_id)
-    # Normalize response to include name, version, id
-    out = [
-        {"id": t.get("id"), "name": t.get("name"), "version": t.get("version")}
-        for t in templates
-    ]
-    return {"templates": out}
+        repo_count = len(repos) if repos else 0
+        log_repository_refresh(fabric_host, 'completed', repositories_count=repo_count)
+    else:
+        log_repository_refresh(fabric_host, 'failed', error_message="Refresh request failed")
+    
+    # Cache population removed - templates are fetched but not stored in cache table
+    return {"count": len(templates) if templates else 0}
 
 
-@app.get("/repo/remotes")
-def repo_remotes(request: Request, fabric_host: str):
-    token = get_access_token_from_request(request, fabric_host)
-    if not token:
-        raise HTTPException(401, "Missing access_token in session or Authorization header")
-    repos = list_repositories(fabric_host, token)
-    out = [
-        {"id": r.get("id"), "name": r.get("name")}
-        for r in repos
-    ]
-    return {"repositories": out}
+# Legacy cache.db endpoints removed - now using cached_templates table only
+# See get_cached_templates() and cache_templates() below for current implementation
 
 
+# Repository cache functions
+def get_cached_repositories(fabric_host: str):
+    """Get cached repositories for a host if cache is still valid"""
+    conn = db_connect_with_retry()
+    if not conn:
+        return None
+    
+    try:
+        c = conn.cursor()
+        now = datetime.now(timezone.utc)
+        
+        # Get all cached repositories for this host that haven't expired
+        c.execute('''
+            SELECT repo_id, repo_name, repo_data
+            FROM cached_repositories
+            WHERE fabric_host = ? AND expires_at > ?
+            ORDER BY repo_name
+        ''', (fabric_host, now.isoformat()))
+        
+        rows = c.fetchall()
+        if rows:
+            repos = []
+            for repo_id, repo_name, repo_data_json in rows:
+                try:
+                    repo_data = json.loads(repo_data_json)
+                    repos.append(repo_data)
+                except (json.JSONDecodeError, TypeError):
+                    continue
+            logger.debug(f"Retrieved {len(repos)} cached repositories for {fabric_host}")
+            return repos
+        return None
+    except Exception as e:
+        logger.error(f"Error retrieving cached repositories: {e}")
+        return None
+    finally:
+        conn.close()
+
+def cache_repositories(fabric_host: str, repositories: list):
+    """Cache repositories for a host with TTL"""
+    if not repositories:
+        return
+    
+    conn = db_connect_with_retry()
+    if not conn:
+        return
+    
+    try:
+        c = conn.cursor()
+        now = datetime.now(timezone.utc)
+        expires_at = now + timedelta(hours=Config.REPO_CACHE_TTL_HOURS)
+        
+        # Delete existing cache for this host
+        c.execute('DELETE FROM cached_repositories WHERE fabric_host = ?', (fabric_host,))
+        
+        # Insert new cache entries
+        for repo in repositories:
+            repo_id = repo.get('id')
+            repo_name = repo.get('name')
+            if not repo_id or not repo_name:
+                continue
+            
+            try:
+                repo_data_json = json.dumps(repo)
+                c.execute('''
+                    INSERT OR REPLACE INTO cached_repositories 
+                    (fabric_host, repo_id, repo_name, repo_data, cached_at, expires_at)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                ''', (fabric_host, str(repo_id), repo_name, repo_data_json, now.isoformat(), expires_at.isoformat()))
+            except Exception as e:
+                logger.error(f"Error caching repository {repo_name}: {e}")
+                continue
+        
+        conn.commit()
+        logger.info(f"Cached {len(repositories)} repositories for {fabric_host}")
+    except Exception as e:
+        logger.error(f"Error caching repositories: {e}")
+        conn.rollback()
+    finally:
+        conn.close()
+
+def log_repository_refresh(fabric_host: str, status: str, error_message: str = None, repositories_count: int = None):
+    """Log repository refresh operation"""
+    conn = db_connect_with_retry()
+    if not conn:
+        return None
+    
+    try:
+        c = conn.cursor()
+        now = datetime.now(timezone.utc)
+        
+        if status == 'started':
+            c.execute('''
+                INSERT INTO repository_refresh_logs 
+                (fabric_host, status, started_at)
+                VALUES (?, ?, ?)
+            ''', (fabric_host, status, now.isoformat()))
+            conn.commit()
+            refresh_id = c.lastrowid
+            return refresh_id
+        elif status in ('completed', 'failed'):
+            # Update latest refresh log for this host
+            c.execute('''
+                SELECT id FROM repository_refresh_logs
+                WHERE fabric_host = ? AND status = 'started'
+                ORDER BY started_at DESC
+                LIMIT 1
+            ''', (fabric_host,))
+            row = c.fetchone()
+            if row:
+                refresh_id = row[0]
+                c.execute('''
+                    UPDATE repository_refresh_logs
+                    SET status = ?, completed_at = ?, error_message = ?, repositories_count = ?
+                    WHERE id = ?
+                ''', (status, now.isoformat(), error_message, repositories_count, refresh_id))
+                conn.commit()
+                return refresh_id
+        return None
+    except Exception as e:
+        logger.error(f"Error logging repository refresh: {e}")
+        return None
+    finally:
+        conn.close()
+
+def get_latest_refresh_status(fabric_host: str):
+    """Get the latest refresh status for a host"""
+    conn = db_connect_with_retry()
+    if not conn:
+        return None
+    
+    try:
+        c = conn.cursor()
+        c.execute('''
+            SELECT status, started_at, completed_at, error_message, repositories_count
+            FROM repository_refresh_logs
+            WHERE fabric_host = ?
+            ORDER BY started_at DESC
+            LIMIT 1
+        ''', (fabric_host,))
+        row = c.fetchone()
+        if row:
+            return {
+                'status': row[0],
+                'started_at': row[1],
+                'completed_at': row[2],
+                'error_message': row[3],
+                'repositories_count': row[4]
+            }
+        return None
+    except Exception as e:
+        logger.error(f"Error getting refresh status: {e}")
+        return None
+    finally:
+        conn.close()
+
+# Template cache functions
+def cache_templates(templates: list):
+    """
+    Cache templates with TTL. Durable cache that compares and updates incrementally.
+    - Keeps expired templates when host is unreachable
+    - Updates existing templates and adds new ones
+    - Only removes templates that are no longer present in the new data
+    """
+    if not templates:
+        return
+    
+    conn = db_connect_with_retry()
+    if not conn:
+        return
+    
+    try:
+        c = conn.cursor()
+        now = datetime.now(timezone.utc)
+        expires_at = now + timedelta(hours=Config.TEMPLATE_CACHE_TTL_HOURS)
+        
+        # Get existing templates (including expired ones) for comparison
+        c.execute('''
+            SELECT repo_id, repo_name, template_id, template_name, version
+            FROM cached_templates
+        ''')
+        existing_templates = set()
+        for row in c.fetchall():
+            # Create a unique key: repo_name:template_name:version
+            key = f"{row[1]}:{row[3]}:{row[4] or ''}"
+            existing_templates.add(key)
+        
+        # Build set of new templates
+        new_templates = set()
+        templates_to_insert = []
+        
+        for template in templates:
+            repo_id = template.get('repository_id') or template.get('repo_id')
+            repo_name = template.get('repository_name') or template.get('repo_name')
+            template_id = template.get('id') or template.get('template_id')
+            template_name = template.get('name') or template.get('template_name')
+            version = template.get('version')
+            
+            if not repo_id or not repo_name or not template_id or not template_name:
+                continue
+            
+            # Create unique key
+            key = f"{repo_name}:{template_name}:{version or ''}"
+            new_templates.add(key)
+            templates_to_insert.append((str(repo_id), repo_name, str(template_id), template_name, version))
+        
+        # Insert or update templates (this will refresh expires_at for existing templates)
+        updated_count = 0
+        new_count = 0
+        for repo_id, repo_name, template_id, template_name, version in templates_to_insert:
+            try:
+                # Check if template already exists
+                c.execute('''
+                    SELECT id FROM cached_templates
+                    WHERE repo_name = ? AND template_name = ? AND version = ?
+                ''', (repo_name, template_name, version))
+                exists = c.fetchone()
+                
+                if exists:
+                    # Update existing template (refresh expires_at and template_id in case it changed)
+                    c.execute('''
+                        UPDATE cached_templates
+                        SET repo_id = ?, template_id = ?, cached_at = ?, expires_at = ?
+                        WHERE repo_name = ? AND template_name = ? AND version = ?
+                    ''', (repo_id, template_id, now.isoformat(), expires_at.isoformat(), repo_name, template_name, version))
+                    updated_count += 1
+                else:
+                    # Insert new template
+                    c.execute('''
+                        INSERT INTO cached_templates 
+                        (repo_id, repo_name, template_id, template_name, version, cached_at, expires_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ''', (repo_id, repo_name, template_id, template_name, version, now.isoformat(), expires_at.isoformat()))
+                    new_count += 1
+            except Exception as e:
+                logger.error(f"Error caching template {template_name}: {e}")
+                continue
+        
+        # Remove templates that are no longer present in the new data
+        # This ensures cache stays in sync with the source (LEAD_FABRIC_HOST)
+        # Only remove if we successfully fetched new data and template is not in it
+        removed_count = 0
+        templates_to_remove = existing_templates - new_templates
+        if templates_to_remove:
+            logger.debug(f"Removing {len(templates_to_remove)} templates that are no longer in source")
+            for key in templates_to_remove:
+                parts = key.split(':')
+                if len(parts) == 3:
+                    repo_name, template_name, version = parts
+                    c.execute('''
+                        DELETE FROM cached_templates
+                        WHERE repo_name = ? AND template_name = ? AND version = ?
+                    ''', (repo_name, template_name, version if version else None))
+                    removed_count += c.rowcount
+        
+        conn.commit()
+        logger.info(f"Template cache updated: {new_count} new, {updated_count} updated, {removed_count} removed (expires at {expires_at.isoformat()})")
+    except Exception as e:
+        logger.error(f"Error caching templates: {e}")
+        conn.rollback()
+    finally:
+        conn.close()
+
+def get_cached_templates_internal():
+    """
+    Get all cached templates. Returns both valid and expired templates for durability.
+    Expired templates are kept when host is unreachable to maintain cache availability.
+    """
+    conn = db_connect_with_retry()
+    if not conn:
+        return []
+    
+    try:
+        c = conn.cursor()
+        now = datetime.now(timezone.utc)
+        
+        # Get all cached templates (including expired ones for durability)
+        # Expired templates are still useful when host is unreachable
+        c.execute('''
+            SELECT repo_id, repo_name, template_id, template_name, version, cached_at, expires_at
+            FROM cached_templates
+            ORDER BY repo_name, template_name, version
+        ''')
+        
+        rows = c.fetchall()
+        templates = []
+        for row in rows:
+            expires_at_str = row[6]
+            is_expired = False
+            if expires_at_str:
+                try:
+                    expires_at = datetime.fromisoformat(expires_at_str)
+                    is_expired = expires_at <= now
+                except:
+                    pass
+            
+            templates.append({
+                "repo_id": row[0],
+                "repo_name": row[1],
+                "template_id": row[2],
+                "template_name": row[3],
+                "version": row[4],
+                "cached_at": row[5],
+                "expired": is_expired  # Indicate if template is expired but still available
+            })
+        return templates
+    except Exception as e:
+        logger.error(f"Error retrieving cached templates: {e}")
+        return []
+    finally:
+        conn.close()
+
+def get_cached_templates_for_repo(repo_name: str):
+    """Get templates for a repository from cache"""
+    templates = get_cached_templates_internal()
+    if not templates:
+        return []
+    
+    repo_input = (repo_name or "").strip().lower()
+    repo_templates = []
+    for template in templates:
+        template_repo_name = (template.get("repo_name") or "").strip().lower()
+        if template_repo_name == repo_input:
+            repo_templates.append({
+                "id": template.get("template_id"),
+                "name": template.get("template_name"),
+                "version": template.get("version")
+            })
+    return repo_templates
+
+def get_cached_template_versions(repo_name: str, template_name: str):
+    """Get versions for a template from cache"""
+    templates = get_cached_templates_internal()
+    if not templates:
+        return []
+    
+    repo_input = (repo_name or "").strip().lower()
+    template_input = (template_name or "").strip().lower()
+    versions = set()
+    
+    for template in templates:
+        template_repo_name = (template.get("repo_name") or "").strip().lower()
+        template_template_name = (template.get("template_name") or "").strip().lower()
+        if template_repo_name == repo_input and template_template_name == template_input:
+            version = template.get("version")
+            if version:
+                versions.add(version)
+    
+    return sorted(list(versions))
+
+def get_cached_template_id(repo_name: str, template_name: str, version: str):
+    """Get template ID from cache by repository name, template name, and version"""
+    templates = get_cached_templates_internal()
+    if not templates:
+        return None
+    
+    repo_input = (repo_name or "").strip().lower()
+    template_input = (template_name or "").strip().lower()
+    version_input = (version or "").strip()
+    
+    for template in templates:
+        template_repo_name = (template.get("repo_name") or "").strip().lower()
+        template_template_name = (template.get("template_name") or "").strip().lower()
+        template_version = (template.get("version") or "").strip()
+        
+        if (template_repo_name == repo_input and 
+            template_template_name == template_input and 
+            template_version == version_input):
+            return template.get("template_id")
+    
+    return None
+
+# Duplicate GET /repo/remotes endpoint removed - using the one at line 2757 with nhi_credential_id support
 # Compatibility endpoint used by preparation flow to resolve a single template_id
 @app.get("/repo/template")
 def repo_template_single(request: Request, fabric_host: str, template_name: str, repo_name: str, version: str):
+    """
+    Get template_id for a specific fabric_host.
+    
+    IMPORTANT: Template IDs are host-specific, so we always query the specific fabric_host
+    rather than using the cache (which contains template_ids from LEAD_FABRIC_HOST only).
+    The cache is useful for listing available templates, but not for getting template_ids
+    for a specific host.
+    """
+    # Always query the specific fabric_host for template_id since template_ids are host-specific
+    # The cache contains template_ids from LEAD_FABRIC_HOST, which may not match other hosts
     token = get_access_token_from_request(request, fabric_host)
     if not token:
         raise HTTPException(401, "Missing access_token in session or Authorization header")
+    
     # Resolve repository by name/code (case-insensitive)
     repos = list_repositories(fabric_host, token)
     repo_input = (repo_name or "").strip()
@@ -1967,7 +3356,7 @@ def repo_template_single(request: Request, fabric_host: str, template_name: str,
             match = r
             break
     if not match:
-        logger.warning("Repository not found for repo_name='%s'. Available repos: %s", repo_input, [ (r.get('id'), r.get('name')) for r in repos ])
+        logger.warning("Repository not found for repo_name='%s' on host %s. Available repos: %s", repo_input, fabric_host, [ (r.get('id'), r.get('name')) for r in repos ])
         raise HTTPException(404, "Repository not found")
 
     rid = match.get("id")
@@ -1978,65 +3367,58 @@ def repo_template_single(request: Request, fabric_host: str, template_name: str,
         name_norm = (t.get("name") or "").strip().lower()
         ver_val = (t.get("version") or "").strip()
         if name_norm == tname_norm and ver_val == ver_norm:
-            return {"template_id": t.get("id")}
+            template_id = t.get("id")
+            logger.debug(f"Found template_id {template_id} for {template_name} v{version} in repo {repo_name} on host {fabric_host}")
+            return {"template_id": template_id}
     sample = [{"id": x.get("id"), "name": x.get("name"), "version": x.get("version")} for x in templates[:5]]
-    logger.warning("Template not found in repo '%s'. Looking for name='%s' version='%s'. Sample: %s", match.get("name"), template_name, version, sample)
+    logger.warning("Template not found in repo '%s' on host %s. Looking for name='%s' version='%s'. Sample: %s", match.get("name"), fabric_host, template_name, version, sample)
     raise HTTPException(404, "Template not found")
 
 
 # New lightweight proxy endpoints for repository/template metadata
 @app.get("/repo/remotes")
-def repo_remotes_proxy(request: Request, fabric_host: str):
-    token = get_access_token_from_request(request, fabric_host)
-    if not token:
-        raise HTTPException(401, "Missing access_token in session or Authorization header")
-    url = f"https://{fabric_host}/api/v1/system/repository/remote"
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Cache-Control": "no-cache",
-    }
-    try:
-        resp = requests.get(url, headers=headers, verify=False, timeout=30)
-    except requests.RequestException as exc:
-        raise HTTPException(400, f"Error listing repositories: {exc}")
-    if resp.status_code != 200:
-        raise HTTPException(resp.status_code, resp.text)
-    try:
-        data = resp.json()
-    except ValueError:
-        raise HTTPException(500, "Invalid JSON from repository list")
-    objects = data.get("object", [])
+def repo_remotes_proxy(request: Request, fabric_host: str, nhi_credential_id: Optional[int] = None):
+    # Try cache first - no authentication required if cache is available
+    cached_repos = get_cached_repositories(fabric_host)
+    if cached_repos:
+        logger.debug(f"Using cached repositories for {fabric_host}")
+        repos = cached_repos
+    else:
+        # Fallback to API if cache is empty/expired
+        token = get_access_token_from_request(request, fabric_host, nhi_credential_id)
+        if not token:
+            raise HTTPException(401, "Missing access_token in session or Authorization header")
+        
+        # Fetch from API and cache
+        repos = list_repositories(fabric_host, token)
+        if repos:
+            cache_repositories(fabric_host, repos)
+    
     # Return minimal info: id and name
-    return {"repositories": [{"id": o.get("id"), "name": o.get("name")} for o in objects]}
+    return {"repositories": [{"id": r.get("id"), "name": r.get("name")} for r in repos]}
 
 
 @app.get("/repo/templates/list")
 def repo_templates_list(request: Request, fabric_host: str, repo_name: str):
+    # Try cache first - no authentication required if cache is available
+    templates = get_cached_templates_for_repo(repo_name)
+    if templates:
+        logger.debug(f"Using cached templates for repository {repo_name}")
+        return {"templates": templates}
+    
+    # Fallback to API if cache is empty/expired
     token = get_access_token_from_request(request, fabric_host)
     if not token:
         raise HTTPException(401, "Missing access_token in session or Authorization header")
-    # Resolve repo id first
-    url_repo = f"https://{fabric_host}/api/v1/system/repository/remote"
-    headers = {"Authorization": f"Bearer {token}", "Cache-Control": "no-cache"}
-    try:
-        r = requests.get(url_repo, headers=headers, verify=False, timeout=30)
-    except requests.RequestException as exc:
-        raise HTTPException(400, f"Error listing repositories: {exc}")
-    if r.status_code != 200:
-        raise HTTPException(r.status_code, r.text)
-    try:
-        repo_data = r.json()
-    except ValueError:
-        raise HTTPException(500, "Invalid JSON from repository list")
-    repo_id = None
-    for o in repo_data.get("object", []):
-        if o.get("name") == repo_name:
-            repo_id = o.get("id")
-            break
+    
+    # Resolve repo id using standardized function
+    repo_id = get_repositoryId(fabric_host, token, repo_name)
     if repo_id is None:
         raise HTTPException(404, "Repository not found")
+    
     # List templates for repo
     url_tpl = f"https://{fabric_host}/api/v1/system/repository/template?select=repository={repo_id}"
+    headers = {"Authorization": f"Bearer {token}", "Cache-Control": "no-cache"}
     try:
         t = requests.get(url_tpl, headers=headers, verify=False, timeout=30)
     except requests.RequestException as exc:
@@ -2054,12 +3436,18 @@ def repo_templates_list(request: Request, fabric_host: str, repo_name: str):
 
 @app.get("/repo/versions")
 def repo_versions(request: Request, fabric_host: str, repo_name: str, template_name: str):
+    # Try cache first - no authentication required if cache is available
+    versions = get_cached_template_versions(repo_name, template_name)
+    if versions:
+        logger.debug(f"Using cached versions for template {template_name} in repository {repo_name}")
+        return {"versions": versions}
+    
+    # Fallback to API if cache is empty/expired
     token = get_access_token_from_request(request, fabric_host)
     if not token:
         raise HTTPException(401, "Missing access_token in session or Authorization header")
-    # Reuse templates/list and filter versions - need to call with request and token
-    # Create a temporary request-like object or call the function directly
-    # For now, call the underlying function directly
+    
+    # Reuse templates/list and filter versions
     repo_id = get_repositoryId(fabric_host, token, repo_name)
     if not repo_id:
         repos = list_repositories(fabric_host, token)
@@ -2079,87 +3467,14 @@ def repo_versions(request: Request, fabric_host: str, repo_name: str, template_n
     return {"versions": list(versions)}
 
 
-# Template caching endpoints
-class CacheTemplatesReq(BaseModel):
-    templates: List[dict]  # List of {repo_id, repo_name, template_id, template_name, version}
-
-
-@app.post("/cache/templates")
-def cache_templates(req: CacheTemplatesReq):
-    """Cache templates in the database - purges all existing templates and replaces with new ones"""
-    conn = db_connect_with_retry()
-    if not conn:
-        raise HTTPException(500, "Database connection failed")
-    c = conn.cursor()
-    
-    try:
-        # Purge all existing cached templates
-        c.execute('DELETE FROM cached_templates')
-        
-        # Insert new cached templates (already deduplicated by frontend)
-        inserted_count = 0
-        for tpl in req.templates:
-            repo_id = tpl.get("repo_id")
-            repo_name = tpl.get("repo_name")
-            template_id = tpl.get("template_id")
-            template_name = tpl.get("template_name")
-            version = tpl.get("version")
-            
-            if not all([repo_id, repo_name, template_id, template_name]):
-                continue  # Skip invalid entries
-            
-            try:
-                c.execute('''
-                    INSERT OR REPLACE INTO cached_templates 
-                    (repo_id, repo_name, template_id, template_name, version, cached_at)
-                    VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-                ''', (repo_id, repo_name, template_id, template_name, version))
-                inserted_count += 1
-            except sqlite3.Error as e:
-                logger.error(f"Error inserting template {template_name}: {e}")
-                continue
-        
-        conn.commit()
-        return {"message": f"Cached {inserted_count} templates successfully", "count": inserted_count}
-    except Exception as e:
-        conn.rollback()
-        raise HTTPException(500, f"Error caching templates: {str(e)}")
-    finally:
-        conn.close()
+# Template cache population endpoint removed - cache is no longer populated
 
 
 @app.get("/cache/templates")
 def get_cached_templates():
-    """Get all cached templates (independent of hosts)"""
-    conn = db_connect_with_retry()
-    if not conn:
-        raise HTTPException(500, "Database connection failed")
-    c = conn.cursor()
-    
-    try:
-        c.execute('''
-            SELECT repo_id, repo_name, template_id, template_name, version, cached_at
-            FROM cached_templates
-            ORDER BY repo_name, template_name, version
-        ''')
-        
-        rows = c.fetchall()
-        templates = [
-            {
-                "repo_id": row[0],
-                "repo_name": row[1],
-                "template_id": row[2],
-                "template_name": row[3],
-                "version": row[4],
-                "cached_at": row[5]
-            }
-            for row in rows
-        ]
-        return {"templates": templates, "count": len(templates)}
-    except Exception as e:
-        raise HTTPException(500, f"Error retrieving cached templates: {str(e)}")
-    finally:
-        conn.close()
+    """Get all cached templates (independent of hosts) that haven't expired"""
+    templates = get_cached_templates_internal()
+    return {"templates": templates, "count": len(templates)}
 
 
 # Configuration management endpoints
@@ -2221,7 +3536,7 @@ def save_config(req: SaveConfigReq, request: Request):
         config_id = req.id if req.id is not None else c.lastrowid
         
         # Log audit event
-        log_audit(log_action, details=f"Configuration '{req.name}' (ID: {config_id})", ip_address=get_client_ip(request))
+        log_audit(log_action, details=f"Configuration '{req.name}' (ID: {config_id})", request=request)
         
         return {
             "status": "ok", 
@@ -2322,7 +3637,7 @@ def delete_config(config_id: int, request: Request):
             raise HTTPException(404, f"Configuration with id {config_id} not found")
         
         # Log audit event
-        log_audit("configuration_deleted", details=f"Configuration '{config_name}' (ID: {config_id})", ip_address=get_client_ip(request))
+        log_audit("configuration_deleted", details=f"Configuration '{config_name}' (ID: {config_id})", request=request)
         
         return {"status": "ok", "message": f"Configuration {config_id} deleted successfully"}
     except sqlite3.Error as e:
@@ -2340,7 +3655,6 @@ class CreateEventReq(BaseModel):
     configuration_id: int
     auto_run: bool = False
     id: int = None  # Optional ID for updating existing event
-    nhi_password: Optional[str] = None  # Optional password to decrypt NHI client secret for auto-run
 
 
 class EventListItem(BaseModel):
@@ -2391,6 +3705,9 @@ def save_event(req: CreateEventReq, request: Request):
         raise HTTPException(500, "Database connection failed")
     c = conn.cursor()
     
+    # Flag to track if migration already committed
+    migration_committed = False
+    
     try:
         # Verify configuration exists
         c.execute('SELECT id, name FROM configurations WHERE id = ?', (req.configuration_id,))
@@ -2427,37 +3744,137 @@ def save_event(req: CreateEventReq, request: Request):
             action = "saved"
             event_id = c.lastrowid
         
-        # If an NHI password was provided, find the configuration's NHI credential and store password encrypted
+        # Store NHI credential ID for event (no password needed - using FS_SERVER_SECRET)
         try:
-            if req.nhi_password and req.nhi_password.strip():
-                # Load configuration to extract nhiCredentialId
-                c.execute('SELECT config_data FROM configurations WHERE id = ?', (req.configuration_id,))
-                cfg_row = c.fetchone()
-                if cfg_row:
-                    cfg = json.loads(cfg_row[0])
-                    nhi_cred_id = cfg.get('nhiCredentialId')
-                    if nhi_cred_id:
-                        pwd_enc = encrypt_with_server_secret(req.nhi_password.strip())
-                        # Upsert into event_nhi_passwords
+            # Load configuration to extract nhiCredentialId
+            c.execute('SELECT config_data FROM configurations WHERE id = ?', (req.configuration_id,))
+            cfg_row = c.fetchone()
+            if cfg_row:
+                cfg = json.loads(cfg_row[0])
+                nhi_cred_id = cfg.get('nhiCredentialId')
+                if nhi_cred_id:
+                    # Store NHI credential ID
+                    try:
                         c.execute('''
-                            INSERT INTO event_nhi_passwords (event_id, nhi_credential_id, password_encrypted, updated_at)
-                            VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+                            INSERT INTO event_nhi_passwords (event_id, nhi_credential_id, updated_at)
+                            VALUES (?, ?, CURRENT_TIMESTAMP)
                             ON CONFLICT(event_id) DO UPDATE SET
                                 nhi_credential_id=excluded.nhi_credential_id,
-                                password_encrypted=excluded.password_encrypted,
                                 updated_at=CURRENT_TIMESTAMP
-                        ''', (event_id, int(nhi_cred_id), pwd_enc))
-                    else:
-                        logger.warning(f"Configuration {req.configuration_id} has no nhiCredentialId; skipping password store")
+                        ''', (event_id, int(nhi_cred_id)))
+                    except sqlite3.IntegrityError as integrity_err:
+                        if "password_encrypted" in str(integrity_err):
+                            # Migration hasn't run yet - need to rollback current transaction first
+                            logger.warning(f"Database migration needed - password_encrypted column still exists. Attempting migration...")
+                            try:
+                                # Rollback current transaction to allow migration
+                                conn.rollback()
+                                
+                                # Check if password_encrypted column exists
+                                c.execute("PRAGMA table_info(event_nhi_passwords)")
+                                columns_info = c.fetchall()
+                                columns = [row[1] for row in columns_info]
+                                if 'password_encrypted' in columns:
+                                    # Run migration in a new transaction
+                                    c.execute('PRAGMA foreign_keys=OFF')
+                                    c.execute('BEGIN TRANSACTION')
+                                    
+                                    # Clean up any leftover table from previous failed migration
+                                    c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='event_nhi_passwords_new'")
+                                    if c.fetchone():
+                                        logger.info("Cleaning up leftover event_nhi_passwords_new table from previous migration")
+                                        c.execute('DROP TABLE event_nhi_passwords_new')
+                                    
+                                    c.execute('''
+                                        CREATE TABLE event_nhi_passwords_new (
+                                            event_id INTEGER PRIMARY KEY,
+                                            nhi_credential_id INTEGER NOT NULL,
+                                            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                                            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                                            FOREIGN KEY (event_id) REFERENCES event_schedules(id) ON DELETE CASCADE,
+                                            FOREIGN KEY (nhi_credential_id) REFERENCES nhi_credentials(id) ON DELETE CASCADE
+                                        )
+                                    ''')
+                                    c.execute('''
+                                        INSERT INTO event_nhi_passwords_new 
+                                        (event_id, nhi_credential_id, created_at, updated_at)
+                                        SELECT event_id, nhi_credential_id, created_at, updated_at
+                                        FROM event_nhi_passwords
+                                    ''')
+                                    c.execute('DROP TABLE event_nhi_passwords')
+                                    c.execute('ALTER TABLE event_nhi_passwords_new RENAME TO event_nhi_passwords')
+                                    c.execute('COMMIT')
+                                    c.execute('PRAGMA foreign_keys=ON')
+                                    conn.commit()
+                                    logger.info("Successfully migrated event_nhi_passwords table during event save")
+                                    
+                                    # Now restart the event save transaction
+                                    # Re-insert/update the event (need to redo everything since we rolled back)
+                                    if req.id:
+                                        # Update existing event
+                                        c.execute('''
+                                            UPDATE event_schedules 
+                                            SET name = ?, event_date = ?, event_time = ?, configuration_id = ?, auto_run = ?, updated_at = CURRENT_TIMESTAMP
+                                            WHERE id = ?
+                                        ''', (req.name.strip(), utc_date.strftime('%Y-%m-%d'), utc_time.strftime('%H:%M'), req.configuration_id, 1 if req.auto_run else 0, req.id))
+                                        
+                                        # Clear execution records when event is updated so badge returns to green
+                                        c.execute('DELETE FROM event_executions WHERE event_id = ?', (req.id,))
+                                        
+                                        action = "updated"
+                                        event_id = req.id
+                                    else:
+                                        # Insert new event
+                                        c.execute('''
+                                            INSERT INTO event_schedules (name, event_date, event_time, configuration_id, auto_run, created_at)
+                                            VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                                        ''', (req.name.strip(), utc_date.strftime('%Y-%m-%d'), utc_time.strftime('%H:%M'), req.configuration_id, 1 if req.auto_run else 0))
+                                        action = "saved"
+                                        event_id = c.lastrowid
+                                    
+                                    # Now retry the NHI credential insert
+                                    c.execute('''
+                                        INSERT INTO event_nhi_passwords (event_id, nhi_credential_id, updated_at)
+                                        VALUES (?, ?, CURRENT_TIMESTAMP)
+                                        ON CONFLICT(event_id) DO UPDATE SET
+                                            nhi_credential_id=excluded.nhi_credential_id,
+                                            updated_at=CURRENT_TIMESTAMP
+                                    ''', (event_id, int(nhi_cred_id)))
+                                    
+                                    # Commit the entire operation
+                                    conn.commit()
+                                    migration_committed = True
+                                else:
+                                    raise integrity_err
+                            except Exception as migration_err:
+                                try:
+                                    c.execute('ROLLBACK')
+                                except:
+                                    pass
+                                try:
+                                    c.execute('PRAGMA foreign_keys=ON')
+                                except:
+                                    pass
+                                conn.rollback()
+                                logger.error(f"Failed to migrate during event save: {migration_err}", exc_info=True)
+                                raise HTTPException(500, "Database migration failed. Please restart the application.")
+                        else:
+                            raise
+                else:
+                    logger.warning(f"Configuration {req.configuration_id} has no nhiCredentialId; skipping NHI credential store")
+        except HTTPException:
+            raise
         except Exception as e:
-            logger.error(f"Error storing NHI password for event {event_id}: {e}", exc_info=True)
+            logger.error(f"Error storing NHI credential for event {event_id}: {e}", exc_info=True)
         
-        conn.commit()
+        # Only commit if migration didn't already commit
+        if not migration_committed:
+            conn.commit()
         
         # Log audit event
         log_action = "event_created" if action == "saved" else "event_updated"
         config_name = config[1] if config else f"ID {req.configuration_id}"
-        log_audit(log_action, details=f"Event '{req.name}' (ID: {event_id}) - Configuration: {config_name}", ip_address=get_client_ip(request))
+        log_audit(log_action, details=f"Event '{req.name}' (ID: {event_id}) - Configuration: {config_name}", request=request)
         
         return {"status": "ok", "message": f"Event '{req.name}' {action} successfully", "id": event_id}
     except sqlite3.Error as e:
@@ -2584,7 +4001,7 @@ def delete_event(event_id: int, request: Request):
             raise HTTPException(404, f"Event with id {event_id} not found")
         
         # Log audit event
-        log_audit("event_deleted", details=f"Event '{event_name}' (ID: {event_id})", ip_address=get_client_ip(request))
+        log_audit("event_deleted", details=f"Event '{event_name}' (ID: {event_id})", request=request)
         
         return {"status": "ok", "message": f"Event {event_id} deleted successfully"}
     except sqlite3.Error as e:
@@ -2948,21 +4365,67 @@ def run_configuration(config_data: dict, event_name: str, event_id: Optional[int
         templates_list = config_data.get('templates', [])
         install_select = config_data.get('installSelect', '')
         
+        # Initialize nhi_cred_id early so it's available for token storage
+        nhi_cred_id = None
+        
         # If client_secret missing, try retrieving from NHI sources
-        # 1) For scheduled events: from event_nhi_passwords
-        # 2) For manual runs: from provided nhiCredentialId + nhiDecryptPassword
-        if not client_secret:
+        # For scheduled events: from event_nhi_passwords (using FS_SERVER_SECRET)
+        # For manual runs: from configuration nhiCredentialId (using FS_SERVER_SECRET)
+        if not client_secret or not client_secret.strip():
             try:
                 conn = db_connect_with_retry()
                 if conn:
                     c = conn.cursor()
                     if event_id is not None:
-                        # Get stored password and related credential id for event
-                        c.execute('SELECT nhi_credential_id, password_encrypted FROM event_nhi_passwords WHERE event_id = ?', (event_id,))
+                        # Get NHI credential id for event (using FS_SERVER_SECRET)
+                        logger.info(f"Event '{event_name}': Retrieving NHI credential for event_id={event_id}")
+                        c.execute('SELECT nhi_credential_id FROM event_nhi_passwords WHERE event_id = ?', (event_id,))
                         row = c.fetchone()
                         if row:
-                            nhi_cred_id, pwd_enc = row
-                            nhi_password = decrypt_with_server_secret(pwd_enc)
+                            nhi_cred_id = row[0]
+                            logger.info(f"Event '{event_name}': Found NHI credential_id={nhi_cred_id}")
+                        else:
+                            # Fallback: try to get NHI credential ID from the configuration
+                            logger.warning(f"Event '{event_name}': No NHI credential stored for event_id={event_id}, trying to extract from configuration")
+                            try:
+                                # Get the configuration ID for this event
+                                c.execute('SELECT configuration_id FROM event_schedules WHERE id = ?', (event_id,))
+                                config_row = c.fetchone()
+                                if config_row:
+                                    config_id = config_row[0]
+                                    # Get configuration data
+                                    c.execute('SELECT config_data FROM configurations WHERE id = ?', (config_id,))
+                                    cfg_row = c.fetchone()
+                                    if cfg_row:
+                                        cfg = json.loads(cfg_row[0])
+                                        nhi_cred_id_from_config = cfg.get('nhiCredentialId')
+                                        if nhi_cred_id_from_config:
+                                            nhi_cred_id = int(nhi_cred_id_from_config)
+                                            logger.info(f"Event '{event_name}': Extracted NHI credential_id={nhi_cred_id} from configuration")
+                                            # Store it for future use
+                                            try:
+                                                c.execute('''
+                                                    INSERT INTO event_nhi_passwords (event_id, nhi_credential_id, updated_at)
+                                                    VALUES (?, ?, CURRENT_TIMESTAMP)
+                                                    ON CONFLICT(event_id) DO UPDATE SET
+                                                        nhi_credential_id=excluded.nhi_credential_id,
+                                                        updated_at=CURRENT_TIMESTAMP
+                                                ''', (event_id, nhi_cred_id))
+                                                conn.commit()
+                                                logger.info(f"Event '{event_name}': Stored NHI credential_id={nhi_cred_id} for future use")
+                                            except Exception as e:
+                                                logger.warning(f"Event '{event_name}': Failed to store NHI credential_id: {e}")
+                                        else:
+                                            logger.error(f"Event '{event_name}': Configuration {config_id} has no nhiCredentialId")
+                                    else:
+                                        logger.error(f"Event '{event_name}': Configuration {config_id} not found")
+                                else:
+                                    logger.error(f"Event '{event_name}': Event {event_id} has no configuration_id")
+                            except Exception as e:
+                                logger.error(f"Event '{event_name}': Error extracting NHI credential from configuration: {e}", exc_info=True)
+                        
+                        # If we have nhi_cred_id, fetch the credentials
+                        if nhi_cred_id:
                             # Fetch encrypted client secret and client_id
                             c.execute('SELECT client_id, client_secret_encrypted FROM nhi_credentials WHERE id = ?', (nhi_cred_id,))
                             cred = c.fetchone()
@@ -2971,12 +4434,20 @@ def run_configuration(config_data: dict, event_name: str, event_id: Optional[int
                                 if not client_id:
                                     client_id = client_id_db or client_id
                                 if client_secret_encrypted:
-                                    client_secret = decrypt_client_secret(client_secret_encrypted, nhi_password)
+                                    # Decrypt using FS_SERVER_SECRET
+                                    try:
+                                        client_secret = decrypt_with_server_secret(client_secret_encrypted)
+                                        logger.info(f"Event '{event_name}': Successfully decrypted client_secret (length={len(client_secret)})")
+                                    except Exception as e:
+                                        logger.error(f"Event '{event_name}': Failed to decrypt client_secret: {e}", exc_info=True)
+                                else:
+                                    logger.warning(f"Event '{event_name}': NHI credential {nhi_cred_id} has no encrypted client_secret")
+                            else:
+                                logger.error(f"Event '{event_name}': NHI credential {nhi_cred_id} not found in database")
                     else:
-                        # Manual run: accept NHI credential + decrypt password from payload
+                        # Manual run: get NHI credential from configuration (using FS_SERVER_SECRET)
                         nhi_cred_id_payload = config_data.get('nhiCredentialId')
-                        nhi_decrypt_password = config_data.get('nhiDecryptPassword')
-                        if nhi_cred_id_payload and nhi_decrypt_password:
+                        if nhi_cred_id_payload:
                             c.execute('SELECT client_id, client_secret_encrypted FROM nhi_credentials WHERE id = ?', (int(nhi_cred_id_payload),))
                             cred = c.fetchone()
                             if cred:
@@ -2984,7 +4455,12 @@ def run_configuration(config_data: dict, event_name: str, event_id: Optional[int
                                 if not client_id:
                                     client_id = client_id_db or client_id
                                 if client_secret_encrypted:
-                                    client_secret = decrypt_client_secret(client_secret_encrypted, nhi_decrypt_password)
+                                    # Decrypt using FS_SERVER_SECRET
+                                    try:
+                                        client_secret = decrypt_with_server_secret(client_secret_encrypted)
+                                        logger.info(f"Event '{event_name}': Successfully decrypted client_secret for manual run (length={len(client_secret)})")
+                                    except Exception as e:
+                                        logger.error(f"Event '{event_name}': Failed to decrypt client_secret for manual run: {e}", exc_info=True)
                     conn.close()
             except Exception as e:
                 logger.error(f"Event '{event_name}': Failed to retrieve/decrypt client secret: {e}", exc_info=True)
@@ -2992,19 +4468,16 @@ def run_configuration(config_data: dict, event_name: str, event_id: Optional[int
         # Step 1: Get tokens for all hosts (reuse stored if valid, otherwise fetch new)
         host_tokens = {}
         
-        # Check if we have NHI credential ID to look up stored tokens
-        nhi_cred_id = None
-        nhi_password = None
-        if event_id is not None:
+        # If nhi_cred_id wasn't set above (for scheduled events), try to get it now
+        if nhi_cred_id is None and event_id is not None:
             try:
                 conn = db_connect_with_retry()
                 if conn:
                     c = conn.cursor()
-                    c.execute('SELECT nhi_credential_id, password_encrypted FROM event_nhi_passwords WHERE event_id = ?', (event_id,))
+                    c.execute('SELECT nhi_credential_id FROM event_nhi_passwords WHERE event_id = ?', (event_id,))
                     nhi_row = c.fetchone()
                     if nhi_row:
                         nhi_cred_id = nhi_row[0]
-                        nhi_password = decrypt_with_server_secret(nhi_row[1])
                     conn.close()
             except Exception as e:
                 logger.warning(f"Event '{event_name}': Could not retrieve NHI credential info: {e}")
@@ -3014,7 +4487,7 @@ def run_configuration(config_data: dict, event_name: str, event_id: Optional[int
             token_fetched = False
             
             # First, try to reuse stored token from NHI credential if available
-            if nhi_cred_id and nhi_password:
+            if nhi_cred_id:
                 try:
                     conn = db_connect_with_retry()
                     if conn:
@@ -3027,13 +4500,17 @@ def run_configuration(config_data: dict, event_name: str, event_id: Optional[int
                                 expires_at = datetime.fromisoformat(token_expires_at_str)
                                 now = datetime.now()
                                 if expires_at > now:
-                                    # Token is still valid, reuse it
-                                    decrypted_token = decrypt_client_secret(token_encrypted, nhi_password)
-                                    host_tokens[host] = decrypted_token
-                                    delta = expires_at - now
-                                    hours = int(delta.total_seconds() // 3600)
-                                    minutes = int((delta.total_seconds() % 3600) // 60)
-                                    token_fetched = True
+                                    # Token is still valid, reuse it (decrypt using FS_SERVER_SECRET)
+                                    try:
+                                        decrypted_token = decrypt_with_server_secret(token_encrypted)
+                                        host_tokens[host] = decrypted_token
+                                        delta = expires_at - now
+                                        hours = int(delta.total_seconds() // 3600)
+                                        minutes = int((delta.total_seconds() % 3600) // 60)
+                                        token_fetched = True
+                                        logger.info(f"Event '{event_name}': Reusing stored token for {host} (expires in {hours}h {minutes}m)")
+                                    except Exception as e:
+                                        logger.warning(f"Event '{event_name}': Failed to decrypt stored token for {host}: {e}, will fetch new token")
                         conn.close()
                 except Exception as e:
                     logger.warning(f"Event '{event_name}': Error checking stored token for {host}: {e}, will fetch new token")
@@ -3041,18 +4518,50 @@ def run_configuration(config_data: dict, event_name: str, event_id: Optional[int
             # If no valid stored token, fetch a new one
             if not token_fetched:
                 try:
+                    # Verify we have credentials before attempting token fetch
+                    if not client_id or not client_secret:
+                        msg = f"Missing credentials for host {host}: client_id={bool(client_id)}, client_secret={bool(client_secret)}"
+                        logger.error(f"Event '{event_name}': {msg}")
+                        errors.append(msg)
+                        completed_at = datetime.now(timezone.utc)
+                        if execution_record_id is not None:
+                            conn = db_connect_with_retry()
+                            if conn:
+                                c = conn.cursor()
+                                try:
+                                    c.execute('''
+                                        UPDATE event_executions
+                                        SET status = ?, message = ?, errors = ?, completed_at = ?
+                                        WHERE id = ?
+                                    ''', (
+                                        'error',
+                                        msg,
+                                        json.dumps(errors),
+                                        completed_at.isoformat(),
+                                        execution_record_id
+                                    ))
+                                    conn.commit()
+                                except sqlite3.Error as db_err:
+                                    logger.error(f"Failed to update execution record: {db_err}")
+                                finally:
+                                    conn.close()
+                        return {"status": "error", "message": msg, "errors": errors, "event": event_name}
+                    
+                    logger.info(f"Event '{event_name}': Fetching new token for host {host} with client_id={client_id[:10] if client_id else 'None'}...")
+                    logger.info(f"Event '{event_name}': client_id length={len(client_id) if client_id else 0}, client_secret length={len(client_secret) if client_secret else 0}")
                     token_data = get_access_token(client_id, client_secret, host)
-                    if token_data and token_data.get("access_token"):
+                    if token_data and isinstance(token_data, dict) and token_data.get("access_token"):
+                        logger.info(f"Event '{event_name}': Successfully acquired token for host {host}")
                         host_tokens[host] = token_data.get("access_token")
                         
-                        # Store the new token in nhi_tokens if we have NHI credential
-                        if nhi_cred_id and nhi_password:
+                        # Store the new token in nhi_tokens if we have NHI credential (encrypt with FS_SERVER_SECRET)
+                        if nhi_cred_id:
                             try:
                                 expires_in = token_data.get("expires_in")
                                 if expires_in:
                                     expires_at = datetime.now() + timedelta(seconds=expires_in)
                                     token_expires_at = expires_at.isoformat()
-                                    token_encrypted = encrypt_client_secret(token_data.get("access_token"), nhi_password)
+                                    token_encrypted = encrypt_with_server_secret(token_data.get("access_token"))
                                     
                                     conn = db_connect_with_retry()
                                     if conn:
@@ -3064,9 +4573,17 @@ def run_configuration(config_data: dict, event_name: str, event_id: Optional[int
                                         ''', (nhi_cred_id, host, token_encrypted, token_expires_at))
                                         conn.commit()
                                         conn.close()
+                                        logger.info(f"Event '{event_name}': Stored new token for {host} (expires at {token_expires_at})")
                             except Exception as e:
                                 logger.warning(f"Event '{event_name}': Failed to store token for {host}: {e}")
                     else:
+                        # Log what we got back for debugging
+                        logger.error(f"Event '{event_name}': get_access_token returned: {token_data}")
+                        if token_data is None:
+                            logger.error(f"Event '{event_name}': get_access_token returned None - check logs above for OAuth2 error details")
+                        elif isinstance(token_data, dict):
+                            logger.error(f"Event '{event_name}': Token data missing access_token: {list(token_data.keys())}")
+                        
                         msg = f"Failed to acquire token for host {host}"
                         logger.error(f"Event '{event_name}': {msg}")
                         errors.append(msg)
@@ -3191,16 +4708,31 @@ def run_configuration(config_data: dict, event_name: str, event_id: Optional[int
                 logger.error(f"Event '{event_name}': {msg}")
                 errors.append(msg)
         
+        # Track hostname and password changes for execution report
+        hostname_changes = []
+        password_changes = []
+        
         # Change hostname if provided
         if new_hostname:
             for i, host in enumerate(host_tokens.keys()):
                 try:
                     hostname = f"{new_hostname}{i + 1}"
                     change_hostname(host, host_tokens[host], hostname)
+                    hostname_changes.append({
+                        "host": host,
+                        "new_hostname": hostname,
+                        "success": True
+                    })
                 except Exception as e:
                     msg = f"Error changing hostname on host {host}: {e}"
                     logger.error(f"Event '{event_name}': {msg}")
                     errors.append(msg)
+                    hostname_changes.append({
+                        "host": host,
+                        "new_hostname": f"{new_hostname}{i + 1}",
+                        "success": False,
+                        "error": str(e)
+                    })
         
         # Change password if provided
         if new_password:
@@ -3212,24 +4744,45 @@ def run_configuration(config_data: dict, event_name: str, event_id: Optional[int
                         msg = f"Guest user not found on host {host}"
                         logger.error(f"Event '{event_name}': {msg}")
                         errors.append(msg)
+                        password_changes.append({
+                            "host": host,
+                            "username": "guest",
+                            "success": False,
+                            "error": msg
+                        })
                         continue
-                    change_password(host, host_tokens[host], user_id, new_password)
+                    change_fabricstudio_password(host, host_tokens[host], user_id, new_password)
+                    password_changes.append({
+                        "host": host,
+                        "username": "guest",
+                        "success": True
+                    })
                 except Exception as e:
                     msg = f"Error changing password on host {host}: {e}"
                     logger.error(f"Event '{event_name}': {msg}")
                     errors.append(msg)
+                    password_changes.append({
+                        "host": host,
+                        "username": "guest",
+                        "success": False,
+                        "error": str(e)
+                    })
         
         # Step 3: Create all workspace templates
         fabric_creation_details = []  # Track fabric creation details
         failed_hosts = set()  # Track hosts that failed during creation
         if templates_list:
-            for template_info in templates_list:
+            logger.info(f"Event '{event_name}': Processing {len(templates_list)} template(s) for creation")
+            for idx, template_info in enumerate(templates_list, 1):
                 template_name = template_info.get('template_name', '')
                 repo_name = template_info.get('repo_name', '')
                 version = template_info.get('version', '')
                 
                 if not (template_name and repo_name and version):
+                    logger.warning(f"Event '{event_name}': Skipping template {idx}/{len(templates_list)} - missing required fields (name={template_name}, repo={repo_name}, version={version})")
                     continue
+                
+                logger.info(f"Event '{event_name}': Processing template {idx}/{len(templates_list)}: '{template_name}' v{version} from repo '{repo_name}'")
                 
                 # Check for running tasks before creating (only if there are actually running tasks)
                 for host in host_tokens.keys():
@@ -3298,9 +4851,13 @@ def run_configuration(config_data: dict, event_name: str, event_id: Optional[int
                                 # Continue to next host (this host will be skipped in future templates)
                                 continue
                         else:
+                            # Template not found - mark host as failed and continue to next host
                             msg = f"Template '{template_name}' v{version} not found on host {host}"
                             logger.error(f"Event '{event_name}': {msg}")
                             errors.append(msg)
+                            # Don't mark host as failed for template not found - it might be available on other hosts
+                            # Just continue to next host
+                            continue
                     except Exception as e:
                         # Mark host as failed on exception
                         failed_hosts.add(host)
@@ -3383,144 +4940,151 @@ def run_configuration(config_data: dict, event_name: str, event_id: Optional[int
                                 ''', (ssh_key_id,))
                                 key_row = c.fetchone()
                                 
-                                if key_row:
+                                if not key_row:
+                                    error_msg = f"SSH key with id {ssh_key_id} not found"
+                                    logger.error(f"Event '{event_name}': {error_msg}")
+                                    errors.append(error_msg)
+                                    ssh_execution_details["error"] = error_msg
+                                    # Mark all hosts as failed and stop SSH execution for this profile
+                                    for host in host_tokens.keys():
+                                        if host not in failed_hosts:
+                                            failed_hosts.add(host)
+                                            host_result = {
+                                                "host": host,
+                                                "success": False,
+                                                "commands_executed": 0,
+                                                "commands_failed": 0,
+                                                "error": error_msg
+                                            }
+                                            ssh_execution_details["hosts"].append(host_result)
+                                    # Skip SSH execution - hosts are already marked as failed
+                                else:
                                     encrypted_private_key = key_row[0]
-                                    # Get encryption password from event_nhi_passwords if available (for scheduled events)
-                                    # or from config_data.nhiDecryptPassword (for manual runs)
-                                    encryption_password = None
-                                    if event_id:
-                                        c.execute('''
-                                            SELECT password_encrypted
-                                            FROM event_nhi_passwords
-                                            WHERE event_id = ?
-                                        ''', (event_id,))
-                                        pwd_row = c.fetchone()
-                                        if pwd_row:
-                                            encryption_password = decrypt_with_server_secret(pwd_row[0])
-                                    elif is_manual_run:
-                                        # For manual runs, use the decrypt password from config_data
-                                        encryption_password = config_data.get('nhiDecryptPassword')
-                                        if not encryption_password:
-                                            logger.warning(f"Event '{event_name}': nhiDecryptPassword not found in config_data for manual run")
-                                        else:
-                                            logger.info(f"Event '{event_name}': Using nhiDecryptPassword from config_data for SSH key decryption")
-                                    
-                                    if encryption_password:
-                                        logger.info(f"Event '{event_name}': Decrypting SSH key and executing commands")
-                                        try:
-                                            private_key = decrypt_client_secret(encrypted_private_key, encryption_password)
+                                    # Decrypt using FS_SERVER_SECRET (no password required)
+                                    logger.info(f"Event '{event_name}': Decrypting SSH key and executing commands")
+                                    try:
+                                        private_key = decrypt_with_server_secret(encrypted_private_key)
+                                        
+                                        # Execute SSH commands on each host (skip failed hosts)
+                                        for host in host_tokens.keys():
+                                            # Skip hosts that failed during template creation
+                                            if host in failed_hosts:
+                                                logger.info(f"Event '{event_name}': Skipping SSH execution on failed host {host}")
+                                                continue
                                             
-                                            # Execute SSH commands on each host (skip failed hosts)
-                                            for host in host_tokens.keys():
-                                                # Skip hosts that failed during template creation
-                                                if host in failed_hosts:
-                                                    logger.info(f"Event '{event_name}': Skipping SSH execution on failed host {host}")
-                                                    continue
+                                            host_result = {
+                                                "host": host,
+                                                "success": False,
+                                                "commands_executed": 0,
+                                                "commands_failed": 0,
+                                                "error": None
+                                            }
+                                            try:
+                                                # Parse commands
+                                                command_list = [cmd.strip() for cmd in commands.split('\n') if cmd.strip()]
                                                 
+                                                if command_list:
+                                                    ssh_client = paramiko.SSHClient()
+                                                    ssh_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+                                                    
+                                                    try:
+                                                        # Try different key formats
+                                                        private_key_obj = None
+                                                        try:
+                                                            private_key_obj = paramiko.RSAKey.from_private_key(io.StringIO(private_key))
+                                                        except:
+                                                            try:
+                                                                private_key_obj = paramiko.Ed25519Key.from_private_key(io.StringIO(private_key))
+                                                            except:
+                                                                try:
+                                                                    private_key_obj = paramiko.DSSKey.from_private_key(io.StringIO(private_key))
+                                                                except:
+                                                                    try:
+                                                                        private_key_obj = paramiko.ECDSAKey.from_private_key(io.StringIO(private_key))
+                                                                    except:
+                                                                        private_key_obj = paramiko.ssh_private_key_from_string(private_key)
+                                                        
+                                                        if private_key_obj:
+                                                            ssh_client.connect(
+                                                                hostname=host,
+                                                                port=22,
+                                                                username='admin',
+                                                                pkey=private_key_obj,
+                                                                timeout=30,
+                                                                look_for_keys=False,
+                                                                allow_agent=False
+                                                            )
+                                                            
+                                                            # Execute commands
+                                                            for cmd in command_list:
+                                                                stdin, stdout, stderr = ssh_client.exec_command(cmd, timeout=300)
+                                                                exit_status = stdout.channel.recv_exit_status()
+                                                                stdout_text = stdout.read().decode('utf-8', errors='replace')
+                                                                stderr_text = stderr.read().decode('utf-8', errors='replace')
+                                                                
+                                                                host_result["commands_executed"] += 1
+                                                                
+                                                                if exit_status != 0:
+                                                                    host_result["commands_failed"] += 1
+                                                                    msg = f"SSH command '{cmd}' on {host} exited with status {exit_status}"
+                                                                    logger.warning(f"Event '{event_name}': {msg}")
+                                                                    errors.append(msg)
+                                                                
+                                                                # Check for error indicators
+                                                                output_lower = (stdout_text + stderr_text).lower()
+                                                                error_indicators = ['error', 'failed', 'failure', 'exception', 'cannot', 'unable', 'denied']
+                                                                if any(indicator in output_lower for indicator in error_indicators):
+                                                                    if exit_status == 0:
+                                                                        msg = f"Warning: Potential error detected in SSH command '{cmd}' output on {host}"
+                                                                        logger.warning(f"Event '{event_name}': {msg}")
+                                                                        errors.append(msg)
+                                                                
+                                                                # Wait after each command (including the last one)
+                                                                if ssh_wait_time > 0:
+                                                                    time.sleep(ssh_wait_time)
+                                                            
+                                                            host_result["success"] = host_result["commands_failed"] == 0
+                                                            if host_result["success"]:
+                                                                logger.info(f"Event '{event_name}': SSH commands executed successfully on {host}")
+                                                            else:
+                                                                logger.warning(f"Event '{event_name}': SSH commands failed on {host}: {host_result['commands_failed']} command(s) failed")
+                                                                # Mark host as failed - stop processing for this host
+                                                                failed_hosts.add(host)
+                                                    except Exception as e:
+                                                        msg = f"Error executing SSH commands on {host}: {e}"
+                                                        host_result["error"] = str(e)
+                                                        logger.error(f"Event '{event_name}': {msg}")
+                                                        errors.append(msg)
+                                                        # Mark host as failed - stop processing for this host
+                                                        failed_hosts.add(host)
+                                                    finally:
+                                                        ssh_client.close()
+                                            except Exception as e:
+                                                msg = f"Error connecting via SSH to {host}: {e}"
+                                                host_result["error"] = str(e)
+                                                logger.error(f"Event '{event_name}': {msg}")
+                                                errors.append(msg)
+                                                # Mark host as failed - stop processing for this host
+                                                failed_hosts.add(host)
+                                            
+                                            ssh_execution_details["hosts"].append(host_result)
+                                    except Exception as e:
+                                        msg = f"Failed to decrypt SSH key: {e}"
+                                        logger.error(f"Event '{event_name}': {msg}")
+                                        errors.append(msg)
+                                        ssh_execution_details["error"] = msg
+                                        # Mark all hosts as failed and stop SSH execution for this profile
+                                        for host in host_tokens.keys():
+                                            if host not in failed_hosts:
+                                                failed_hosts.add(host)
                                                 host_result = {
                                                     "host": host,
                                                     "success": False,
                                                     "commands_executed": 0,
                                                     "commands_failed": 0,
-                                                    "error": None
+                                                    "error": msg
                                                 }
-                                                try:
-                                                    # Parse commands
-                                                    command_list = [cmd.strip() for cmd in commands.split('\n') if cmd.strip()]
-                                                    
-                                                    if command_list:
-                                                        ssh_client = paramiko.SSHClient()
-                                                        ssh_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-                                                        
-                                                        try:
-                                                            # Try different key formats
-                                                            private_key_obj = None
-                                                            try:
-                                                                private_key_obj = paramiko.RSAKey.from_private_key(io.StringIO(private_key))
-                                                            except:
-                                                                try:
-                                                                    private_key_obj = paramiko.Ed25519Key.from_private_key(io.StringIO(private_key))
-                                                                except:
-                                                                    try:
-                                                                        private_key_obj = paramiko.DSSKey.from_private_key(io.StringIO(private_key))
-                                                                    except:
-                                                                        try:
-                                                                            private_key_obj = paramiko.ECDSAKey.from_private_key(io.StringIO(private_key))
-                                                                        except:
-                                                                            private_key_obj = paramiko.ssh_private_key_from_string(private_key)
-                                                            
-                                                            if private_key_obj:
-                                                                ssh_client.connect(
-                                                                    hostname=host,
-                                                                    port=22,
-                                                                    username='admin',
-                                                                    pkey=private_key_obj,
-                                                                    timeout=30,
-                                                                    look_for_keys=False,
-                                                                    allow_agent=False
-                                                                )
-                                                                
-                                                                # Execute commands
-                                                                for cmd in command_list:
-                                                                    stdin, stdout, stderr = ssh_client.exec_command(cmd, timeout=300)
-                                                                    exit_status = stdout.channel.recv_exit_status()
-                                                                    stdout_text = stdout.read().decode('utf-8', errors='replace')
-                                                                    stderr_text = stderr.read().decode('utf-8', errors='replace')
-                                                                    
-                                                                    host_result["commands_executed"] += 1
-                                                                    
-                                                                    if exit_status != 0:
-                                                                        host_result["commands_failed"] += 1
-                                                                        msg = f"SSH command '{cmd}' on {host} exited with status {exit_status}"
-                                                                        logger.warning(f"Event '{event_name}': {msg}")
-                                                                        errors.append(msg)
-                                                                    
-                                                                    # Check for error indicators
-                                                                    output_lower = (stdout_text + stderr_text).lower()
-                                                                    error_indicators = ['error', 'failed', 'failure', 'exception', 'cannot', 'unable', 'denied']
-                                                                    if any(indicator in output_lower for indicator in error_indicators):
-                                                                        if exit_status == 0:
-                                                                            msg = f"Warning: Potential error detected in SSH command '{cmd}' output on {host}"
-                                                                            logger.warning(f"Event '{event_name}': {msg}")
-                                                                            errors.append(msg)
-                                                                    
-                                                                    # Wait after each command (including the last one)
-                                                                    if ssh_wait_time > 0:
-                                                                        time.sleep(ssh_wait_time)
-                                                                
-                                                                host_result["success"] = host_result["commands_failed"] == 0
-                                                                if host_result["success"]:
-                                                                    logger.info(f"Event '{event_name}': SSH commands executed successfully on {host}")
-                                                                else:
-                                                                    logger.warning(f"Event '{event_name}': SSH commands failed on {host}: {host_result['commands_failed']} command(s) failed")
-                                                                    # Mark host as failed - stop processing for this host
-                                                                    failed_hosts.add(host)
-                                                        except Exception as e:
-                                                            msg = f"Error executing SSH commands on {host}: {e}"
-                                                            host_result["error"] = str(e)
-                                                            logger.error(f"Event '{event_name}': {msg}")
-                                                            errors.append(msg)
-                                                            # Mark host as failed - stop processing for this host
-                                                            failed_hosts.add(host)
-                                                        finally:
-                                                            ssh_client.close()
-                                                except Exception as e:
-                                                    msg = f"Error connecting via SSH to {host}: {e}"
-                                                    host_result["error"] = str(e)
-                                                    logger.error(f"Event '{event_name}': {msg}")
-                                                    errors.append(msg)
-                                                    # Mark host as failed - stop processing for this host
-                                                    failed_hosts.add(host)
-                                                
                                                 ssh_execution_details["hosts"].append(host_result)
-                                        except ValueError as e:
-                                            msg = f"Failed to decrypt SSH key: {e}"
-                                            logger.error(f"Event '{event_name}': {msg}")
-                                            errors.append(msg)
-                                else:
-                                    msg = "Encryption password not available for SSH key decryption"
-                                    logger.warning(f"Event '{event_name}': {msg}")
-                                    errors.append(msg)
                             else:
                                 msg = "SSH key not found in database"
                                 logger.warning(f"Event '{event_name}': {msg}")
@@ -3733,11 +5297,16 @@ def run_configuration(config_data: dict, event_name: str, event_id: Optional[int
                                 "repo_name": repo_name if 'repo_name' in locals() else '',
                                 "template_name": template_name if 'template_name' in locals() else '',
                                 "version": version if 'version' in locals() else ''
-                            } if install_select else None
+                            } if (install_select and len(installation_details) > 0) else None
                         ),
                         "installations": installation_details,
                         "installations_count": len(installation_details),
                         "install_select": install_select,
+                        "install_executed": len(installation_details) > 0,
+                        "hostname_changes": hostname_changes if 'hostname_changes' in locals() else [],
+                        "hostname_changes_count": len(hostname_changes) if 'hostname_changes' in locals() else 0,
+                        "password_changes": password_changes if 'password_changes' in locals() else [],
+                        "password_changes_count": len(password_changes) if 'password_changes' in locals() else 0,
                         "ssh_profile": ssh_execution_details if ssh_execution_details else None,
                         "duration_seconds": (completed_at - started_at).total_seconds(),
                         "started_at": started_at.isoformat(),
@@ -3831,6 +5400,8 @@ def run_configuration(config_data: dict, event_name: str, event_id: Optional[int
                                 } for t in (templates_list or []) if isinstance(t, dict)
                             ] if 'templates_list' in locals() else [],
                             "install_select": install_select if 'install_select' in locals() else '',
+                            "install_executed": len(installation_details) > 0 if 'installation_details' in locals() else False,
+                            "installations_count": len(installation_details) if 'installation_details' in locals() else 0,
                             "ssh_profile": ssh_execution_details if 'ssh_execution_details' in locals() and ssh_execution_details else None,
                             "duration_seconds": (completed_at - started_at).total_seconds()
                         }),
@@ -3862,11 +5433,10 @@ class SaveSshKeyReq(BaseModel):
     name: str
     public_key: str
     private_key: Optional[str] = None  # Optional for updates
-    encryption_password: str
 
 @app.post("/ssh-keys/save")
-def save_ssh_key(req: SaveSshKeyReq):
-    """Save or update an SSH key"""
+def save_ssh_key(req: SaveSshKeyReq, request: Request):
+    """Save or update an SSH key - private_key encrypted with FS_SERVER_SECRET"""
     import re
     
     if not req.name or not req.name.strip():
@@ -3879,9 +5449,6 @@ def save_ssh_key(req: SaveSshKeyReq):
     
     if not req.public_key or not req.public_key.strip():
         raise HTTPException(400, "Public key is required")
-    
-    if not req.encryption_password or not req.encryption_password.strip():
-        raise HTTPException(400, "Encryption password is required")
     
     conn = db_connect_with_retry()
     if not conn:
@@ -3896,11 +5463,13 @@ def save_ssh_key(req: SaveSshKeyReq):
             # Create requires a private key
             if not provided_private_key:
                 raise HTTPException(400, "Private key is required for creating a new SSH key")
-            encrypted_private_key = encrypt_client_secret(provided_private_key, req.encryption_password)
+            # Encrypt with FS_SERVER_SECRET
+            encrypted_private_key = encrypt_with_server_secret(provided_private_key)
         else:
             # Update - use provided private key if given, otherwise keep existing
             if provided_private_key:
-                encrypted_private_key = encrypt_client_secret(provided_private_key, req.encryption_password)
+                # Encrypt with FS_SERVER_SECRET
+                encrypted_private_key = encrypt_with_server_secret(provided_private_key)
             else:
                 # Keep existing encrypted private key
                 c.execute('SELECT private_key_encrypted FROM ssh_keys WHERE id = ?', (req.id,))
@@ -3945,7 +5514,8 @@ def save_ssh_key(req: SaveSshKeyReq):
         try:
             log_audit(
                 "ssh_key_created" if action == "saved" else "ssh_key_updated",
-                details=f"ssh_key_id={ssh_key_id} name={name_stripped}"
+                details=f"ssh_key_id={ssh_key_id} name={name_stripped}",
+                request=request
             )
         except Exception:
             pass
@@ -3961,55 +5531,38 @@ def save_ssh_key(req: SaveSshKeyReq):
     finally:
         conn.close()
 
-class GetSshKeyReq(BaseModel):
-    encryption_password: str
-
 @app.post("/ssh-keys/get/{ssh_key_id}")
 async def get_ssh_key(ssh_key_id: int, request: Request):
-    """Retrieve an SSH key by ID without returning the private key"""
+    """Retrieve an SSH key by ID without returning the private key - no password required"""
+    conn = db_connect_with_retry()
+    if not conn:
+        raise HTTPException(500, "Database connection failed")
+    c = conn.cursor()
+    
     try:
-        body = await request.json()
-        encryption_password = body.get("encryption_password", "").strip() if body else ""
+        c.execute('''
+            SELECT name, public_key, created_at, updated_at
+            FROM ssh_keys
+            WHERE id = ?
+        ''', (ssh_key_id,))
+        row = c.fetchone()
         
-        if not encryption_password:
-            raise HTTPException(400, "Encryption password is required")
+        if not row:
+            raise HTTPException(404, f"SSH key with id {ssh_key_id} not found")
         
-        conn = db_connect_with_retry()
-        if not conn:
-            raise HTTPException(500, "Database connection failed")
-        c = conn.cursor()
+        result = {
+            "id": ssh_key_id,
+            "name": row[0],
+            "public_key": row[1],
+            "created_at": row[2],
+            "updated_at": row[3]
+        }
         
-        try:
-            c.execute('''
-                SELECT name, public_key, created_at, updated_at
-                FROM ssh_keys
-                WHERE id = ?
-            ''', (ssh_key_id,))
-            row = c.fetchone()
-            
-            if not row:
-                raise HTTPException(404, f"SSH key with id {ssh_key_id} not found")
-            
-            result = {
-                "id": ssh_key_id,
-                "name": row[0],
-                "public_key": row[1],
-                "created_at": row[2],
-                "updated_at": row[3]
-            }
-            
-            return JSONResponse(result)
-        except HTTPException:
-            raise
-        except sqlite3.Error as e:
-            raise HTTPException(500, f"Database error: {str(e)}")
-        finally:
-            conn.close()
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error in get_ssh_key endpoint: {e}", exc_info=True)
-        raise HTTPException(500, f"Internal server error: {str(e)}")
+        return JSONResponse(result)
+    except sqlite3.Error as e:
+        raise HTTPException(500, f"Database error: {str(e)}")
+    finally:
+        conn.close()
 
 @app.get("/ssh-keys/list")
 def list_ssh_keys():
@@ -4081,7 +5634,7 @@ class SaveSshCommandProfileReq(BaseModel):
     ssh_key_id: Optional[int] = None
 
 @app.post("/ssh-command-profiles/save")
-def save_ssh_command_profile(req: SaveSshCommandProfileReq):
+def save_ssh_command_profile(req: SaveSshCommandProfileReq, request: Request):
     """Save or update an SSH command profile"""
     import re
     
@@ -4151,7 +5704,8 @@ def save_ssh_command_profile(req: SaveSshCommandProfileReq):
         try:
             log_audit(
                 "ssh_profile_created" if action == "saved" else "ssh_profile_updated",
-                details=f"profile_id={profile_id} name={name_stripped} ssh_key_id={req.ssh_key_id or ''}"
+                details=f"profile_id={profile_id} name={name_stripped} ssh_key_id={req.ssh_key_id or ''}",
+                request=request
             )
         except Exception:
             pass
@@ -4283,9 +5837,7 @@ class ExecuteSshProfileReq(BaseModel):
     fabric_host: str
     ssh_profile_id: int
     ssh_port: int = 22
-    encryption_password: str
     wait_time_seconds: int = 0  # Wait time between commands (default: 0)
-    nhi_credential_id: Optional[int] = None  # Optional NHI credential ID for password validation
 
 @app.post("/ssh-profiles/validate-password")
 async def validate_ssh_password(req: dict):
@@ -4395,13 +5947,10 @@ async def execute_ssh_profile(req: ExecuteSshProfileReq):
             key_name = key_row[0]
             encrypted_private_key = key_row[1]
             
-            if not req.encryption_password or not req.encryption_password.strip():
-                raise HTTPException(400, "Encryption password is required to decrypt SSH private key")
-            
-            # Decrypt private key
+            # Decrypt private key using FS_SERVER_SECRET
             try:
-                private_key = decrypt_client_secret(encrypted_private_key, req.encryption_password)
-            except ValueError as e:
+                private_key = decrypt_with_server_secret(encrypted_private_key)
+            except Exception as e:
                 raise HTTPException(400, f"Failed to decrypt SSH key: {str(e)}")
             
             # Execute SSH commands
@@ -4515,7 +6064,8 @@ async def execute_ssh_profile(req: ExecuteSshProfileReq):
             try:
                 log_audit(
                     "ssh_profile_executed",
-                    details=f"host={req.fabric_host} profile_id={req.ssh_profile_id} key_name={key_name} success={success}"
+                    details=f"host={req.fabric_host} profile_id={req.ssh_profile_id} key_name={key_name} success={success}",
+                    request=request
                 )
             except Exception:
                 pass
@@ -4546,7 +6096,6 @@ class SaveNhiReq(BaseModel):
     client_id: str
     # For create this is required; for update it's optional and, if omitted, the existing secret is kept
     client_secret: Optional[str] = None
-    encryption_password: str
     fabric_hosts: str = None  # Optional space-separated list of fabric hosts for getting tokens
     id: int = None  # Optional ID for updating existing credential
 
@@ -4574,12 +6123,10 @@ class GetNhiReq(BaseModel):
 
 @app.post("/nhi/save")
 def save_nhi(req: SaveNhiReq, request: Request):
-    """Save or update an NHI credential"""
+    """Save or update an NHI credential - client_secret encrypted with FS_SERVER_SECRET"""
     # Validate inputs
     name_stripped = validate_name(req.name, "Name")
     req.client_id = validate_client_id(req.client_id)
-    if not req.encryption_password or not req.encryption_password.strip():
-        raise HTTPException(400, "Encryption password is required")
     
     # Validate fabric_hosts if provided
     hosts_to_process = []
@@ -4600,10 +6147,13 @@ def save_nhi(req: SaveNhiReq, request: Request):
             if not provided_client_secret:
                 raise HTTPException(400, "Client Secret is required for creating a new credential")
             provided_client_secret = validate_client_secret(provided_client_secret)
-            encrypted_secret = encrypt_client_secret(provided_client_secret, req.encryption_password)
+            # Encrypt with FS_SERVER_SECRET
+            encrypted_secret = encrypt_with_server_secret(provided_client_secret)
         elif provided_client_secret:
             # Update with new secret - validate it
             provided_client_secret = validate_client_secret(provided_client_secret)
+            # Encrypt with FS_SERVER_SECRET
+            encrypted_secret = encrypt_with_server_secret(provided_client_secret)
         
         if req.id is not None:
             # Update existing credential
@@ -4620,7 +6170,6 @@ def save_nhi(req: SaveNhiReq, request: Request):
             
             # If a new client_secret is provided, update it; otherwise keep existing encrypted secret
             if provided_client_secret:
-                encrypted_secret = encrypt_client_secret(provided_client_secret, req.encryption_password)
                 c.execute('''
                     UPDATE nhi_credentials 
                     SET name = ?, client_id = ?, client_secret_encrypted = ?, updated_at = CURRENT_TIMESTAMP
@@ -4657,26 +6206,44 @@ def save_nhi(req: SaveNhiReq, request: Request):
             # Determine the client secret to use for token retrieval
             client_secret_to_use = provided_client_secret
             if not client_secret_to_use:
-                # Need to decrypt existing stored secret
-                # Fetch encrypted secret if not already available
-                if encrypted_secret is None:
-                    c.execute('SELECT client_secret_encrypted FROM nhi_credentials WHERE id = ?', (nhi_id,))
-                    row_secret = c.fetchone()
-                    if not row_secret:
-                        raise HTTPException(404, f"NHI credential with id {nhi_id} not found")
-                    encrypted_secret_db = row_secret[0]
-                else:
-                    encrypted_secret_db = encrypted_secret
+                # Need to decrypt existing stored secret using FS_SERVER_SECRET
+                c.execute('SELECT client_secret_encrypted FROM nhi_credentials WHERE id = ?', (nhi_id,))
+                row_secret = c.fetchone()
+                if not row_secret:
+                    raise HTTPException(404, f"NHI credential with id {nhi_id} not found")
+                encrypted_secret_db = row_secret[0]
                 try:
-                    client_secret_to_use = decrypt_client_secret(encrypted_secret_db, req.encryption_password)
-                except ValueError as e:
-                    raise HTTPException(400, str(e))
+                    client_secret_to_use = decrypt_with_server_secret(encrypted_secret_db)
+                    logger.info(f"Decrypted client secret length: {len(client_secret_to_use) if client_secret_to_use else 0}")
+                    logger.info(f"Decrypted client secret (first 5 chars): {client_secret_to_use[:5] if client_secret_to_use else 'None'}...")
+                    logger.info(f"Decrypted client secret (last 5 chars): ...{client_secret_to_use[-5:] if client_secret_to_use and len(client_secret_to_use) >= 5 else 'N/A'}")
+                except Exception as e:
+                    logger.error(f"Failed to decrypt client secret: {str(e)}", exc_info=True)
+                    raise HTTPException(400, f"Failed to decrypt client secret: {str(e)}")
             for fabric_host in hosts_to_process:
                 try:
-                    token_data = get_access_token(req.client_id.strip(), client_secret_to_use, fabric_host)
+                    # Ensure client_id and client_secret are properly trimmed
+                    client_id_clean = req.client_id.strip()
+                    client_secret_clean = client_secret_to_use.strip() if client_secret_to_use else None
+                    
+                    if not client_secret_clean:
+                        error_msg = f"Host {fabric_host}: Client secret is missing or empty"
+                        token_errors.append(error_msg)
+                        logger.warning(error_msg)
+                        continue
+                    
+                    logger.info(f"Attempting token retrieval for host {fabric_host} with client_id: {client_id_clean[:10]}...")
+                    logger.debug(f"Client ID: {client_id_clean[:20]}... (length: {len(client_id_clean)})")
+                    logger.debug(f"Client Secret: {client_secret_clean[:3]}... (length: {len(client_secret_clean)})")
+                    
+                    # Verify decryption worked correctly by checking if secret looks reasonable
+                    if len(client_secret_clean) < 10:
+                        logger.warning(f"Client secret seems unusually short ({len(client_secret_clean)} chars) - decryption may have failed")
+                    
+                    token_data = get_access_token(client_id_clean, client_secret_clean, fabric_host)
                     if token_data and isinstance(token_data, dict) and token_data.get("access_token"):
-                        # Encrypt the token using the same encryption password
-                        token_encrypted = encrypt_client_secret(token_data.get("access_token"), req.encryption_password)
+                        # Encrypt the token using FS_SERVER_SECRET
+                        token_encrypted = encrypt_with_server_secret(token_data.get("access_token"))
                         
                         # Calculate expiration time
                         expires_in = token_data.get("expires_in")
@@ -4719,7 +6286,7 @@ def save_nhi(req: SaveNhiReq, request: Request):
         
         # Log audit event
         log_action = "nhi_credential_created" if action == "saved" else "nhi_credential_updated"
-        log_audit(log_action, details=f"NHI credential '{name_stripped}' (ID: {nhi_id})", ip_address=get_client_ip(request))
+        log_audit(log_action, details=f"NHI credential '{name_stripped}' (ID: {nhi_id})", request=request)
         
         # Include errors in response if any occurred
         response = {"status": "ok", "message": message, "id": nhi_id}
@@ -4742,7 +6309,13 @@ def save_nhi(req: SaveNhiReq, request: Request):
 
 @app.get("/nhi/list")
 def list_nhi():
-    """List all NHI credentials (without decrypting secrets)"""
+    """List all NHI credentials (without decrypting secrets). Automatically refreshes expired tokens."""
+    # First, refresh any expired tokens proactively
+    try:
+        refresh_nhi_tokens()
+    except Exception as e:
+        logger.warning(f"Error refreshing NHI tokens in list endpoint: {e}")
+    
     conn = db_connect_with_retry()
     if not conn:
         raise HTTPException(500, "Database connection failed")
@@ -4812,122 +6385,90 @@ def list_nhi():
         conn.close()
 
 
-@app.post("/nhi/get/{nhi_id}")
+@app.get("/nhi/get/{nhi_id}")
 async def get_nhi(nhi_id: int, request: Request):
-    """Retrieve an NHI credential by ID without returning the client secret"""
+    """Retrieve an NHI credential by ID - no password required, uses FS_SERVER_SECRET"""
+    conn = db_connect_with_retry()
+    if not conn:
+        raise HTTPException(500, "Database connection failed")
+    c = conn.cursor()
+    
     try:
-        body = await request.json()
-        encryption_password = body.get("encryption_password", "").strip() if body else ""
+        # Fetch credential and tokens in parallel queries (SQLite allows this)
+        c.execute('''
+            SELECT name, client_id, client_secret_encrypted, created_at, updated_at
+            FROM nhi_credentials
+            WHERE id = ?
+        ''', (nhi_id,))
+        row = c.fetchone()
         
-        if not encryption_password:
-            raise HTTPException(400, "Encryption password is required")
+        if not row:
+            raise HTTPException(404, f"NHI credential with id {nhi_id} not found")
         
-        conn = db_connect_with_retry()
-        if not conn:
-            raise HTTPException(500, "Database connection failed")
-        c = conn.cursor()
+        # Get all tokens for this credential (decrypted)
+        c.execute('''
+            SELECT fabric_host, token_encrypted, token_expires_at
+            FROM nhi_tokens
+            WHERE nhi_credential_id = ?
+            ORDER BY fabric_host ASC
+        ''', (nhi_id,))
+        token_rows = c.fetchall()
         
+        # Decrypt client_secret using FS_SERVER_SECRET
         try:
-            # Fetch credential and tokens in parallel queries (SQLite allows this)
-            c.execute('''
-                SELECT name, client_id, client_secret_encrypted, created_at, updated_at
-                FROM nhi_credentials
-                WHERE id = ?
-            ''', (nhi_id,))
-            row = c.fetchone()
+            decrypted_client_secret = decrypt_with_server_secret(row[2])
+        except Exception as e:
+            raise HTTPException(400, f"Failed to decrypt client secret: {str(e)}")
+        
+        client_id = row[1]
+        
+        # Process tokens efficiently - combine validation and decryption in one pass
+        from datetime import datetime
+        now = datetime.now()
+        hosts_with_tokens = []
+        tokens_by_host_for_session = {}
+        
+        for token_row in token_rows:
+            fabric_host = token_row[0]
+            token_encrypted = token_row[1]
+            token_expires_at = token_row[2]
             
-            if not row:
-                raise HTTPException(404, f"NHI credential with id {nhi_id} not found")
-            
-            # Get all tokens for this credential (decrypted)
-            c.execute('''
-                SELECT fabric_host, token_encrypted, token_expires_at
-                FROM nhi_tokens
-                WHERE nhi_credential_id = ?
-                ORDER BY fabric_host ASC
-            ''', (nhi_id,))
-            token_rows = c.fetchall()
-            
-            # Decrypt client_secret for storing in session (needed for token refresh)
-            # We don't return it to the frontend, but store it encrypted in the session
+            # Check if token is valid
             try:
-                decrypted_client_secret = decrypt_client_secret(row[2], encryption_password)
-            except ValueError as e:
-                raise HTTPException(400, str(e))
-            
-            client_id = row[1]
-            
-            # Process tokens efficiently - combine validation and decryption in one pass
-            from datetime import datetime
-            now = datetime.now()
-            hosts_with_tokens = []
-            tokens_by_host_for_session = {}
-            
-            for token_row in token_rows:
-                fabric_host = token_row[0]
-                token_encrypted = token_row[1]
-                token_expires_at = token_row[2]
-                
-                # Check if token is valid
-                try:
-                    expires_at = datetime.fromisoformat(token_expires_at)
-                    if expires_at > now:
-                        # Token is valid - add to host list and decrypt for session
-                        hosts_with_tokens.append(fabric_host)
-                        try:
-                            decrypted_token = decrypt_client_secret(token_encrypted, encryption_password)
-                            tokens_by_host_for_session[fabric_host] = {
-                                "token": decrypted_token,
-                                "expires_at": token_expires_at
-                            }
-                        except ValueError:
-                            # Decryption failed, skip this token
-                            pass
-                except (ValueError, TypeError):
-                    # Date parsing failed, skip this token
-                    pass
-            
-            result = {
-                "id": nhi_id,
-                "name": row[0],
-                "client_id": row[1],
-                # Don't return tokens - they're stored server-side in the session
-                "hosts_with_tokens": hosts_with_tokens,  # Just list of hosts that have valid tokens
-                "created_at": row[3],
-                "updated_at": row[4]
-            }
-            
-            # Create session with tokens and credentials (for automatic token refresh)
-            session_id, session_key, expires_at = create_session(
-                nhi_id, 
-                encryption_password, 
-                tokens_by_host_for_session,
-                client_id=client_id,
-                client_secret=decrypted_client_secret
-            )
-            
-            # Create response with cookie
-            response = JSONResponse(result)
-            response.set_cookie(
-                key="fabricstudio_session",
-                value=session_id,
-                httponly=True,
-                secure=False,  # Set to True in production with HTTPS
-                samesite="lax",
-                max_age=3600,  # 1 hour
-                path="/"  # Make cookie available for all paths
-            )
-            
-            return response
-        except sqlite3.Error as e:
-            raise HTTPException(500, f"Database error: {str(e)}")
-        finally:
-            conn.close()
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error in get_nhi endpoint: {e}", exc_info=True)
-        raise HTTPException(500, f"Internal server error: {str(e)}")
+                expires_at = datetime.fromisoformat(token_expires_at)
+                if expires_at > now:
+                    # Token is valid - add to host list and decrypt for session
+                    hosts_with_tokens.append(fabric_host)
+                    try:
+                        decrypted_token = decrypt_with_server_secret(token_encrypted)
+                        tokens_by_host_for_session[fabric_host] = {
+                            "token": decrypted_token,
+                            "expires_at": token_expires_at
+                        }
+                    except Exception:
+                        # Decryption failed, skip this token
+                        pass
+            except (ValueError, TypeError):
+                # Date parsing failed, skip this token
+                pass
+        
+        result = {
+            "id": nhi_id,
+            "name": row[0],
+            "client_id": row[1],
+            # Don't return tokens - they're stored server-side in the session
+            "hosts_with_tokens": hosts_with_tokens,  # Just list of hosts that have valid tokens
+            "created_at": row[3],
+            "updated_at": row[4]
+        }
+        
+        # Note: Session is now user-based, so we don't create a new session here
+        # The tokens are available for use in the current user session
+        return JSONResponse(result)
+    except sqlite3.Error as e:
+        raise HTTPException(500, f"Database error: {str(e)}")
+    finally:
+        conn.close()
 
 
 @app.post("/nhi/update-token/{nhi_id}")
@@ -4985,36 +6526,6 @@ async def update_nhi_token(request: Request, nhi_id: int):
         raise
     except sqlite3.Error as e:
         conn.rollback()
-        raise HTTPException(500, f"Database error: {str(e)}")
-    finally:
-        conn.close()
-
-
-@app.delete("/nhi/delete/{nhi_id}")
-def delete_nhi_cleanup(nhi_id: int):
-    """Delete an NHI credential by ID"""
-    conn = db_connect_with_retry()
-    if not conn:
-        raise HTTPException(500, "Database connection failed")
-    c = conn.cursor()
-    
-    try:
-        c.execute('DELETE FROM nhi_credentials WHERE id = ?', (nhi_id,))
-        conn.commit()
-        
-        if c.rowcount == 0:
-            raise HTTPException(404, f"NHI credential with id {nhi_id} not found")
-        
-        # Also delete any sessions for this NHI credential
-        c.execute('DELETE FROM sessions WHERE nhi_credential_id = ?', (nhi_id,))
-        conn.commit()
-        
-        return {"status": "ok", "message": f"NHI credential {nhi_id} deleted successfully"}
-    except HTTPException:
-        raise
-    except sqlite3.Error as e:
-        conn.rollback()
-        logger.error(f"Error deleting NHI credential: {e}")
         raise HTTPException(500, f"Database error: {str(e)}")
     finally:
         conn.close()
@@ -5336,124 +6847,25 @@ class CreateSessionReq(BaseModel):
 
 @app.post("/auth/session/create")
 def create_session_endpoint(req: CreateSessionReq):
-    """Create a new session for an NHI credential"""
-    if not req.encryption_password or not req.encryption_password.strip():
-        raise HTTPException(400, "Encryption password is required")
-    
-    # Verify NHI credential exists
-    conn = db_connect_with_retry()
-    if not conn:
-        raise HTTPException(500, "Database connection failed")
-    c = conn.cursor()
-    try:
-        c.execute('SELECT id FROM nhi_credentials WHERE id = ?', (req.nhi_credential_id,))
-        if not c.fetchone():
-            raise HTTPException(404, f"NHI credential with id {req.nhi_credential_id} not found")
-        
-        # Get client_id and client_secret for storing in session (needed for token refresh)
-        c.execute('SELECT client_id, client_secret_encrypted FROM nhi_credentials WHERE id = ?', (req.nhi_credential_id,))
-        cred_row = c.fetchone()
-        if not cred_row:
-            raise HTTPException(404, f"NHI credential with id {req.nhi_credential_id} not found")
-        
-        client_id = cred_row[0]
-        try:
-            decrypted_client_secret = decrypt_client_secret(cred_row[1], req.encryption_password)
-        except ValueError as e:
-            raise HTTPException(400, str(e))
-        
-        # Get tokens for this NHI credential
-        tokens_by_host = {}
-        c.execute('''
-            SELECT fabric_host, token_encrypted, token_expires_at
-            FROM nhi_tokens
-            WHERE nhi_credential_id = ?
-        ''', (req.nhi_credential_id,))
-        
-        token_rows = c.fetchall()
-        now = datetime.now()
-        
-        for token_row in token_rows:
-            fabric_host = token_row[0]
-            token_encrypted = token_row[1]
-            token_expires_at = token_row[2]
-            
-            if token_expires_at:
-                try:
-                    expires_at = datetime.fromisoformat(token_expires_at)
-                    if expires_at > now:
-                        # Token is still valid, decrypt it
-                        try:
-                            token = decrypt_client_secret(token_encrypted, req.encryption_password)
-                            tokens_by_host[fabric_host] = {
-                                "token": token,
-                                "expires_at": token_expires_at
-                            }
-                        except ValueError:
-                            # Decryption failed, skip this token
-                            pass
-                except (ValueError, TypeError):
-                    # Invalid date format, skip this token
-                    pass
-    finally:
-        conn.close()
-    
-    # Create session with tokens and credentials (for automatic token refresh)
-    session_id, session_key, expires_at = create_session(
-        req.nhi_credential_id, 
-        req.encryption_password, 
-        tokens_by_host,
-        client_id=client_id,
-        client_secret=decrypted_client_secret
-    )
-    
-    # Create response with cookie
-    response = JSONResponse({
-        "session_id": session_id,
-        "expires_at": expires_at.isoformat()
+    """Create a new session for an NHI credential - No longer needed, tokens are stored in nhi_tokens table"""
+    # Tokens are already stored in nhi_tokens table encrypted with FS_SERVER_SECRET
+    # No need to create a separate session - return success immediately
+    return JSONResponse({
+        "message": "Session creation not needed - tokens are managed in nhi_tokens table"
     })
-    response.set_cookie(
-        key="fabricstudio_session",
-        value=session_id,
-        httponly=True,
-        secure=False,  # Set to True in production with HTTPS
-        samesite="lax",
-        max_age=3600  # 1 hour
-    )
-    
-    return response
 
 @app.get("/auth/session/status")
 def get_session_status(request: Request):
-    """Get current session status"""
+    """Get current user session status - NHI tokens are stored in nhi_tokens table, not in sessions"""
+    # Check user login session (for authentication)
     session = get_session_from_request(request)
-    if not session:
-        raise HTTPException(401, "No active session")
+    if not session or not session.get('user_id'):
+        raise HTTPException(401, "No active user session")
     
-    # Ensure expires_at is properly formatted with timezone info
-    expires_at_str = session['expires_at']
-    try:
-        # Parse and ensure UTC timezone
-        if isinstance(expires_at_str, str):
-            expires_at = datetime.fromisoformat(expires_at_str)
-            # If naive datetime, assume it's UTC (from old code)
-            if expires_at.tzinfo is None:
-                expires_at = expires_at.replace(tzinfo=timezone.utc)
-        else:
-            expires_at = expires_at_str
-        
-        # Return ISO format with timezone (JavaScript will parse this correctly)
-        expires_at_iso = expires_at.isoformat()
-    except Exception as e:
-        logger.error(f"Error formatting expires_at: {e}")
-        expires_at_iso = expires_at_str
-    
+    # User is authenticated - tokens are stored in nhi_tokens table, not in sessions
     return {
-        "session_id": session['session_id'],
-        "nhi_credential_id": session['nhi_credential_id'],
-        "created_at": session['created_at'],
-        "last_used": session['last_used'],
-        "expires_at": expires_at_iso
+        "user_id": session.get('user_id'),
+        "message": "User authenticated - tokens are managed in nhi_tokens table"
     }
 
 @app.post("/auth/session/refresh")
@@ -5469,7 +6881,6 @@ def refresh_session_endpoint(request: Request):
     
     # Update cookie
     response = JSONResponse({
-        "session_id": session['session_id'],
         "expires_at": expires_at.isoformat()
     })
     response.set_cookie(
@@ -5496,6 +6907,37 @@ def revoke_session_endpoint(request: Request):
     response.delete_cookie("fabricstudio_session")
     
     return response
+
+@app.put("/auth/session/nhi-credential")
+def update_session_nhi_credential_endpoint(request: Request, nhi_credential_id: Optional[int] = None):
+    """Update the selected NHI credential ID in the user's session"""
+    session = get_session_from_request(request)
+    if not session or not session.get('user_id'):
+        raise HTTPException(401, "Authentication required")
+    
+    # If nhi_credential_id is None, clear it from session (allow clearing)
+    if nhi_credential_id is not None:
+        # Verify the NHI credential exists
+        conn = db_connect_with_retry()
+        if not conn:
+            raise HTTPException(500, "Database connection failed")
+        c = conn.cursor()
+        try:
+            c.execute('SELECT id FROM nhi_credentials WHERE id = ?', (nhi_credential_id,))
+            if not c.fetchone():
+                raise HTTPException(404, f"NHI credential with id {nhi_credential_id} not found")
+        finally:
+            conn.close()
+    
+    # Update session (can be None to clear)
+    success = update_session_nhi_credential(session['session_id'], nhi_credential_id)
+    if not success:
+        raise HTTPException(500, "Failed to update session")
+    
+    if nhi_credential_id is None:
+        return {"status": "ok", "message": "Session NHI credential cleared"}
+    else:
+        return {"status": "ok", "message": f"Session updated with NHI credential {nhi_credential_id}"}
 
 def refresh_nhi_tokens():
     """Refresh NHI tokens from nhi_tokens table for credentials with stored event passwords"""
@@ -5524,34 +6966,15 @@ def refresh_nhi_tokens():
             
             refreshed_count = 0
             
-            # Group tokens by credential ID to batch password lookups
+            # Group tokens by credential ID
             tokens_by_credential = {}
             for nhi_cred_id, fabric_host, token_expires_at in expiring_tokens:
                 if nhi_cred_id not in tokens_by_credential:
                     tokens_by_credential[nhi_cred_id] = []
                 tokens_by_credential[nhi_cred_id].append((fabric_host, token_expires_at))
             
-            # For each credential, find events with stored passwords
+            # For each credential, refresh tokens (no password needed - using FS_SERVER_SECRET)
             for nhi_cred_id, tokens in tokens_by_credential.items():
-                # Get stored password from any event using this credential
-                c.execute('''
-                    SELECT password_encrypted
-                    FROM event_nhi_passwords
-                    WHERE nhi_credential_id = ?
-                    LIMIT 1
-                ''', (nhi_cred_id,))
-                pwd_row = c.fetchone()
-                
-                if not pwd_row:
-                    # No stored password for this credential, skip
-                    continue
-                
-                try:
-                    nhi_password = decrypt_with_server_secret(pwd_row[0])
-                except Exception as e:
-                    logger.warning(f"Failed to decrypt password for NHI credential {nhi_cred_id}: {e}")
-                    continue
-                
                 # Get client credentials
                 c.execute('''
                     SELECT client_id, client_secret_encrypted
@@ -5565,8 +6988,9 @@ def refresh_nhi_tokens():
                 
                 client_id, client_secret_encrypted = cred_row
                 
+                # Decrypt client secret using FS_SERVER_SECRET
                 try:
-                    client_secret = decrypt_client_secret(client_secret_encrypted, nhi_password)
+                    client_secret = decrypt_with_server_secret(client_secret_encrypted)
                 except Exception as e:
                     logger.warning(f"Failed to decrypt client secret for NHI credential {nhi_cred_id}: {e}")
                     continue
@@ -5581,7 +7005,7 @@ def refresh_nhi_tokens():
                             if expires_in:
                                 expires_at = datetime.now() + timedelta(seconds=expires_in)
                                 token_expires_at_new = expires_at.isoformat()
-                                token_encrypted = encrypt_client_secret(token_data.get("access_token"), nhi_password)
+                                token_encrypted = encrypt_with_server_secret(token_data.get("access_token"))
                                 
                                 # Update token in nhi_tokens
                                 c.execute('''
@@ -5654,7 +7078,7 @@ def refresh_expiring_tokens():
                             if refresh_token_for_host(session_id, host):
                                 session_refreshed_count += 1
                 except Exception as e:
-                    logger.warning(f"Error processing session {session_id} for token refresh: {e}")
+                    logger.warning(f"Error processing session for token refresh: {e}")
                     continue
         finally:
             conn.close()
@@ -5726,6 +7150,167 @@ def cleanup_executions_periodically():
         except Exception as e:
             logger.error(f"Error in execution cleanup thread: {e}", exc_info=True)
             time.sleep(3600)  # Wait 1 hour before retrying on error
+
+def refresh_repositories_periodically():
+    """Background task to refresh repositories periodically for LEAD_FABRIC_HOST using CLIENT_ID and CLIENT_SECRET from .env"""
+    # Run immediately on startup, then wait for interval
+    first_run = True
+    
+    # Small delay on startup to ensure database is fully initialized
+    time.sleep(2)
+    
+    while True:
+        try:
+            # Wait for interval before subsequent refreshes (but not before first run)
+            if not first_run:
+                time.sleep(Config.REPO_REFRESH_INTERVAL_HOURS * 60 * 60)
+            first_run = False
+            
+            # Check if configuration is available
+            fabric_host = Config.LEAD_FABRIC_HOST
+            client_id = Config.LEAD_CLIENT_ID
+            client_secret = Config.LEAD_CLIENT_SECRET
+            
+            if not fabric_host:
+                logger.warning("LEAD_FABRIC_HOST not configured, skipping periodic repository refresh")
+                # Wait before retrying
+                time.sleep(Config.REPO_REFRESH_INTERVAL_HOURS * 60 * 60)
+                continue
+            
+            if not client_id or not client_secret:
+                logger.warning("CLIENT_ID or CLIENT_SECRET not configured, skipping periodic repository refresh")
+                # Wait before retrying
+                time.sleep(Config.REPO_REFRESH_INTERVAL_HOURS * 60 * 60)
+                continue
+            
+            logger.info(f"Starting periodic repository refresh for {fabric_host}")
+            
+            try:
+                # Get access token using credentials from .env
+                token_data = get_access_token(client_id, client_secret, fabric_host)
+                
+                if not token_data or not token_data.get("access_token"):
+                    error_msg = "Failed to get access token"
+                    logger.error(f"{error_msg} for {fabric_host}")
+                    log_repository_refresh(fabric_host, 'failed', error_message=error_msg)
+                    continue
+                
+                token = token_data.get("access_token")
+                
+                # Log refresh start
+                log_repository_refresh(fabric_host, 'started')
+                
+                # Refresh repositories
+                success = refresh_repositories(fabric_host, token)
+                
+                # Invalidate cache after refresh
+                conn = db_connect_with_retry()
+                if conn:
+                    try:
+                        c = conn.cursor()
+                        c.execute('DELETE FROM cached_repositories WHERE fabric_host = ?', (fabric_host,))
+                        # Also invalidate template cache since repositories were refreshed
+                        c.execute('DELETE FROM cached_templates')
+                        conn.commit()
+                    except Exception as e:
+                        logger.error(f"Error invalidating cache for {fabric_host}: {e}")
+                    finally:
+                        conn.close()
+                
+                # Log refresh completion
+                if success:
+                    repos = list_repositories(fabric_host, token)
+                    repo_count = len(repos) if repos else 0
+                    log_repository_refresh(fabric_host, 'completed', repositories_count=repo_count)
+                    logger.info(f"Periodic repository refresh completed for {fabric_host}: {repo_count} repositories")
+                    
+                    # Refresh template cache after repository refresh
+                    try:
+                        templates = list_all_templates(fabric_host, token)
+                        if templates:
+                            cache_templates(templates)
+                            logger.info(f"Template cache refreshed after repository refresh: {len(templates)} templates")
+                    except Exception as e:
+                        logger.warning(f"Failed to refresh template cache after repository refresh: {e}")
+                else:
+                    log_repository_refresh(fabric_host, 'failed', error_message="Refresh request failed")
+                    logger.warning(f"Periodic repository refresh failed for {fabric_host}")
+            
+            except Exception as e:
+                logger.error(f"Error refreshing repositories for {fabric_host}: {e}", exc_info=True)
+                log_repository_refresh(fabric_host, 'failed', error_message=str(e))
+        
+        except Exception as e:
+            logger.error(f"Error in repository refresh background task: {e}", exc_info=True)
+            # Wait 1 hour before retrying on error
+            time.sleep(60 * 60)
+
+def refresh_template_cache_periodically():
+    """Background task to refresh template cache periodically for LEAD_FABRIC_HOST using CLIENT_ID and CLIENT_SECRET from .env"""
+    # Run immediately on startup, then wait for interval
+    first_run = True
+    
+    # Small delay on startup to ensure database is fully initialized
+    time.sleep(2)
+    
+    while True:
+        try:
+            # Wait for interval before subsequent refreshes (but not before first run)
+            if not first_run:
+                time.sleep(Config.TEMPLATE_CACHE_REFRESH_INTERVAL_HOURS * 60 * 60)
+            first_run = False
+            
+            # Check if configuration is available
+            fabric_host = Config.LEAD_FABRIC_HOST
+            client_id = Config.LEAD_CLIENT_ID
+            client_secret = Config.LEAD_CLIENT_SECRET
+            
+            if not fabric_host:
+                logger.warning("LEAD_FABRIC_HOST not configured, skipping periodic template cache refresh")
+                # Wait before retrying
+                time.sleep(Config.TEMPLATE_CACHE_REFRESH_INTERVAL_HOURS * 60 * 60)
+                continue
+            
+            if not client_id or not client_secret:
+                logger.warning("CLIENT_ID or CLIENT_SECRET not configured, skipping periodic template cache refresh")
+                # Wait before retrying
+                time.sleep(Config.TEMPLATE_CACHE_REFRESH_INTERVAL_HOURS * 60 * 60)
+                continue
+            
+            logger.info(f"Starting periodic template cache refresh for {fabric_host}")
+            
+            try:
+                # Get access token using credentials from .env
+                token_data = get_access_token(client_id, client_secret, fabric_host)
+                
+                if not token_data or not token_data.get("access_token"):
+                    error_msg = "Failed to get access token"
+                    logger.error(f"{error_msg} for {fabric_host}")
+                    logger.warning(f"Template cache refresh skipped for {fabric_host} - host may be unreachable or credentials invalid")
+                    logger.warning(f"Check network connectivity, VPN connection, firewall rules, or verify LEAD_FABRIC_HOST is correct")
+                    # Wait for interval before retrying (don't spam retries)
+                    time.sleep(Config.TEMPLATE_CACHE_REFRESH_INTERVAL_HOURS * 60 * 60)
+                    continue
+                
+                token = token_data.get("access_token")
+                
+                # Fetch all templates
+                templates = list_all_templates(fabric_host, token)
+                
+                if templates:
+                    # Cache the templates
+                    cache_templates(templates)
+                    logger.info(f"Periodic template cache refresh completed for {fabric_host}: {len(templates)} templates cached")
+                else:
+                    logger.warning(f"No templates found for {fabric_host}")
+            
+            except Exception as e:
+                logger.error(f"Error refreshing template cache for {fabric_host}: {e}", exc_info=True)
+        
+        except Exception as e:
+            logger.error(f"Error in template cache refresh background task: {e}", exc_info=True)
+            # Wait 1 hour before retrying on error
+            time.sleep(60 * 60)
 
 # Track events that have been executed to prevent duplicates
 # Background scheduler to check for events that need to run
@@ -6000,10 +7585,16 @@ scheduler_thread = None
 token_refresh_thread = None
 cleanup_thread = None
 backup_thread = None
+repo_refresh_thread = None
+template_cache_thread = None
 
 def _start_background_threads():
     """Start the background scheduler on application startup"""
-    global scheduler_thread, token_refresh_thread, cleanup_thread, backup_thread
+    global scheduler_thread, token_refresh_thread, cleanup_thread, backup_thread, repo_refresh_thread, template_cache_thread
+    
+    # Start app log worker thread (for batched app log writes)
+    _start_app_log_worker()
+    
     if scheduler_thread is None or not scheduler_thread.is_alive():
         scheduler_thread = threading.Thread(target=check_and_run_events)
         scheduler_thread.daemon = True  # Allow main process to exit
@@ -6041,6 +7632,26 @@ def _start_background_threads():
     
     # Start audit log worker thread
     _start_audit_log_worker()
+    
+    # Start repository refresh background task
+    global repo_refresh_thread
+    if repo_refresh_thread is None or not repo_refresh_thread.is_alive():
+        repo_refresh_thread = threading.Thread(target=refresh_repositories_periodically)
+        repo_refresh_thread.daemon = True
+        repo_refresh_thread.start()
+        logger.info("Repository refresh thread started")
+    else:
+        logger.warning("Repository refresh thread already running")
+    
+    # Start template cache refresh background task
+    global template_cache_thread
+    if template_cache_thread is None or not template_cache_thread.is_alive():
+        template_cache_thread = threading.Thread(target=refresh_template_cache_periodically)
+        template_cache_thread.daemon = True
+        template_cache_thread.start()
+        logger.info("Template cache refresh thread started")
+    else:
+        logger.warning("Template cache refresh thread already running")
     
     # Create initial backup on startup
     try:

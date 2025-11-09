@@ -1,19 +1,10 @@
 <div id="preparation-section" class="content-section">
   <h3>Authentication</h3>
   <div class="row">
-    <label>API Base</label>
-    <input id="apiBase" value="" size="40" type="text" />
-  </div>
-  <div class="row">
     <label>NHI Credential</label>
-    <select id="nhiCredentialSelect" style="width: 287px;">
+    <select id="nhiCredentialSelect" style="width: 292px;">
       <option value="">Select NHI credential...</option>
     </select>
-  </div>
-  <div class="row">
-    <label>Encryption Password</label>
-    <input id="nhiDecryptPassword" type="password" size="40" placeholder="Enter password to decrypt credential" />
-    <button id="btnLoadNhiCredential" style="margin-left: 4px;">Load</button>
     <span id="nhiLoadStatus" style="font-size: 12px; color: #86868b; margin-left: 8px;"></span>
   </div>
   <div class="row">
@@ -45,15 +36,6 @@
         </label>
       </div>
     </div>
-  </div>
-  <div class="row">
-    <label></label>
-    <button id="btnConfirmHosts" disabled>Confirm</button>
-    <span id="tokenStatus" class="status"></span>
-  </div>
-  <div class="row" id="hostsListRow" style="display: none;">
-    <label>Hosts</label>
-    <ul id="fabricHostList"></ul>
   </div>
   <div class="row">
     <label>Expert Mode</label>

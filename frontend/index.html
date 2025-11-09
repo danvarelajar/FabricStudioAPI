@@ -37,39 +37,43 @@
           <span style="margin-left: 4px;">FabricStudio Assistant</span>
         </h2>
         <nav class="sidebar-nav">
-          <div class="menu-group">
-            <button type="button" class="menu-item menu-parent active" data-section="preparation" id="preparation-menu">
-              FabricStudio Runs
-              <span class="menu-arrow"></span>
-            </button>
-            <div class="submenu" id="preparation-submenu">
-              <button type="button" class="menu-item submenu-item active" data-section="preparation">Run Configuration</button>
-              <button type="button" class="menu-item submenu-item" data-section="configurations">Saved Configurations</button>
-              <button type="button" class="menu-item submenu-item" data-section="ssh-command-profiles">SSH Commands Profiles</button>
-              <button type="button" class="menu-item submenu-item" data-section="reports">Reports</button>
+          <div style="flex: 1; display: flex; flex-direction: column; gap: 2px;">
+            <div class="menu-group">
+              <button type="button" class="menu-item menu-parent active" data-section="preparation" id="preparation-menu">
+                FabricStudio Runs
+                <span class="menu-arrow"></span>
+              </button>
+              <div class="submenu" id="preparation-submenu">
+                <button type="button" class="menu-item submenu-item active" data-section="preparation">Run Configuration</button>
+                <button type="button" class="menu-item submenu-item" data-section="configurations">Saved Configurations</button>
+                <button type="button" class="menu-item submenu-item" data-section="ssh-command-profiles">SSH Commands Profiles</button>
+                <button type="button" class="menu-item submenu-item" data-section="reports">Reports</button>
+              </div>
+            </div>
+            <button type="button" class="menu-item" data-section="event-schedule">Event Schedule</button>
+            <div class="menu-group">
+              <button type="button" class="menu-item menu-parent" data-section="nhi-management" id="nhi-management-menu">
+                NHI Management
+                <span class="menu-arrow"></span>
+              </button>
+              <div class="submenu" id="nhi-management-submenu">
+                <button type="button" class="menu-item submenu-item" data-section="nhi-management">NHI Credentials</button>
+                <button type="button" class="menu-item submenu-item" data-section="ssh-keys">SSH Keys</button>
+              </div>
+            </div>
+            <button type="button" class="menu-item" data-section="user-management">User Management</button>
+            <div class="menu-group">
+              <button type="button" class="menu-item menu-parent" data-section="logs" id="logs-menu">
+                Logs
+                <span class="menu-arrow"></span>
+              </button>
+              <div class="submenu" id="logs-submenu">
+                <button type="button" class="menu-item submenu-item" data-section="audit-logs">Audit Logs</button>
+                <button type="button" class="menu-item submenu-item" data-section="server-logs">Server Logs</button>
+              </div>
             </div>
           </div>
-          <button type="button" class="menu-item" data-section="event-schedule">Event Schedule</button>
-          <div class="menu-group">
-            <button type="button" class="menu-item menu-parent" data-section="nhi-management" id="nhi-management-menu">
-              NHI Management
-              <span class="menu-arrow"></span>
-            </button>
-            <div class="submenu" id="nhi-management-submenu">
-              <button type="button" class="menu-item submenu-item" data-section="nhi-management">NHI Credentials</button>
-              <button type="button" class="menu-item submenu-item" data-section="ssh-keys">SSH Keys</button>
-            </div>
-          </div>
-          <div class="menu-group">
-            <button type="button" class="menu-item menu-parent" data-section="logs" id="logs-menu">
-              Logs
-              <span class="menu-arrow"></span>
-            </button>
-            <div class="submenu" id="logs-submenu">
-              <button type="button" class="menu-item submenu-item" data-section="audit-logs">Audit Logs</button>
-              <button type="button" class="menu-item submenu-item" data-section="server-logs">Server Logs</button>
-            </div>
-          </div>
+          <button type="button" class="menu-item" id="btnLogout" style="border-top: 1px solid rgba(255, 255, 255, 0.2); padding-top: 12px; margin-top: 8px; background: #da291c; color: white; border: none; border-radius: 0; font-weight: 600;">Logout</button>
         </nav>
       </aside>
       

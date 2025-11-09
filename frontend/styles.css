@@ -130,6 +130,12 @@ body {
   height: 100vh;
   overflow-y: auto;
   z-index: 1000;
+  scrollbar-width: none; /* Firefox */
+  -ms-overflow-style: none; /* IE and Edge */
+}
+
+.sidebar::-webkit-scrollbar {
+  display: none; /* Chrome, Safari, Opera */
 }
 
 .sidebar-title {
@@ -153,6 +159,8 @@ body {
   flex-direction: column;
   gap: 2px;
   padding: 8px;
+  height: calc(100vh - 100px); /* Adjust based on sidebar-title height */
+  min-height: 0;
 }
 
 .menu-item {
@@ -176,6 +184,11 @@ body {
 
 .menu-item:hover {
   background: rgba(255, 255, 255, 0.15);
+}
+
+#btnLogout:hover {
+  background: #c92216 !important;
+  color: white !important;
 }
 
 .menu-item.active {

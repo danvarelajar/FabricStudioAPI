@@ -594,7 +594,7 @@ function validateFabricHosts(forceValidation = false) {
   renderHostChips();
   updateValidationStatus();
   
-  // If forced validation (e.g., on blur or confirm), validate current input if any
+  // If forced validation (e.g., on blur), validate current input if any
   if (forceValidation && input.value.trim()) {
     const currentValue = input.value.trim();
     const parts = currentValue.split(/\s+/).filter(p => p.trim());
@@ -612,6 +612,16 @@ function validateFabricHosts(forceValidation = false) {
     
     renderHostChips();
     updateValidationStatus();
+  }
+  
+  // Auto-confirm hosts when they're validated
+  if (validatedHosts.length > 0) {
+    autoConfirmHosts();
+    // Enable Add Row button if hosts are confirmed
+    const addRowBtn = el('btnAddRow');
+    if (addRowBtn && confirmedHosts.length > 0) {
+      addRowBtn.disabled = false;
+    }
   }
   
   // Return true if we have at least one validated host
@@ -802,12 +812,37 @@ function handleSessionExpired() {
 
 // Removed mergeAuth - tokens are now managed server-side via session cookies
 
-async function renderFabricHostList() {
+// Helper function to auto-confirm hosts when they're available
+function autoConfirmHosts() {
+  // Determine which host source to use
+  const hostSourceManual = el('hostSourceManual');
+  const useManualHosts = hostSourceManual && hostSourceManual.checked;
+  
+  let sourceValidatedHosts;
+  if (useManualHosts) {
+    sourceValidatedHosts = validatedHosts;
+  } else {
+    if (!window.validatedNhiHosts) window.validatedNhiHosts = [];
+    sourceValidatedHosts = window.validatedNhiHosts;
+  }
+  
+  // Auto-confirm hosts if we have any
+  if (sourceValidatedHosts && sourceValidatedHosts.length > 0) {
+    confirmedHosts = sourceValidatedHosts.map(({host, port}) => ({host, port}));
+    return true;
+  }
+  return false;
+}
+
+async function renderFabricHostList(shouldConfirmHosts = false) {
   const listEl = el('fabricHostList');
   if (!listEl) return;
   listEl.innerHTML = '';
   const items = parseFabricHosts();
-  confirmedHosts = items; // Store confirmed hosts
+  // Auto-confirm hosts when they're available (no manual confirmation needed)
+  if (items && items.length > 0) {
+    confirmedHosts = items; // Store confirmed hosts automatically
+  }
   
   // Use existing sessionExpiresAt instead of making API call
   // The session status will be checked when actually needed (e.g., before API calls)
@@ -850,12 +885,7 @@ async function checkRunningTasks(host, timeoutMs = 60000) {
 
 async function waitForNoRunningTasks(hosts, actionName) {
   const checks = hosts.map(async ({host}) => {
-    // Check session status first
-    const session = await checkSessionStatus();
-    if (!session) {
-      handleSessionExpired();
-      return {host, success: false, error: 'No active session'};
-    }
+    // User is already authenticated via login - proceed with check
     logMsg(`Checking for running tasks on ${host} before ${actionName}...`);
     const checkResult = await checkRunningTasks(host, 1000); // Quick check first
     if (!checkResult.running) {
@@ -885,7 +915,13 @@ async function waitForNoRunningTasks(hosts, actionName) {
 async function executeOnAllHosts(actionName, actionFn, options = {}) {
   const hosts = getAllConfirmedHosts();
   if (hosts.length === 0) {
-    showStatus('No hosts configured. Please confirm hosts first.');
+    // Auto-confirm hosts if available
+    if (autoConfirmHosts()) {
+      // Hosts are now confirmed, continue
+    } else {
+      showStatus('No hosts configured. Please add at least one valid host.');
+      return;
+    }
     return;
   }
   
@@ -896,12 +932,7 @@ async function executeOnAllHosts(actionName, actionFn, options = {}) {
   
   const results = [];
   const promises = hosts.map(async ({host}) => {
-    // Check session status - tokens are managed server-side
-    const session = await checkSessionStatus();
-    if (!session) {
-      handleSessionExpired();
-      return {host, success: false, error: 'No active session'};
-    }
+    // User is already authenticated via login - proceed with operation
     try {
       await actionFn(host, null); // Token is retrieved server-side
       return {host, success: true};
@@ -920,56 +951,85 @@ async function executeOnAllHosts(actionName, actionFn, options = {}) {
   return results;
 }
 // Load NHI credentials into dropdown
+// Cache for NHI credentials to avoid duplicate calls
+let _nhiCredentialsCache = null;
+let _nhiCredentialsLoading = null;
+
 async function loadNhiCredentialsForAuth() {
   const select = el('nhiCredentialSelect');
   if (!select) return;
   
-  try {
-    const res = await api('/nhi/list');
-    if (!res.ok) {
-      select.innerHTML = '<option value="">Error loading credentials</option>';
+  // If already loading, wait for that request
+  if (_nhiCredentialsLoading) {
+    await _nhiCredentialsLoading;
+    if (_nhiCredentialsCache) {
+      populateNhiCredentialsDropdown(select, _nhiCredentialsCache);
       return;
     }
-    
-    const data = await res.json();
-    const credentials = data.credentials || [];
-    
-    // Clear and rebuild dropdown
-    select.innerHTML = '<option value="">Select NHI credential...</option>';
-    credentials.forEach(cred => {
-      const option = document.createElement('option');
-      option.value = cred.id.toString(); // Ensure ID is a string
-      option.textContent = `${cred.name} (${cred.client_id})`;
-      select.appendChild(option);
-    });
-    
-    // If no credentials, clear any previously selected value
-    if (credentials.length === 0) {
-      select.value = '';
-    }
-  } catch (error) {
-    select.innerHTML = '<option value="">Error loading credentials</option>';
   }
-}
-
-// Load selected NHI credential with password
-async function loadSelectedNhiCredential() {
-  const select = el('nhiCredentialSelect');
-  const passwordInput = el('nhiDecryptPassword');
-  const statusSpan = el('nhiLoadStatus');
   
-  if (!select || !passwordInput) return;
-  
-  const nhiId = select.value;
-  const password = passwordInput.value.trim();
-  
-  if (!nhiId) {
-    if (statusSpan) statusSpan.textContent = 'Please select a credential';
+  // If we have cached data, use it
+  if (_nhiCredentialsCache) {
+    populateNhiCredentialsDropdown(select, _nhiCredentialsCache);
     return;
   }
   
-  if (!password) {
-    if (statusSpan) statusSpan.textContent = 'Please enter encryption password';
+  // Load credentials
+  _nhiCredentialsLoading = (async () => {
+    try {
+      const res = await api('/nhi/list');
+      if (!res.ok) {
+        select.innerHTML = '<option value="">Error loading credentials</option>';
+        return;
+      }
+      
+      const data = await res.json();
+      const credentials = data.credentials || [];
+      _nhiCredentialsCache = credentials;
+      populateNhiCredentialsDropdown(select, credentials);
+    } catch (error) {
+      select.innerHTML = '<option value="">Error loading credentials</option>';
+    } finally {
+      _nhiCredentialsLoading = null;
+    }
+  })();
+  
+  await _nhiCredentialsLoading;
+}
+
+function populateNhiCredentialsDropdown(select, credentials) {
+  // Clear and rebuild dropdown
+  select.innerHTML = '<option value="">Select NHI credential...</option>';
+  credentials.forEach(cred => {
+    const option = document.createElement('option');
+    option.value = cred.id.toString(); // Ensure ID is a string
+    option.textContent = `${cred.name} (${cred.client_id})`;
+    select.appendChild(option);
+  });
+  
+  // If no credentials, clear any previously selected value
+  if (credentials.length === 0) {
+    select.value = '';
+  }
+}
+
+// Clear NHI credentials cache (call after save/delete/update)
+function clearNhiCredentialsCache() {
+  _nhiCredentialsCache = null;
+  _requestCache.clear(); // Clear API cache for /nhi/list
+}
+
+// Load selected NHI credential - no password required
+async function loadSelectedNhiCredential() {
+  const select = el('nhiCredentialSelect');
+  const statusSpan = el('nhiLoadStatus');
+  
+  if (!select) return;
+  
+  const nhiId = select.value;
+  
+  if (!nhiId) {
+    if (statusSpan) statusSpan.textContent = 'Please select a credential';
     return;
   }
   
@@ -986,11 +1046,8 @@ async function loadSelectedNhiCredential() {
   
   try {
     if (statusSpan) statusSpan.textContent = 'Loading...';
-    const res = await api(`/nhi/get/${nhiId}`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ encryption_password: password })
-    });
+    // No password required - uses FS_SERVER_SECRET
+    const res = await api(`/nhi/get/${nhiId}`);
     
     if (!res.ok) {
       let errorText = 'Unknown error';
@@ -1013,7 +1070,7 @@ async function loadSelectedNhiCredential() {
         select.value = '';
         showStatus(`NHI credential not found. The credential may have been deleted. Please select a different one.`);
       } else if (res.status === 400) {
-        showStatus(`Failed to load NHI credential: ${errorText}. Please check your encryption password.`);
+        showStatus(`Failed to load NHI credential: ${errorText}`);
       } else {
         showStatus(`Failed to load NHI credential: ${errorText}`);
       }
@@ -1023,6 +1080,20 @@ async function loadSelectedNhiCredential() {
       currentNhiId = null;
       sessionExpiresAt = null;
       // Session-based: tokens are managed server-side
+      
+      // Clear NHI credential from session
+      try {
+        await api('/auth/session/nhi-credential', {
+          method: 'PUT',
+          params: { nhi_credential_id: null }
+        });
+      } catch (error) {
+        // Ignore errors when clearing
+      }
+      
+      // Disable Add Row button on error
+      const addRowBtnError = el('btnAddRow');
+      if (addRowBtnError) addRowBtnError.disabled = true;
       
       // Disable the NHI credential input and radio button on error
       const fabricHostFromNhiInput = el('fabricHostFromNhi');
@@ -1047,9 +1118,6 @@ async function loadSelectedNhiCredential() {
         }
       }
       
-      // Keep Confirm button disabled on error
-      const confirmBtn = el('btnConfirmHosts');
-      if (confirmBtn) confirmBtn.disabled = true;
       return;
     }
     
@@ -1072,13 +1140,24 @@ async function loadSelectedNhiCredential() {
     // decryptedClientSecret is not needed anymore - session handles tokens
     currentNhiId = parseInt(nhiId);
     
+    // Update session with selected NHI credential ID
+    try {
+      await api('/auth/session/nhi-credential', {
+        method: 'PUT',
+        params: { nhi_credential_id: currentNhiId }
+      });
+    } catch (error) {
+      console.warn(`Failed to update session with NHI credential ID: ${error.message || error}`);
+      // Continue anyway - the credential is still loaded
+    }
+    
+    // Enable Add Row button after NHI credential is selected
+    const addRowBtn = el('btnAddRow');
+    if (addRowBtn) addRowBtn.disabled = false;
+    
     // Session-based: tokens are managed server-side
     // Session is created automatically by backend when NHI credential is loaded
-    // Check session status to get expiration time
-    const session = await checkSessionStatus();
-    if (session && session.expires_at) {
-      sessionExpiresAt = new Date(session.expires_at);
-    }
+    // No need to check session status - user is already authenticated via login
     
     const nhiHosts = [];
     // Session-based: tokens are stored server-side, backend returns hosts_with_tokens array
@@ -1138,13 +1217,19 @@ async function loadSelectedNhiCredential() {
       statusSpan.style.color = '#10b981';
     }
     
-    // Enable Confirm button after successful credential load
-    const confirmBtn = el('btnConfirmHosts');
-    if (confirmBtn) confirmBtn.disabled = false;
-    
-    // Ensure Run button is disabled until hosts are confirmed
-    const runBtn = el('btnInstallSelected');
-    if (runBtn) runBtn.disabled = true;
+    // Auto-confirm hosts when NHI credential is loaded
+    if (autoConfirmHosts()) {
+      // Automatically acquire tokens
+      if (await acquireTokens()) {
+        // Enable Add Row button
+        const addRowBtn = el('btnAddRow');
+        if (addRowBtn) addRowBtn.disabled = false;
+        showStatus('Hosts confirmed and tokens acquired.', { hideAfterMs: 1000 });
+        updateCreateEnabled();
+      } else {
+        showStatus('Token acquisition failed. Please check credentials.');
+      }
+    }
     
     // Show final success message if no specific message was already shown above
     if (nhiHosts.length === 0) {
@@ -1192,10 +1277,6 @@ async function loadSelectedNhiCredential() {
         }
       }
     }
-    
-    // Keep Confirm button disabled on error
-    const confirmBtn = el('btnConfirmHosts');
-    if (confirmBtn) confirmBtn.disabled = true;
     
     // Disable Run button when credentials are cleared
     const runBtnCleared = el('btnInstallSelected');
@@ -1298,12 +1379,12 @@ function showNhiStatus(msg, opts = {}) {
 }
 
 function setActionsEnabled(enabled) {
-  const idsToSkip = new Set(['btnInstallSelected','btnConfirmHosts','btnAddRow']);
+  const idsToSkip = new Set(['btnInstallSelected','btnAddRow']);
   document.querySelectorAll('button').forEach(b => {
     if (!idsToSkip.has(b.id)) b.disabled = !enabled;
   });
   // Inputs for API config should remain enabled
-  ['apiBase','fabricHost'].forEach(id => {
+  ['fabricHost'].forEach(id => {
     const i = el(id);
     if (i) i.disabled = false;
   });
@@ -1313,17 +1394,49 @@ function setActionsEnabled(enabled) {
   }
 }
 
+// Request cache to prevent duplicate calls (for GET requests only)
+const _requestCache = new Map();
+const _requestCacheTimeout = 5000; // Cache for 5 seconds
+const _pendingRequests = new Map(); // Track in-flight requests to deduplicate
+
 // Generic API wrapper with optional params - cookies are included automatically
 async function api(path, options = {}) {
-  const baseInput = el('apiBase');
-  const base = baseInput ? baseInput.value.trim() : '';
+  // Always use current origin as base URL
+  const base = '';
   
   // Separate params from headers - headers should never be in params
   const params = options.params || {};
   const headers = new Headers(options.headers || {});
   
-  // Add CSRF token if available (for state-changing operations)
+  // For GET requests, check cache and pending requests to avoid duplicates
   const method = (options.method || 'GET').toUpperCase();
+  if (method === 'GET') {
+    const cacheKey = `${path}?${new URLSearchParams(params).toString()}`;
+    const now = Date.now();
+    
+    // Check if we have a cached response
+    if (_requestCache.has(cacheKey)) {
+      const cached = _requestCache.get(cacheKey);
+      if (now - cached.timestamp < _requestCacheTimeout) {
+        // Return cached response (clone it since Response can only be read once)
+        return new Response(JSON.stringify(cached.data), {
+          status: 200,
+          statusText: 'OK',
+          headers: { 'Content-Type': 'application/json' }
+        });
+      } else {
+        _requestCache.delete(cacheKey);
+      }
+    }
+    
+    // Check if there's already a pending request for this path
+    if (_pendingRequests.has(cacheKey)) {
+      // Wait for the pending request to complete
+      return await _pendingRequests.get(cacheKey);
+    }
+  }
+  
+  // Add CSRF token if available (for state-changing operations)
   if (['POST', 'PUT', 'DELETE', 'PATCH'].includes(method)) {
     const csrfToken = sessionStorage.getItem('csrf_token');
     if (csrfToken) {
@@ -1363,6 +1476,46 @@ async function api(path, options = {}) {
     // Add timeout to fetch request
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), timeout);
+    
+    // For GET requests, create a promise and track it
+    let requestPromise;
+    if (method === 'GET') {
+      const cacheKey = `${path}?${new URLSearchParams(params).toString()}`;
+      requestPromise = (async () => {
+        try {
+          const response = await fetch(url.toString(), { 
+            ...fetchOptions, 
+            cache: 'no-store',
+            signal: controller.signal
+          });
+          clearTimeout(timeoutId);
+          
+          // Extract CSRF token from response headers if present (for all responses)
+          const newCsrfToken = response.headers.get('X-CSRF-Token');
+          if (newCsrfToken) {
+            sessionStorage.setItem('csrf_token', newCsrfToken);
+          }
+          
+          // Cache successful GET responses
+          if (response.ok && response.status === 200) {
+            try {
+              const clonedResponse = response.clone();
+              const data = await clonedResponse.json();
+              _requestCache.set(cacheKey, { data, timestamp: Date.now() });
+            } catch (e) {
+              // Not JSON or can't cache, ignore
+            }
+          }
+          
+          return response;
+        } finally {
+          // Remove from pending requests when done
+          _pendingRequests.delete(cacheKey);
+        }
+      })();
+      _pendingRequests.set(cacheKey, requestPromise);
+      return await requestPromise;
+    }
     
     try {
       const response = await fetch(url.toString(), { 
@@ -1417,6 +1570,12 @@ async function api(path, options = {}) {
       });
       clearTimeout(timeoutId);
       
+      // Handle 401 responses by redirecting to login
+      if (response.status === 401 && !window.location.pathname.includes('/login')) {
+        window.location.href = '/login';
+        throw new Error('Authentication required');
+      }
+      
       // Extract CSRF token from response headers if present
       const newCsrfToken = response.headers.get('X-CSRF-Token');
       if (newCsrfToken) {
@@ -1461,6 +1620,12 @@ async function api(path, options = {}) {
       });
       clearTimeout(timeoutId);
       
+      // Handle 401 responses by redirecting to login
+      if (response.status === 401 && !window.location.pathname.includes('/login')) {
+        window.location.href = '/login';
+        throw new Error('Authentication required');
+      }
+      
       // Extract CSRF token from response headers if present
       const newCsrfToken = response.headers.get('X-CSRF-Token');
       if (newCsrfToken) {
@@ -1499,17 +1664,12 @@ async function apiJson(path, options = {}) {
 // Reset Preparation UI/state so it can be reused for a new run
 function resetPreparationForNewRun() {
   try {
-    // Reset Authentication section (keep API Base)
-    const apiBase = el('apiBase');
-    // intentionally keep apiBase as-is
+    // Reset Authentication section
     const nhiSelect = el('nhiCredentialSelect');
     if (nhiSelect) nhiSelect.value = '';
-    const nhiPwd = el('nhiDecryptPassword');
-    if (nhiPwd) nhiPwd.value = '';
+    // Password field removed - no longer needed
     const nhiStatus = el('nhiLoadStatus');
     if (nhiStatus) nhiStatus.textContent = '';
-    const tokenStatus = el('tokenStatus');
-    if (tokenStatus) tokenStatus.textContent = '';
     const hostSourceManual = el('hostSourceManual');
     if (hostSourceManual) hostSourceManual.checked = true;
     const hostSourceNhi = el('hostSourceNhi');
@@ -1537,6 +1697,10 @@ function resetPreparationForNewRun() {
     }
     const runBtn = el('btnInstallSelected');
     if (runBtn) runBtn.disabled = true;
+    
+    // Disable Add Row button
+    const btnAddRow = el('btnAddRow');
+    if (btnAddRow) btnAddRow.disabled = true;
 
     // Clear host inputs and chips/status
     const fabricHost = el('fabricHost');
@@ -1578,8 +1742,6 @@ function resetPreparationForNewRun() {
     // Re-enable inputs/buttons as initial state
     const addRowBtn = el('btnAddRow');
     if (addRowBtn) addRowBtn.disabled = false;
-    const confirmBtn = el('btnConfirmHosts');
-    if (confirmBtn) confirmBtn.disabled = false;
 
     // Clear status/notice area
     const actionStatus = el('actionStatus');
@@ -1613,165 +1775,38 @@ document.addEventListener('click', (e) => {
 
 // Token acquisition function (now called from Install Workspace)
 async function acquireTokens() {
+  // Auto-confirm hosts if not already confirmed
   if (confirmedHosts.length === 0) {
-    showStatus('Please confirm hosts first');
-    return false;
+    if (!autoConfirmHosts()) {
+      showStatus('Please add at least one valid host');
+      return false;
+    }
   }
   
-  // Session-based: Check if NHI credential is loaded and session exists
-  // If not, try to load it from the UI
+  // Check if NHI credential is loaded - if not, try to load it from the UI
   try {
     if (!currentNhiId || !decryptedClientId) {
       const nhiSelect = el('nhiCredentialSelect');
-      const pwdInput = el('nhiDecryptPassword');
       const selectedId = nhiSelect ? (nhiSelect.value || '') : '';
-      const encPwd = pwdInput ? (pwdInput.value || '').trim() : '';
-      if (selectedId && encPwd) {
+      if (selectedId) {
         // Load NHI credential which will create a session
         await loadSelectedNhiCredential();
-        // After loading, check if session was created
-        const session = await checkSessionStatus();
-        if (!session) {
-          showStatus('Failed to create session. Please check encryption password.');
-          return false;
-        }
-        } else {
-        showStatus('Please select NHI credential and enter encryption password to acquire tokens');
-          return false;
+      } else {
+        showStatus('Please select NHI credential to acquire tokens');
+        return false;
       }
     }
   } catch (e) {
-    showStatus('Error loading NHI credential. Please check encryption password.');
+    showStatus('Error loading NHI credential. Please try again.');
     return false;
   }
   
-  // Check session status - tokens are managed server-side
-  const session = await checkSessionStatus();
-  if (!session) {
-    showStatus('No active session. Please reload NHI credential.');
-    return false;
-  }
-  
-  // Session is active - tokens are stored server-side
+  // User is already authenticated via login - tokens are managed server-side
   await renderFabricHostList();
-  el('tokenStatus').textContent = 'Session OK - Tokens managed server-side';
-  showStatus('Session active - tokens are managed server-side');
-    return true;
+  return true;
 }
 
-// Cache all templates from all repositories for the first confirmed host only
-// Templates are stored independently (deduplicated across hosts)
-async function cacheAllTemplates() {
-  if (confirmedHosts.length === 0) {
-    return;
-  }
-  
-  const allTemplates = [];
-  const uniqueTemplates = new Map(); // Key: "repo_name|template_name|version"
-  let successCount = 0;
-  let errorCount = 0;
-  
-  try {
-    showStatus('Fetching repositories and templates...', { hideAfterMs: false });
-    
-    // Only use the first host for template caching
-    const firstHost = confirmedHosts[0];
-    const {host} = firstHost;
-    // Check session status first
-    const session = await checkSessionStatus();
-    if (!session) {
-      errorCount++;
-      return;
-    }
-    
-    try {
-      // Get all repositories for the first host - cookies sent automatically
-      const reposRes = await api('/repo/remotes', { params: { fabric_host: host } });
-      if (!reposRes.ok) {
-        if (reposRes.status === 401) {
-          handleSessionExpired();
-        }
-        errorCount++;
-        return;
-      }
-      
-      const reposData = await reposRes.json();
-      const repositories = reposData.repositories || [];
-      
-      // For each repository, get all templates
-      for (const repo of repositories) {
-        const repoId = repo.id;
-        const repoName = repo.name;
-        
-        if (!repoId || !repoName) {
-          continue;
-        }
-        
-        try {
-          const templatesData = await apiJson('/repo/templates/list', { 
-            params: { fabric_host: host, repo_name: repoName }
-          });
-          const templates = templatesData.templates || [];
-          
-          // Add templates to collection, deduplicating by repo_name + template_name + version
-          for (const tpl of templates) {
-            const templateName = tpl.name;
-            const version = tpl.version || null;
-            const uniqueKey = `${repoName}|${templateName}|${version}`;
-            
-            // Only add if we haven't seen this template before
-            if (!uniqueTemplates.has(uniqueKey)) {
-              const templateEntry = {
-                repo_id: repoId,
-                repo_name: repoName,
-                template_id: tpl.id,
-                template_name: templateName,
-                version: version
-              };
-              uniqueTemplates.set(uniqueKey, templateEntry);
-              allTemplates.push(templateEntry);
-            }
-          }
-          
-          successCount++;
-        } catch (error) {
-          errorCount++;
-        }
-      }
-    } catch (error) {
-      errorCount++;
-    }
-    
-    // Send all unique templates to the cache endpoint (will purge and replace all existing)
-    if (allTemplates.length > 0) {
-      try {
-        const cacheRes = await api('/cache/templates', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ templates: allTemplates })
-        });
-        
-        if (cacheRes.ok) {
-          const cacheData = await cacheRes.json();
-          showStatus(`Cached ${cacheData.count} unique templates successfully`, { hideAfterMs: 3000 });
-          logMsg(`Cached ${cacheData.count} unique templates from ${host}`);
-        } else {
-          const errorText = await cacheRes.text().catch(() => 'Unknown error');
-          showStatus(`Failed to cache templates: ${errorText}`, { hideAfterMs: 5000 });
-        }
-      } catch (error) {
-        showStatus(`Error caching templates: ${error.message || error}`, { hideAfterMs: 5000 });
-      }
-    } else {
-      showStatus('No templates found to cache', { hideAfterMs: 2000 });
-    }
-    
-    if (errorCount > 0) {
-    }
-  } catch (error) {
-    showStatus(`Error caching templates: ${error.message || error}`, { hideAfterMs: 5000 });
-  }
-}
+// cacheAllTemplates() function removed - cache population is no longer used
 
 function updateInstallSelect() {
   const select = el('installSelect');
@@ -1806,14 +1841,8 @@ function updateInstallSelect() {
     }
   });
   
-  // Then collect created/installed templates
-  const created = templates.filter(t => t.status === 'created' || t.status === 'installed');
-  created.forEach((t) => {
-    const key = `${t.template_name}|||${t.version}`;
-    if (!rowTemplates.has(key)) {
-      rowTemplates.set(key, { template_name: t.template_name, version: t.version, repo_name: t.repo_name });
-    }
-  });
+  // Only show templates from current rows (not from past runs)
+  // Removed code that added templates from global 'templates' array to avoid showing past run templates
   
   // Convert to array and sort alphabetically
   const allOptions = Array.from(rowTemplates.values()).sort((a, b) => {
@@ -1842,7 +1871,10 @@ function updateInstallSelect() {
   const hasOptions = select.options.length > 0;
   const installBtn = el('btnInstallSelected');
   if (installBtn) {
-    // Button should be enabled if there are options OR if all rows are filled (for initial install)
+    // Button should only be enabled if:
+    // 1. Hosts are confirmed (auto-confirmed when available)
+    // 2. AND (there are options OR all rows are filled)
+    const hostsConfirmed = confirmedHosts && confirmedHosts.length > 0;
     const rows = Array.from(document.querySelectorAll('.tpl-row'));
     const allFilled = rows.length > 0 && rows.every(r => {
       const selects = r.querySelectorAll('select');
@@ -1854,7 +1886,8 @@ function updateInstallSelect() {
       const version = versionSelect?.value || '';
       return Boolean(repo_name && template_name && version);
     });
-    installBtn.disabled = !hasOptions && !allFilled;
+    // Require hosts to be confirmed before enabling button
+    installBtn.disabled = !hostsConfirmed || (!hasOptions && !allFilled);
   }
   select.disabled = !hasOptions;
 }
@@ -2009,6 +2042,8 @@ function renderTemplates(showContainer = true) {
 
 // Flag to bypass gating conditions after loading a configuration
 let bypassGatingConditions = false;
+// Flag to track if we're currently restoring a configuration
+let isRestoringConfiguration = false;
 
 function updateCreateEnabled() {
   const runBtn = el('btnInstallSelected');
@@ -2020,16 +2055,32 @@ function updateCreateEnabled() {
     return;
   }
   
-  // Check if NHI credentials are loaded and hosts are confirmed
-  const nhiLoaded = currentNhiId && decryptedClientId;
-  const hostsConfirmed = confirmedHosts && confirmedHosts.length > 0;
-  
-  // Both conditions must be met
-  if (!nhiLoaded || !hostsConfirmed) {
+  // If we're restoring a configuration, always disable the button until restore is complete
+  if (isRestoringConfiguration) {
     runBtn.disabled = true;
     return;
   }
   
+  // Auto-confirm hosts if available
+  if (confirmedHosts.length === 0) {
+    autoConfirmHosts();
+  }
+  
+  // Check if hosts are available
+  const hostsConfirmed = confirmedHosts && confirmedHosts.length > 0;
+  if (!hostsConfirmed) {
+    runBtn.disabled = true;
+    return;
+  }
+  
+  // Check if NHI credentials are loaded
+  const nhiLoaded = currentNhiId && decryptedClientId;
+  if (!nhiLoaded) {
+    runBtn.disabled = true;
+    return;
+  }
+  
+  // Both conditions are met, now check if rows are filled
   const rows = Array.from(document.querySelectorAll('.tpl-row'));
   const allNonEmpty = rows.length > 0 && rows.every(r => {
     const selects = r.querySelectorAll('select');
@@ -2230,11 +2281,43 @@ function addTplRow(prefill) {
   
   // Repo is a regular dropdown (no filtering)
   const r = document.createElement('select');
-  r.disabled = true;
+  r.disabled = false; // Enable by default - will be populated from cache
   const optRepoPh = document.createElement('option');
   optRepoPh.value = '';
-  optRepoPh.textContent = 'Select';
+  optRepoPh.textContent = 'Select repo';
   r.appendChild(optRepoPh);
+  
+  // Populate repositories from cache
+  const populateReposFromCache = () => {
+    const cachedTemplates = window.cachedTemplates || [];
+    const repos = Array.from(new Set(cachedTemplates.map(t => t.repo_name).filter(Boolean))).sort();
+    repos.forEach(repoName => {
+      const opt = document.createElement('option');
+      opt.value = repoName;
+      opt.textContent = repoName;
+      r.appendChild(opt);
+    });
+  };
+  
+  // Load cache if not already loaded, then populate repos
+  if (!window.cachedTemplates || window.cachedTemplates.length === 0) {
+    // Load cache asynchronously, then populate
+    (async () => {
+      try {
+        const cacheRes = await api('/cache/templates');
+        if (cacheRes.ok) {
+          const cacheData = await cacheRes.json();
+          window.cachedTemplates = cacheData.templates || [];
+          populateReposFromCache();
+        }
+      } catch (error) {
+        console.error('Error loading cached templates:', error);
+      }
+    })();
+  } else {
+    // Cache already loaded - populate immediately
+    populateReposFromCache();
+  }
   
   // Template is a filtered dropdown with text input
   const templateFiltered = createFilteredDropdown('Select template', '250px');
@@ -2278,57 +2361,9 @@ function addTplRow(prefill) {
     updateInstallSelect();
   });
 
-  // Function to load repositories (can be called later if token wasn't available initially)
-  const loadRepositories = async () => {
-    const host = getFabricHostPrimary();
-    if (!host) return false;
-    
-    // Check session status - tokens are managed server-side
-    const session = await checkSessionStatus();
-    if (!session) {
-      // No session available yet - return false to indicate we should try again later
-      return false;
-    }
-    
-    try {
-      // Load repositories - cookies sent automatically
-      const resRepos = await api('/repo/remotes', { params: { fabric_host: host } });
-      if (resRepos.ok) {
-        const data = await resRepos.json();
-        const repos = (data.repositories || []).map(x => x.name).filter(Boolean);
-        // Clear existing options except the first one
-        while (r.options.length > 1) {
-          r.remove(1);
-        }
-        repos.forEach(name => {
-          const o = document.createElement('option');
-          o.value = name;
-          o.textContent = name;
-          r.appendChild(o);
-        });
-        r.disabled = false;
-        return true;
-      }
-    } catch (err) {
-      // Silently fail - will try again later if needed
-    }
-    return false;
-  };
-  
-  // Try to populate repositories immediately
-  loadRepositories();
-  
-  // Store loadRepositories function on the row so it can be called later if tokens become available
-  r._loadRepositories = loadRepositories;
-
-  // Handle repository change
-  r.addEventListener('change', async () => {
-    // Don't reset if this repo was restored from cache and change event was not user-initiated
-    if (r._restoredFromCache && !r._userInitiatedChange) {
-      return;
-    }
-    
-    // reset dependent selects
+  // Handle repository change - populate templates from cache
+  r.addEventListener('change', () => {
+    const repo_name = r.value;
     templateFiltered.populateOptions([]);
     templateFiltered.disable();
     v.innerHTML = '';
@@ -2338,39 +2373,28 @@ function addTplRow(prefill) {
     v.appendChild(vph);
     v.disabled = true;
     
-    const repo_name = r.value;
-    const host = getFabricHostPrimary();
-    if (!host || !repo_name) return;
+    if (!repo_name) return;
     
-    // Check session status - tokens are managed server-side
-    const session = await checkSessionStatus();
-    if (!session) {
-      return;
-    }
+    // Get unique template names for this repo from cache
+    const cachedTemplates = window.cachedTemplates || [];
+    const templatesForRepo = cachedTemplates.filter(t => t.repo_name === repo_name);
+    const uniqueNames = Array.from(new Set(templatesForRepo.map(t => t.template_name).filter(Boolean))).sort();
     
-    try {
-      try {
-        const data = await apiJson('/repo/templates/list', { params: { fabric_host: host, repo_name } });
-        const uniqueNames = Array.from(new Set((data.templates || []).map(x => x.name).filter(Boolean)));
-        const templateOptions = uniqueNames.map(name => {
-          const o = document.createElement('option');
-          o.value = name;
-          o.textContent = name;
-          return o;
-        });
-        templateFiltered.populateOptions(templateOptions);
-        templateFiltered.enable();
-      } catch (error) { /* surfaced via apiJson/showStatus */ }
-    } catch (error) {
-    }
+    const templateOptions = uniqueNames.map(name => {
+      const o = document.createElement('option');
+      o.value = name;
+      o.textContent = name;
+      return o;
+    });
+    
+    templateFiltered.populateOptions(templateOptions);
+    templateFiltered.enable();
   });
 
-  // Handle template change
-  t.addEventListener('change', async () => {
-    // Don't clear version if it was set from cache
-    if (v._versionSetFromCache && v.value) {
-      return;
-    }
+  // Handle template change - populate versions from cache
+  const handleTemplateChange = () => {
+    const repo_name = r.value;
+    const template_name = templateFiltered ? templateFiltered.getValue() : t.value;
     
     v.innerHTML = '';
     const vph = document.createElement('option');
@@ -2379,37 +2403,51 @@ function addTplRow(prefill) {
     v.appendChild(vph);
     v.disabled = true;
     
-    const repo_name = r.value;
-    // Get template name from the filtered dropdown's getValue method
-    const template_name = templateFiltered ? templateFiltered.getValue() : t.value;
-    const host = getFabricHostPrimary();
-    if (!host || !repo_name || !template_name) {
+    if (!repo_name || !template_name) {
       return;
     }
     
+    // Get versions for this repo+template from cache
+    const cachedTemplates = window.cachedTemplates || [];
+    const matchingTemplates = cachedTemplates.filter(t => {
+      return t.repo_name === repo_name && t.template_name === template_name && t.version;
+    });
     
-    // LIVE API only (no cache)
-    try {
-      const resVer = await api('/repo/versions', { params: { fabric_host: host, repo_name, template_name } });
-      if (resVer.ok) {
-        const data = await resVer.json();
-        (data.versions || []).forEach(ver => {
-          const o = document.createElement('option');
-          o.value = ver;
-          o.textContent = ver;
-          v.appendChild(o);
-        });
-        v.disabled = false;
-        // Prefill version if provided
-        if (prefill && prefill.version && v.options.length > 0) {
-          const versionOpt = Array.from(v.options).find(opt => opt.value === prefill.version);
-          if (versionOpt) v.value = prefill.version;
-        }
-      } else {
-      }
-    } catch (error) {
+    const versions = matchingTemplates
+      .map(t => t.version)
+      .filter(Boolean)
+      .sort((a, b) => a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' }));
+    
+    versions.forEach(ver => {
+      const o = document.createElement('option');
+      o.value = ver;
+      o.textContent = ver;
+      v.appendChild(o);
+    });
+    
+    v.disabled = false;
+    
+    // Prefill version if provided
+    if (prefill && prefill.version && v.options.length > 1) {
+      const versionOpt = Array.from(v.options).find(opt => opt.value === prefill.version);
+      if (versionOpt) v.value = prefill.version;
     }
-  });
+  };
+  
+  // Listen to both the hidden select and the filtered input
+  t.addEventListener('change', handleTemplateChange);
+  if (templateFiltered.input) {
+    templateFiltered.input.addEventListener('change', () => {
+      setTimeout(() => {
+        handleTemplateChange();
+      }, 100);
+    });
+    templateFiltered.input.addEventListener('blur', () => {
+      setTimeout(() => {
+        handleTemplateChange();
+      }, 100);
+    });
+  }
   
   // Prefill values if provided
   if (prefill) {
@@ -2506,6 +2544,11 @@ function initializeSection(sectionName) {
     setupSshCommandProfileButtons();
     loadSshCommandProfiles();
   } else if (sectionName === 'preparation') {
+    // Clear configuration name banner when navigating to preparation section
+    // (unless we're in the middle of loading a configuration)
+    if (!window.isLoadingConfiguration) {
+      clearConfigName();
+    }
     // Initialize preparation section
     initializePreparationSection();
   } else if (sectionName === 'audit-logs') {
@@ -2520,22 +2563,34 @@ function initializeSection(sectionName) {
     // Reports section initialization
     setupReportsButtons();
     loadReports();
+  } else if (sectionName === 'user-management') {
+    // User Management section initialization
+    setupUserManagement();
   }
 }
 
 function initializePreparationSection() {
-  // Initialize API base
-  const apiBaseInput = el('apiBase');
-  if (apiBaseInput && !apiBaseInput.value) {
-    apiBaseInput.value = window.location.origin;
-  }
-  
   // Initialize validatedHosts array
   if (typeof validatedHosts === 'undefined') {
     validatedHosts = [];
   }
   if (!window.validatedNhiHosts) {
     window.validatedNhiHosts = [];
+  }
+  
+  // Load cached templates for use in template rows
+  if (!window.cachedTemplates || window.cachedTemplates.length === 0) {
+    (async () => {
+      try {
+        const cacheRes = await api('/cache/templates');
+        if (cacheRes.ok) {
+          const cacheData = await cacheRes.json();
+          window.cachedTemplates = cacheData.templates || [];
+        }
+      } catch (error) {
+        console.error('Error loading cached templates:', error);
+      }
+    })();
   }
   
   // Initialize fabric host input listeners
@@ -2712,11 +2767,13 @@ function initializePreparationSection() {
     });
   }
   
-  // Load NHI credentials for authentication section
-  loadNhiCredentialsForAuth();
-  
-  // Load SSH profiles for preparation section
-  loadSshProfilesForPreparation();
+  // Load NHI credentials and SSH profiles in parallel to avoid duplicate calls
+  Promise.all([
+    loadNhiCredentialsForAuth(),
+    loadSshProfilesForPreparation()
+  ]).catch(err => {
+    console.error('Error loading preparation data:', err);
+  });
   
   // Set up expert mode toggle
   const exp = el('expertMode');
@@ -2736,152 +2793,35 @@ function initializePreparationSection() {
   }
   
   // Set up button handlers for preparation section
-  const loadBtn = el('btnLoadNhiCredential');
-  if (loadBtn) {
-    loadBtn.onclick = async () => {
-      await loadSelectedNhiCredential();
-    };
-  }
-  
-  const passwordInput = el('nhiDecryptPassword');
-  if (passwordInput) {
-    passwordInput.onkeypress = async (e) => {
-      if (e.key === 'Enter') {
+  // Auto-load NHI credential when selected
+  const nhiSelect = el('nhiCredentialSelect');
+  if (nhiSelect) {
+    nhiSelect.addEventListener('change', async () => {
+      if (nhiSelect.value) {
         await loadSelectedNhiCredential();
       }
-    };
+    });
   }
   
-  const confirmBtn = el('btnConfirmHosts');
-  if (confirmBtn) {
-    confirmBtn.onclick = async (e) => {
-      e.preventDefault();
-      
-      // Determine which host source to use
-      const hostSourceManual = el('hostSourceManual');
-      const useManualHosts = hostSourceManual && hostSourceManual.checked;
-      
-      let sourceInput, sourceValidatedHosts, sourceChipsId, sourceStatusId;
-      
-      if (useManualHosts) {
-        sourceInput = el('fabricHost');
-        sourceValidatedHosts = validatedHosts;
-        sourceChipsId = 'fabricHostChips';
-        sourceStatusId = 'fabricHostStatus';
-        
-        // Validate any remaining input in manual field
-        if (sourceInput && sourceInput.value.trim()) {
-          const currentValue = sourceInput.value.trim();
-          if (!currentValue.endsWith(' ')) {
-            const parts = currentValue.split(/\s+/).filter(p => p.trim());
-            if (parts.length > 0) {
-              const lastPart = parts[parts.length - 1];
-              const exists = validatedHosts.some(vh => {
-                const {host, port} = splitHostPort(lastPart);
-                return vh.host === host && vh.port === port;
-              });
-              if (!exists) {
-                validateAndAddHost(lastPart);
-                renderHostChips();
-                updateValidationStatus();
-              }
-            }
-          }
-        }
-      } else {
-        sourceInput = el('fabricHostFromNhi');
-        if (!window.validatedNhiHosts) window.validatedNhiHosts = [];
-        sourceValidatedHosts = window.validatedNhiHosts;
-        sourceChipsId = 'fabricHostFromNhiChips';
-        sourceStatusId = 'fabricHostFromNhiStatus';
-        
-        // Validate any remaining input in NHI field
-        if (sourceInput && sourceInput.value.trim()) {
-          const currentValue = sourceInput.value.trim();
-          populateHostsFromInput(currentValue, 'fabricHostFromNhi', sourceChipsId, sourceStatusId);
-        }
-      }
-      
-      // Check if we have any hosts from selected source
-      if (sourceValidatedHosts.length === 0) { 
-        showStatus(`Please add at least one valid host in the ${useManualHosts ? 'Host List' : 'NHI credential'} field`); 
-        return; 
-      }
-      
-      // Update confirmed hosts from selected source
-      confirmedHosts = sourceValidatedHosts.map(({host, port}) => ({host, port}));
-      
-      // Also update the manual input to match (for consistency)
-      const fabricHostInput = el('fabricHost');
-      if (fabricHostInput) {
-        const confirmedHostsStr = confirmedHosts.map(({host, port}) => 
-          host + (port !== undefined ? ':' + port : '')
-        ).join(' ');
-        fabricHostInput.value = confirmedHostsStr;
-        // Update validated hosts to match
-        validatedHosts = [...sourceValidatedHosts];
-        renderHostChips();
-        updateValidationStatus();
-      }
-      
-      // Make both Host List and From NHI Credential inputs readonly after confirmation
-      if (fabricHostInput && fabricHostInput.value.trim()) {
-        const validatedStr = validatedHosts.map(({host, port}) => 
-          host + (port !== undefined ? ':' + port : '')
-        ).join(' ');
-        fabricHostInput.value = validatedStr;
-        fabricHostInput.readOnly = true;
-        fabricHostInput.disabled = false;
-        fabricHostInput.style.backgroundColor = '#f5f5f7';
-        fabricHostInput.style.cursor = 'not-allowed';
-      }
-      
-      // Also make the NHI credential input readonly
-      const fabricHostFromNhiInput = el('fabricHostFromNhi');
-      if (fabricHostFromNhiInput && fabricHostFromNhiInput.value.trim()) {
-        const nhiHostsStr = window.validatedNhiHosts && window.validatedNhiHosts.length > 0 
-          ? window.validatedNhiHosts.map(({host, port}) => 
-              host + (port !== undefined ? ':' + port : '')
-            ).join(' ')
-          : fabricHostFromNhiInput.value;
-        fabricHostFromNhiInput.value = nhiHostsStr;
-        fabricHostFromNhiInput.readOnly = true;
-        fabricHostFromNhiInput.disabled = false;
-        fabricHostFromNhiInput.style.backgroundColor = '#f5f5f7';
-        fabricHostFromNhiInput.style.cursor = 'not-allowed';
-      }
-      
-      await renderFabricHostList();
-      // Show the hosts list after confirmation
-      const hostsListRow = el('hostsListRow');
-      if (hostsListRow) hostsListRow.style.display = '';
-      showStatus('Hosts confirmed. Acquiring tokens...');
-      // Automatically acquire tokens after confirming hosts
-      if (await acquireTokens()) {
-        // Enable Add Row button after successful confirmation
-        const addRowBtn = el('btnAddRow');
-        if (addRowBtn) addRowBtn.disabled = false;
-        showStatus('Hosts confirmed and tokens acquired. Caching templates...', { hideAfterMs: 1000 });
-        
-        // Cache all templates from all repositories for all confirmed hosts
-        await cacheAllTemplates();
-        
-        // Now that hosts are confirmed AND credentials are loaded, update Run button state
-        updateCreateEnabled();
-      } else {
-        showStatus('Hosts confirmed but token acquisition failed. Please check credentials.');
-        // Keep Run button disabled if token acquisition failed
-        const runBtn = el('btnInstallSelected');
-        if (runBtn) runBtn.disabled = true;
-      }
-    };
-  }
+  // Confirm button removed - hosts are automatically confirmed when available
   
   // Set up button handlers for preparation section
   const addRowBtn = el('btnAddRow');
   if (addRowBtn) {
-    addRowBtn.onclick = (e) => {
+    addRowBtn.onclick = async (e) => {
       e.preventDefault();
+      // Ensure cache is loaded before adding row
+      if (!window.cachedTemplates || window.cachedTemplates.length === 0) {
+        try {
+          const cacheRes = await api('/cache/templates');
+          if (cacheRes.ok) {
+            const cacheData = await cacheRes.json();
+            window.cachedTemplates = cacheData.templates || [];
+          }
+        } catch (error) {
+          console.error('Error loading cached templates:', error);
+        }
+      }
       addTplRow();
       updateCreateEnabled();
     };
@@ -2999,6 +2939,36 @@ function initMenu() {
     }
   }
   
+  // Handle logout button
+  const logoutBtn = el('btnLogout');
+  if (logoutBtn) {
+    logoutBtn.addEventListener('click', async (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      
+      try {
+        const res = await api('/auth/logout', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' }
+        });
+        
+        if (res.ok) {
+          // Clear any cached data
+          sessionStorage.clear();
+          // Redirect to login page
+          window.location.href = '/login';
+        } else {
+          showStatus('Failed to logout. Please try again.', { error: true });
+        }
+      } catch (error) {
+        console.error('Logout error:', error);
+        // Even if there's an error, try to redirect to login
+        sessionStorage.clear();
+        window.location.href = '/login';
+      }
+    });
+  }
+  
   // Expand Logs menu by default if it's the active section
   const logsGroup = document.querySelector('#logs-menu')?.closest('.menu-group');
   if (logsGroup) {
@@ -3066,9 +3036,6 @@ function resetPreparationSection() {
   bypassGatingConditions = false;
   
   // Reset all input fields
-  const apiBase = el('apiBase');
-  if (apiBase) apiBase.value = window.location.origin || '';
-  
   const fabricHost = el('fabricHost');
   if (fabricHost) {
     fabricHost.value = '';
@@ -3089,8 +3056,7 @@ function resetPreparationSection() {
   // Reset NHI credential inputs
   const nhiCredentialSelect = el('nhiCredentialSelect');
   if (nhiCredentialSelect) nhiCredentialSelect.value = '';
-  const nhiDecryptPassword = el('nhiDecryptPassword');
-  if (nhiDecryptPassword) nhiDecryptPassword.value = '';
+  // Password field removed - no longer needed
   const nhiLoadStatus = el('nhiLoadStatus');
   if (nhiLoadStatus) {
     nhiLoadStatus.textContent = '';
@@ -3121,10 +3087,6 @@ function resetPreparationSection() {
     hostSourceNhi.checked = false;
     hostSourceNhi.disabled = true;
   }
-  
-  // Hide hosts list
-  const hostsListRow = el('hostsListRow');
-  if (hostsListRow) hostsListRow.style.display = 'none';
   
   // Reset other fields
   const newHostname = el('newHostname');
@@ -3166,13 +3128,9 @@ function resetPreparationSection() {
   const fabricHostList = el('fabricHostList');
   if (fabricHostList) fabricHostList.innerHTML = '';
   
-  // Clear token status
-  const tokenStatus = el('tokenStatus');
-  if (tokenStatus) tokenStatus.textContent = '';
-  
   // Reset buttons
-  const btnConfirmHosts = el('btnConfirmHosts');
-  if (btnConfirmHosts) btnConfirmHosts.disabled = true;
+  // Confirm button removed - hosts are auto-confirmed
+  // Disable Add Row button
   const btnAddRow = el('btnAddRow');
   if (btnAddRow) btnAddRow.disabled = true;
   const btnInstallSelected = el('btnInstallSelected');
@@ -3206,6 +3164,42 @@ async function loadEventConfigs() {
       });
     }
   } catch (error) {
+  }
+}
+
+// Helper function to format date/time as DD/MM/YYYY HH:MM
+function formatDateTime(dateString) {
+  if (!dateString) return 'N/A';
+  try {
+    const date = new Date(dateString);
+    if (isNaN(date.getTime())) return dateString; // Return original if invalid
+    
+    const day = String(date.getDate()).padStart(2, '0');
+    const month = String(date.getMonth() + 1).padStart(2, '0');
+    const year = date.getFullYear();
+    const hours = String(date.getHours()).padStart(2, '0');
+    const minutes = String(date.getMinutes()).padStart(2, '0');
+    
+    return `${day}/${month}/${year} ${hours}:${minutes}`;
+  } catch (e) {
+    return dateString;
+  }
+}
+
+// Helper function to format date only as DD/MM/YYYY
+function formatDate(dateString) {
+  if (!dateString) return 'N/A';
+  try {
+    const date = new Date(dateString);
+    if (isNaN(date.getTime())) return dateString; // Return original if invalid
+    
+    const day = String(date.getDate()).padStart(2, '0');
+    const month = String(date.getMonth() + 1).padStart(2, '0');
+    const year = date.getFullYear();
+    
+    return `${day}/${month}/${year}`;
+  } catch (e) {
+    return dateString;
   }
 }
 
@@ -3393,8 +3387,8 @@ async function loadEvents() {
         dateTimeDisplay = event.event_date + (event.event_time ? ` ${event.event_time} UTC` : '');
       }
       
-      const createdDate = new Date(event.created_at).toLocaleString();
-      const updatedDate = new Date(event.updated_at).toLocaleString();
+      const createdDate = formatDateTime(event.created_at);
+      const updatedDate = formatDateTime(event.updated_at);
       
       // Determine badge color: orange if auto_run and has_executions, green if auto_run without executions
       let autoRunBadge = '';
@@ -3576,8 +3570,8 @@ function showExecutionModal(data) {
       const statusColor = exec.status === 'success' ? '#34d399' : exec.status === 'error' ? '#f87171' : '#60a5fa';
       const statusIcon = exec.status === 'success' ? '✓' : exec.status === 'error' ? '✗' : '⟳';
       
-      const startedDate = new Date(exec.started_at).toLocaleString();
-      const completedDate = exec.completed_at ? new Date(exec.completed_at).toLocaleString() : 'In Progress...';
+      const startedDate = formatDateTime(exec.started_at);
+      const completedDate = exec.completed_at ? formatDateTime(exec.completed_at) : 'In Progress...';
       const duration = exec.completed_at && exec.execution_details?.duration_seconds 
         ? `${Math.round(exec.execution_details.duration_seconds)}s` 
         : exec.completed_at ? 'N/A' : '';
@@ -3609,14 +3603,64 @@ function showExecutionModal(data) {
                   </ul>
                 </div>`
               : (exec.execution_details?.templates_count !== undefined ? `<div style="margin-top: 8px; padding: 8px; background: #f0fdf4; border-left: 3px solid #10b981; border-radius: 4px; font-size: 11px; color: #047857;">Templates: ${exec.execution_details.templates_count}</div>` : '')}
-            ${exec.execution_details?.installed 
+            ${exec.execution_details?.install_executed === true && Array.isArray(exec.execution_details?.installations) && exec.execution_details.installations.length > 0
+              ? `<div style="margin-top: 8px; padding: 8px; background: #f0fdf4; border-left: 3px solid #10b981; border-radius: 4px;">
+                  <div style="font-weight: 600; color: #047857; margin-bottom: 4px; font-size: 13px;">Installation Executed:</div>
+                  <ul style="margin: 4px 0 0 16px; font-size: 11px; color: #047857;">
+                    ${exec.execution_details.installations.map(inst => {
+                      const successIcon = inst.success ? '✓' : '✗';
+                      const successColor = inst.success ? '#047857' : '#dc2626';
+                      const duration = inst.duration_seconds ? ` (${Math.round(inst.duration_seconds)}s)` : '';
+                      const errors = inst.errors && inst.errors.length > 0 ? ` - ${inst.errors.join('; ')}` : '';
+                      return `<li style="color: ${successColor}; margin-bottom: 2px;">
+                        ${successIcon} <strong>${inst.template_name || ''}</strong> v${inst.version || ''} on ${inst.host || 'N/A'}${duration}${errors}
+                      </li>`;
+                    }).join('')}
+                  </ul>
+                </div>`
+              : exec.execution_details?.install_select && exec.execution_details?.install_executed === false
+              ? `<div style="margin-top: 8px; padding: 8px; background: #fef3c7; border-left: 3px solid #f59e0b; border-radius: 4px; font-size: 11px; color: #92400e;">
+                  <div style="font-weight: 600; margin-bottom: 4px;">Installation Selected (Not Executed):</div>
+                  <div style="margin-left: 8px;">${exec.execution_details.install_select.split('|||').join(' v')}</div>
+                </div>`
+              : exec.execution_details?.installed 
               ? `<div style="margin-top: 8px; padding: 8px; background: #f0fdf4; border-left: 3px solid #10b981; border-radius: 4px;">
                   <div style="font-weight: 600; color: #047857; margin-bottom: 4px; font-size: 13px;">Installed:</div>
                   <div style="font-size: 11px; color: #047857; margin-left: 8px;">
                     ${exec.execution_details.installed.repo_name ? `<code>${exec.execution_details.installed.repo_name}</code>/` : ''}<strong>${exec.execution_details.installed.template_name || ''}</strong> v${exec.execution_details.installed.version || ''}
                   </div>
                 </div>`
-              : (exec.execution_details?.install_select ? `<div style="margin-top: 8px; padding: 8px; background: #f0fdf4; border-left: 3px solid #10b981; border-radius: 4px; font-size: 11px; color: #047857;">Installed: ${exec.execution_details.install_select}</div>` : '')}
+              : ''}
+            ${exec.execution_details?.hostname_changes && exec.execution_details.hostname_changes.length > 0
+              ? `<div style="margin-top: 8px; padding: 8px; background: #fef3c7; border-left: 3px solid #f59e0b; border-radius: 4px;">
+                  <div style="font-weight: 600; color: #92400e; margin-bottom: 4px; font-size: 13px;">Hostname Changes:</div>
+                  <ul style="margin: 4px 0 0 16px; font-size: 11px; color: #92400e;">
+                    ${exec.execution_details.hostname_changes.map(h => {
+                      const statusIcon = h.success ? '✓' : '✗';
+                      const statusColor = h.success ? '#047857' : '#dc2626';
+                      return `<li style="color: ${statusColor}; margin-bottom: 2px;">
+                        <span style="font-weight: bold;">${statusIcon}</span>
+                        <code>${h.host}</code>: Changed to <strong>${h.new_hostname || 'N/A'}</strong>${h.error ? ` - ${h.error}` : ''}
+                      </li>`;
+                    }).join('')}
+                  </ul>
+                </div>`
+              : ''}
+            ${exec.execution_details?.password_changes && exec.execution_details.password_changes.length > 0
+              ? `<div style="margin-top: 8px; padding: 8px; background: #fef3c7; border-left: 3px solid #f59e0b; border-radius: 4px;">
+                  <div style="font-weight: 600; color: #92400e; margin-bottom: 4px; font-size: 13px;">Password Changes:</div>
+                  <ul style="margin: 4px 0 0 16px; font-size: 11px; color: #92400e;">
+                    ${exec.execution_details.password_changes.map(p => {
+                      const statusIcon = p.success ? '✓' : '✗';
+                      const statusColor = p.success ? '#047857' : '#dc2626';
+                      return `<li style="color: ${statusColor}; margin-bottom: 2px;">
+                        <span style="font-weight: bold;">${statusIcon}</span>
+                        <code>${p.host}</code>: Changed password for user <strong>${p.username || 'guest'}</strong>${p.error ? ` - ${p.error}` : ''}
+                      </li>`;
+                    }).join('')}
+                  </ul>
+                </div>`
+              : ''}
             ${exec.execution_details?.ssh_profile 
               ? `<div style="margin-top: 8px; padding: 8px; background: #f0f9ff; border-left: 3px solid #3b82f6; border-radius: 4px;">
                   <div style="font-weight: 600; color: #1e40af; margin-bottom: 4px; font-size: 13px;">SSH Profile Execution:</div>
@@ -3711,8 +3755,8 @@ async function loadConfigurations() {
     // Create table/list of configurations
     let html = '<div style="display: flex; flex-direction: column; gap: 12px;">';
     configs.forEach((config, idx) => {
-      const createdDate = new Date(config.created_at).toLocaleString();
-      const updatedDate = new Date(config.updated_at).toLocaleString();
+      const createdDate = formatDateTime(config.created_at);
+      const updatedDate = formatDateTime(config.updated_at);
       html += `
         <div class="config-item" data-config-id="${config.id}" style="padding: 12px; border: 1px solid #d2d2d7; border-radius: 4px; background: #f5f5f7; cursor: pointer;">
           <div style="display: flex; align-items: center; gap: 8px; margin-bottom: 8px;">
@@ -3882,6 +3926,9 @@ function hideLoadingScreen() {
 }
 
 async function loadConfigurationById(configId) {
+  // Set flag to prevent clearing config name during section load
+  window.isLoadingConfiguration = true;
+  
   showLoadingScreen('Loading configuration...');
   try {
     showStatus(`Loading configuration...`);
@@ -3889,6 +3936,7 @@ async function loadConfigurationById(configId) {
     if (!getRes.ok) {
       showStatus('Failed to retrieve configuration');
       hideLoadingScreen();
+      window.isLoadingConfiguration = false;
       return;
     }
     
@@ -3896,6 +3944,7 @@ async function loadConfigurationById(configId) {
     if (!configData || !configData.config_data) {
       showStatus('Invalid configuration data received');
       hideLoadingScreen();
+      window.isLoadingConfiguration = false;
       return;
     }
     
@@ -3934,12 +3983,12 @@ async function loadConfigurationById(configId) {
       // Wait for preparation section elements to be available
       let attempts = 0;
       const maxAttempts = 50; // Increased timeout
-      while (attempts < maxAttempts && !el('apiBase')) {
+      while (attempts < maxAttempts && !el('fabricHost')) {
         await new Promise(resolve => setTimeout(resolve, 100));
         attempts++;
       }
       
-      if (!el('apiBase')) {
+      if (!el('fabricHost')) {
         showStatus('Error: Preparation section not loaded. Please try clicking on FabricStudio Runs manually.');
         hideLoadingScreen();
         return;
@@ -3976,6 +4025,9 @@ async function loadConfigurationById(configId) {
     showStatus(`Error loading configuration: ${error.message || error}`);
     logMsg(`Error loading configuration: ${error.message || error}`);
     hideLoadingScreen();
+  } finally {
+    // Clear the flag after configuration loading is complete
+    window.isLoadingConfiguration = false;
   }
 }
 
@@ -4042,8 +4094,7 @@ async function populateConfigEditForm(name, config) {
   if (nameInput) nameInput.value = name || '';
   
   // Set basic fields
-  const apiBaseInput = el('editApiBase');
-  if (apiBaseInput) apiBaseInput.value = config.apiBase || '';
+  // API Base field removed
   
   // Initialize editValidatedHosts globally for chips
   if (!window.editValidatedHosts) {
@@ -4202,16 +4253,20 @@ async function populateConfigEditForm(name, config) {
   const tplFormList = el('editTplFormList');
   if (tplFormList) tplFormList.innerHTML = '';
   
-  
-  // Load cached templates to populate dropdowns
+  // Build cached templates structure from config templates
+  // This allows us to populate dropdowns without calling the cache endpoint
   window.editCachedTemplates = [];
-  try {
-    const cacheRes = await api('/cache/templates');
-    if (cacheRes.ok) {
-      const cacheData = await cacheRes.json();
-      window.editCachedTemplates = cacheData.templates || [];
-    }
-  } catch (error) {
+  if (config.templates && config.templates.length > 0) {
+    // Build a structure similar to cached templates from the config data
+    config.templates.forEach(t => {
+      if (t.repo_name && t.template_name && t.version) {
+        window.editCachedTemplates.push({
+          repo_name: t.repo_name,
+          template_name: t.template_name,
+          version: t.version
+        });
+      }
+    });
   }
   
   // Enable Add Row button
@@ -4221,7 +4276,7 @@ async function populateConfigEditForm(name, config) {
   }
   
   if (config.templates && config.templates.length > 0) {
-    // Add template rows (editable, using cached templates)
+    // Add template rows (editable, using templates from config)
     // Add all rows first, then wait for values to be set
     let rowsAdded = 0;
     for (const template of config.templates) {
@@ -4876,7 +4931,7 @@ function collectConfigFromEditForm() {
   const nhiCredentialId = nhiCredentialSelect ? (nhiCredentialSelect.value || '') : (window.editNhiCredentialId || '');
   
   const config = {
-    apiBase: el('editApiBase')?.value || '',
+    // API Base removed
     fabricHost: el('editFabricHost')?.value || '',
     nhiCredentialId: nhiCredentialId,
     expertMode: el('editExpertMode')?.checked || false,
@@ -5020,7 +5075,7 @@ function cancelEditConfig() {
   if (editView) editView.style.display = 'none';
   
   // Clear form
-  const inputs = ['editConfigName', 'editApiBase', 'editFabricHost', 'editNewHostname', 'editChgPass', 'editSshWaitTime'];
+  const inputs = ['editConfigName', 'editFabricHost', 'editNewHostname', 'editChgPass', 'editSshWaitTime'];
   inputs.forEach(id => {
     const input = el(id);
     if (input) input.value = '';
@@ -5060,7 +5115,17 @@ async function deleteConfiguration(configId) {
   try {
     const res = await api(`/config/delete/${configId}`, { method: 'DELETE' });
     if (!res.ok) {
-      showStatus('Failed to delete configuration');
+      if (res.status === 404) {
+        // Configuration doesn't exist - might have been already deleted
+        showStatus('Configuration not found (may have been already deleted)');
+        logMsg(`Configuration ${configId} not found - may have been already deleted`);
+        // Still reload the list to refresh the UI
+        loadConfigurations();
+      } else {
+        const errorText = await res.text().catch(() => `HTTP ${res.status}`);
+        showStatus(`Failed to delete configuration: ${errorText}`);
+        logMsg(`Failed to delete configuration ${configId}: ${errorText}`);
+      }
       return;
     }
     
@@ -5075,8 +5140,615 @@ async function deleteConfiguration(configId) {
   }
 }
 
+// Login and authentication handling
+async function checkAuth() {
+  try {
+    const res = await api('/user/current');
+    if (res.ok) {
+      return true;
+    }
+    return false;
+  } catch (e) {
+    return false;
+  }
+}
+
+async function showLoginModal() {
+  return new Promise((resolve) => {
+    const overlay = document.createElement('div');
+    overlay.style.position = 'fixed';
+    overlay.style.top = '0';
+    overlay.style.left = '0';
+    overlay.style.right = '0';
+    overlay.style.bottom = '0';
+    overlay.style.background = 'rgba(0,0,0,0.6)';
+    overlay.style.display = 'flex';
+    overlay.style.alignItems = 'center';
+    overlay.style.justifyContent = 'center';
+    overlay.style.zIndex = '10000';
+
+    const dialog = document.createElement('div');
+    dialog.style.background = 'white';
+    dialog.style.border = '1px solid #d2d2d7';
+    dialog.style.boxShadow = '0 4px 12px rgba(0,0,0,0.3)';
+    dialog.style.width = '400px';
+    dialog.style.maxWidth = '90%';
+    dialog.style.padding = '24px';
+    dialog.style.borderRadius = '0';
+
+    const title = document.createElement('h2');
+    title.textContent = 'Login Required';
+    title.style.margin = '0 0 20px 0';
+    title.style.fontSize = '20px';
+    title.style.fontWeight = '600';
+    dialog.appendChild(title);
+
+    const usernameLabel = document.createElement('label');
+    usernameLabel.textContent = 'Username:';
+    usernameLabel.style.display = 'block';
+    usernameLabel.style.marginBottom = '6px';
+    dialog.appendChild(usernameLabel);
+
+    const usernameInput = document.createElement('input');
+    usernameInput.type = 'text';
+    usernameInput.autocomplete = 'username';
+    usernameInput.style.width = '100%';
+    usernameInput.style.boxSizing = 'border-box';
+    usernameInput.style.margin = '0 0 16px 0';
+    usernameInput.style.padding = '8px 12px';
+    usernameInput.style.border = '1px solid #d2d2d7';
+    usernameInput.style.minHeight = '36px';
+    dialog.appendChild(usernameInput);
+
+    const passwordLabel = document.createElement('label');
+    passwordLabel.textContent = 'Password:';
+    passwordLabel.style.display = 'block';
+    passwordLabel.style.marginBottom = '6px';
+    dialog.appendChild(passwordLabel);
+
+    const passwordInput = document.createElement('input');
+    passwordInput.type = 'password';
+    passwordInput.autocomplete = 'current-password';
+    passwordInput.style.width = '100%';
+    passwordInput.style.boxSizing = 'border-box';
+    passwordInput.style.margin = '0 0 20px 0';
+    passwordInput.style.padding = '8px 12px';
+    passwordInput.style.border = '1px solid #d2d2d7';
+    passwordInput.style.minHeight = '36px';
+    dialog.appendChild(passwordInput);
+
+    const errorMsg = document.createElement('div');
+    errorMsg.style.color = '#f87171';
+    errorMsg.style.marginBottom = '16px';
+    errorMsg.style.display = 'none';
+    dialog.appendChild(errorMsg);
+
+    const actions = document.createElement('div');
+    actions.style.display = 'flex';
+    actions.style.gap = '12px';
+    actions.style.justifyContent = 'flex-end';
+
+    const loginBtn = document.createElement('button');
+    loginBtn.textContent = 'Login';
+    loginBtn.className = 'btn btn-primary';
+    loginBtn.onclick = async () => {
+      const username = usernameInput.value.trim();
+      const password = passwordInput.value;
+      
+      if (!username || !password) {
+        errorMsg.textContent = 'Please enter username and password';
+        errorMsg.style.display = 'block';
+        return;
+      }
+      
+      loginBtn.disabled = true;
+      loginBtn.textContent = 'Logging in...';
+      
+      try {
+        const res = await api('/auth/login', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ username, password })
+        });
+        
+        if (res.ok) {
+          document.body.removeChild(overlay);
+          resolve(true);
+        } else {
+          const data = await res.json().catch(() => ({ detail: 'Login failed' }));
+          errorMsg.textContent = data.detail || 'Invalid username or password';
+          errorMsg.style.display = 'block';
+          loginBtn.disabled = false;
+          loginBtn.textContent = 'Login';
+        }
+      } catch (e) {
+        errorMsg.textContent = 'Login failed. Please try again.';
+        errorMsg.style.display = 'block';
+        loginBtn.disabled = false;
+        loginBtn.textContent = 'Login';
+      }
+    };
+    
+    passwordInput.addEventListener('keypress', (e) => {
+      if (e.key === 'Enter') {
+        loginBtn.click();
+      }
+    });
+    
+    actions.appendChild(loginBtn);
+    dialog.appendChild(actions);
+    overlay.appendChild(dialog);
+    document.body.appendChild(overlay);
+    
+    usernameInput.focus();
+  });
+}
+
+// User Management functions
+function setupUserManagement() {
+  const form = document.getElementById('changePasswordForm');
+  if (!form) return;
+  
+  // Load users list
+  loadUsers();
+  
+  // Setup create user button
+  const createUserBtn = el('btnCreateUser');
+  if (createUserBtn) {
+    createUserBtn.addEventListener('click', () => {
+      showCreateUserDialog();
+    });
+  }
+  
+  // Add real-time password match validation
+  const newPasswordInput = el('newPassword');
+  const confirmPasswordInput = el('confirmPassword');
+  const passwordMatchError = el('passwordMatchError');
+  
+  const validatePasswordMatch = () => {
+    if (passwordMatchError) {
+      const newPwd = newPasswordInput ? newPasswordInput.value : '';
+      const confirmPwd = confirmPasswordInput ? confirmPasswordInput.value : '';
+      if (confirmPwd && newPwd !== confirmPwd) {
+        passwordMatchError.textContent = 'Passwords do not match';
+        passwordMatchError.style.display = 'inline';
+      } else {
+        passwordMatchError.style.display = 'none';
+      }
+    }
+  };
+  
+  if (confirmPasswordInput) {
+    confirmPasswordInput.addEventListener('input', validatePasswordMatch);
+    confirmPasswordInput.addEventListener('blur', validatePasswordMatch);
+  }
+  if (newPasswordInput) {
+    newPasswordInput.addEventListener('input', validatePasswordMatch);
+  }
+  
+  form.onsubmit = async (e) => {
+    e.preventDefault();
+    
+    // Hide previous errors
+    if (passwordMatchError) {
+      passwordMatchError.style.display = 'none';
+    }
+    
+    const currentPassword = el('currentPassword') ? el('currentPassword').value : '';
+    const newPassword = newPasswordInput ? newPasswordInput.value : '';
+    const confirmPassword = confirmPasswordInput ? confirmPasswordInput.value : '';
+    
+    if (!currentPassword || !newPassword || !confirmPassword) {
+      showUserManagementStatus('Please fill in all fields', true);
+      return;
+    }
+    
+    if (newPassword !== confirmPassword) {
+      if (passwordMatchError) {
+        passwordMatchError.textContent = 'Passwords do not match';
+        passwordMatchError.style.display = 'inline';
+      }
+      showUserManagementStatus('New passwords do not match', true);
+      return;
+    }
+    
+    if (newPassword.length < 7) {
+      showUserManagementStatus('Password must be at least 7 characters long', true);
+      return;
+    }
+    
+    const hasNumber = /\d/.test(newPassword);
+    if (!hasNumber) {
+      showUserManagementStatus('Password must contain at least one number', true);
+      return;
+    }
+    
+    const specialChars = /[!@#$%^&*()_+\-=\[\]{}|;:,.<>?]/.test(newPassword);
+    if (!specialChars) {
+      showUserManagementStatus('Password must contain at least one special character', true);
+      return;
+    }
+    
+    const changeBtn = el('btnChangePassword');
+    if (changeBtn) {
+      changeBtn.disabled = true;
+      changeBtn.textContent = 'Changing...';
+    }
+    
+    try {
+      const res = await api('/user/change-password', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          current_password: currentPassword,
+          new_password: newPassword
+        })
+      });
+      
+      if (res.ok) {
+        const data = await res.json();
+        showUserManagementStatus(data.message || 'Password changed successfully');
+        form.reset();
+        if (passwordMatchError) {
+          passwordMatchError.style.display = 'none';
+        }
+      } else {
+        const error = await res.json().catch(() => ({ detail: 'Failed to change password' }));
+        showUserManagementStatus(error.detail || 'Failed to change password', true);
+      }
+    } catch (e) {
+      showUserManagementStatus('Error changing password: ' + (e.message || e), true);
+    } finally {
+      if (changeBtn) {
+        changeBtn.disabled = false;
+        changeBtn.textContent = 'Change Password';
+      }
+    }
+  };
+}
+
+async function loadUsers() {
+  const usersListEl = el('usersList');
+  if (!usersListEl) return;
+  
+  try {
+    usersListEl.innerHTML = '<p style="color: #86868b; font-size: 13px;">Loading users...</p>';
+    
+    const res = await api('/user/list');
+    if (!res.ok) {
+      usersListEl.innerHTML = '<p style="color: #f87171; font-size: 13px;">Failed to load users</p>';
+      return;
+    }
+    
+    const data = await res.json();
+    const users = data.users || [];
+    
+    if (users.length === 0) {
+      usersListEl.innerHTML = '<p style="color: #86868b; font-size: 13px;">No users found</p>';
+      return;
+    }
+    
+    // Get current user to highlight
+    let currentUserId = null;
+    try {
+      const currentUserRes = await api('/user/current');
+      if (currentUserRes.ok) {
+        const currentUserData = await currentUserRes.json();
+        currentUserId = currentUserData.id;
+      }
+    } catch (e) {
+      // Ignore errors
+    }
+    
+    let html = '<div style="display: flex; flex-direction: column; gap: 8px;">';
+    users.forEach(user => {
+      const isCurrentUser = user.id === currentUserId;
+      const createdDate = formatDateTime(user.created_at);
+      html += `
+        <div style="display: flex; justify-content: space-between; align-items: center; padding: 10px 12px; background: white; border: 1px solid #d2d2d7; border-radius: 4px;">
+          <div>
+            <div style="font-weight: 600; font-size: 14px; color: #1d1d1f;">
+              ${user.username}${isCurrentUser ? ' <span style="color: #86868b; font-weight: normal; font-size: 12px;">(You)</span>' : ''}
+            </div>
+            <div style="font-size: 12px; color: #86868b; margin-top: 4px;">
+              Created: ${createdDate}
+            </div>
+          </div>
+          ${!isCurrentUser ? `<button type="button" class="btn-delete-user" data-user-id="${user.id}" data-username="${user.username}" style="padding: 4px 12px; font-size: 12px; background: #f87171; color: white; border: none; cursor: pointer; border-radius: 0; font-weight: 600;">Delete</button>` : ''}
+        </div>
+      `;
+    });
+    html += '</div>';
+    
+    usersListEl.innerHTML = html;
+    
+    // Add event listeners for delete buttons
+    usersListEl.querySelectorAll('.btn-delete-user').forEach(btn => {
+      btn.addEventListener('click', async (e) => {
+        e.stopPropagation();
+        const userId = parseInt(btn.getAttribute('data-user-id'));
+        const username = btn.getAttribute('data-username');
+        await deleteUser(userId, username);
+      });
+    });
+  } catch (error) {
+    usersListEl.innerHTML = `<p style="color: #f87171; font-size: 13px;">Error loading users: ${error.message || error}</p>`;
+  }
+}
+
+function showCreateUserDialog() {
+  return new Promise((resolve) => {
+    const overlay = document.createElement('div');
+    overlay.style.cssText = `
+      position: fixed;
+      top: 0;
+      left: 0;
+      right: 0;
+      bottom: 0;
+      background: rgba(0, 0, 0, 0.5);
+      z-index: 10000;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 20px;
+    `;
+    
+    const dialog = document.createElement('div');
+    dialog.style.cssText = `
+      background: white;
+      border-radius: 0;
+      padding: 24px;
+      max-width: 500px;
+      width: 100%;
+      box-shadow: 0 4px 20px rgba(0, 0, 0, 0.3);
+    `;
+    
+    dialog.innerHTML = `
+      <h3 style="margin: 0 0 20px 0; font-size: 18px; font-weight: 600; color: #1d1d1f;">Create New User</h3>
+      
+      <form id="createUserForm">
+        <div style="margin-bottom: 16px;">
+          <label for="newUsername" style="display: block; margin-bottom: 6px; font-weight: 500; color: #1d1d1f; font-size: 14px;">Username:</label>
+          <input 
+            type="text" 
+            id="newUsername" 
+            name="username" 
+            required
+            autocomplete="username"
+            style="width: 100%; box-sizing: border-box; padding: 10px 12px; border: 1px solid #d2d2d7; border-radius: 0; font-size: 14px; min-height: 40px; font-family: 'Inter', ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, 'Helvetica Neue', Arial, 'Noto Sans', 'Liberation Sans', sans-serif;"
+            placeholder="Enter username"
+          />
+          <div style="font-size: 12px; color: #86868b; margin-top: 4px;">Alphanumeric characters, dashes, and underscores only</div>
+        </div>
+        
+        <div style="margin-bottom: 16px;">
+          <label for="newUserPassword" style="display: block; margin-bottom: 6px; font-weight: 500; color: #1d1d1f; font-size: 14px;">Password:</label>
+          <input 
+            type="password" 
+            id="newUserPassword" 
+            name="password" 
+            required
+            autocomplete="new-password"
+            style="width: 100%; box-sizing: border-box; padding: 10px 12px; border: 1px solid #d2d2d7; border-radius: 0; font-size: 14px; min-height: 40px; font-family: 'Inter', ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, 'Helvetica Neue', Arial, 'Noto Sans', 'Liberation Sans', sans-serif;"
+            placeholder="Enter password"
+          />
+          <div style="font-size: 12px; color: #86868b; margin-top: 4px;">Must be at least 7 characters with 1 number and 1 special character</div>
+        </div>
+        
+        <div style="margin-bottom: 20px;">
+          <label for="newUserConfirmPassword" style="display: block; margin-bottom: 6px; font-weight: 500; color: #1d1d1f; font-size: 14px;">Confirm Password:</label>
+          <input 
+            type="password" 
+            id="newUserConfirmPassword" 
+            name="confirmPassword" 
+            required
+            autocomplete="new-password"
+            style="width: 100%; box-sizing: border-box; padding: 10px 12px; border: 1px solid #d2d2d7; border-radius: 0; font-size: 14px; min-height: 40px; font-family: 'Inter', ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, 'Helvetica Neue', Arial, 'Noto Sans', 'Liberation Sans', sans-serif;"
+            placeholder="Confirm password"
+          />
+          <div id="createUserPasswordMatchError" style="font-size: 12px; color: #f87171; margin-top: 4px; display: none;"></div>
+        </div>
+        
+        <div id="createUserError" style="color: #f87171; margin-bottom: 16px; display: none; font-size: 14px;"></div>
+        
+        <div style="display: flex; gap: 8px; justify-content: flex-end;">
+          <button type="button" id="btnCancelCreateUser" style="padding: 8px 16px; border: 1px solid #d2d2d7; background: white; color: #1d1d1f; cursor: pointer; font-size: 14px; border-radius: 0;">Cancel</button>
+          <button type="submit" id="btnSubmitCreateUser" style="padding: 8px 16px; background: #da291c; color: white; border: none; cursor: pointer; font-size: 14px; font-weight: 600; border-radius: 0; box-shadow: 0 2px 4px rgba(218, 41, 28, 0.3);">Create User</button>
+        </div>
+      </form>
+    `;
+    
+    overlay.appendChild(dialog);
+    document.body.appendChild(overlay);
+    
+    const form = dialog.querySelector('#createUserForm');
+    const usernameInput = dialog.querySelector('#newUsername');
+    const passwordInput = dialog.querySelector('#newUserPassword');
+    const confirmPasswordInput = dialog.querySelector('#newUserConfirmPassword');
+    const passwordMatchError = dialog.querySelector('#createUserPasswordMatchError');
+    const errorDiv = dialog.querySelector('#createUserError');
+    const cancelBtn = dialog.querySelector('#btnCancelCreateUser');
+    const submitBtn = dialog.querySelector('#btnSubmitCreateUser');
+    
+    const closeDialog = () => {
+      document.body.removeChild(overlay);
+      resolve(null);
+    };
+    
+    const validatePasswordMatch = () => {
+      const password = passwordInput.value;
+      const confirmPassword = confirmPasswordInput.value;
+      if (confirmPassword && password !== confirmPassword) {
+        passwordMatchError.textContent = 'Passwords do not match';
+        passwordMatchError.style.display = 'block';
+        return false;
+      } else {
+        passwordMatchError.style.display = 'none';
+        return true;
+      }
+    };
+    
+    confirmPasswordInput.addEventListener('input', validatePasswordMatch);
+    confirmPasswordInput.addEventListener('blur', validatePasswordMatch);
+    
+    cancelBtn.addEventListener('click', closeDialog);
+    
+    form.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      
+      errorDiv.style.display = 'none';
+      passwordMatchError.style.display = 'none';
+      
+      const username = usernameInput.value.trim();
+      const password = passwordInput.value;
+      const confirmPassword = confirmPasswordInput.value;
+      
+      if (!username) {
+        errorDiv.textContent = 'Username is required';
+        errorDiv.style.display = 'block';
+        return;
+      }
+      
+      if (!password || !confirmPassword) {
+        errorDiv.textContent = 'Password and confirmation are required';
+        errorDiv.style.display = 'block';
+        return;
+      }
+      
+      if (!validatePasswordMatch()) {
+        return;
+      }
+      
+      if (password.length < 7) {
+        errorDiv.textContent = 'Password must be at least 7 characters long';
+        errorDiv.style.display = 'block';
+        return;
+      }
+      
+      const hasNumber = /\d/.test(password);
+      if (!hasNumber) {
+        errorDiv.textContent = 'Password must contain at least one number';
+        errorDiv.style.display = 'block';
+        return;
+      }
+      
+      const specialChars = /[!@#$%^&*()_+\-=\[\]{}|;:,.<>?]/.test(password);
+      if (!specialChars) {
+        errorDiv.textContent = 'Password must contain at least one special character';
+        errorDiv.style.display = 'block';
+        return;
+      }
+      
+      submitBtn.disabled = true;
+      submitBtn.textContent = 'Creating...';
+      submitBtn.style.opacity = '0.7';
+      submitBtn.style.cursor = 'not-allowed';
+      
+      try {
+        const res = await api('/user/create', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            username: username,
+            password: password
+          })
+        });
+        
+        if (res.ok) {
+          const data = await res.json();
+          showUserManagementStatus(data.message || 'User created successfully');
+          closeDialog();
+          await loadUsers(); // Refresh users list
+          resolve({ username, password });
+        } else {
+          const error = await res.json().catch(() => ({ detail: 'Failed to create user' }));
+          errorDiv.textContent = error.detail || 'Failed to create user';
+          errorDiv.style.display = 'block';
+          submitBtn.disabled = false;
+          submitBtn.textContent = 'Create User';
+          submitBtn.style.opacity = '1';
+          submitBtn.style.cursor = 'pointer';
+        }
+      } catch (e) {
+        errorDiv.textContent = 'Error creating user: ' + (e.message || e);
+        errorDiv.style.display = 'block';
+        submitBtn.disabled = false;
+        submitBtn.textContent = 'Create User';
+        submitBtn.style.opacity = '1';
+        submitBtn.style.cursor = 'pointer';
+      }
+    });
+    
+    // Focus username field
+    setTimeout(() => usernameInput.focus(), 100);
+    
+    // Close on overlay click
+    overlay.addEventListener('click', (e) => {
+      if (e.target === overlay) {
+        closeDialog();
+      }
+    });
+    
+    // Close on Escape key
+    const escapeHandler = (e) => {
+      if (e.key === 'Escape') {
+        closeDialog();
+        document.removeEventListener('keydown', escapeHandler);
+      }
+    };
+    document.addEventListener('keydown', escapeHandler);
+  });
+}
+
+function showUserManagementStatus(message, isError = false) {
+  const statusEl = el('userManagementStatus');
+  if (statusEl) {
+    statusEl.textContent = message;
+    statusEl.style.display = 'block';
+    statusEl.style.background = isError ? '#fee' : '#efe';
+    statusEl.style.border = `1px solid ${isError ? '#f87171' : '#10b981'}`;
+    statusEl.style.color = isError ? '#dc2626' : '#059669';
+    statusEl.style.padding = '12px';
+    statusEl.style.borderRadius = '4px';
+    statusEl.style.margin = '12px 0';
+  }
+  showStatus(message, isError ? { error: true } : {});
+}
+
+async function deleteUser(userId, username) {
+  if (!confirm(`Are you sure you want to delete user '${username}'? This action cannot be undone.`)) {
+    return;
+  }
+  
+  try {
+    const res = await api(`/user/${userId}`, {
+      method: 'DELETE',
+      headers: { 'Content-Type': 'application/json' }
+    });
+    
+    if (res.ok) {
+      const data = await res.json();
+      showUserManagementStatus(data.message || `User '${username}' deleted successfully`);
+      await loadUsers(); // Refresh users list
+    } else {
+      const error = await res.json().catch(() => ({ detail: 'Failed to delete user' }));
+      showUserManagementStatus(error.detail || 'Failed to delete user', true);
+    }
+  } catch (e) {
+    showUserManagementStatus('Error deleting user: ' + (e.message || e), true);
+  }
+}
+
 // Initialize without default rows
-document.addEventListener('DOMContentLoaded', () => {
+document.addEventListener('DOMContentLoaded', async () => {
+  // Check authentication first - redirect to login if not authenticated
+  const isAuthenticated = await checkAuth();
+  if (!isAuthenticated) {
+    // Redirect to login page
+    window.location.href = '/login';
+    return;
+  }
+  
   initMenu();
   // initEventFormValidation() and initNhiFormValidation() are called when sections load
   initGuestPasswordValidation();
@@ -5218,7 +5890,13 @@ async function handleRunButton() {
   clearConfigName();
   const hosts = getAllConfirmedHosts();
   if (hosts.length === 0) {
-    showStatus('No hosts configured. Please confirm hosts first.');
+    // Auto-confirm hosts if available
+    if (autoConfirmHosts()) {
+      // Hosts are now confirmed, continue
+    } else {
+      showStatus('No hosts configured. Please add at least one valid host.');
+      return;
+    }
     return;
   }
   
@@ -5235,16 +5913,8 @@ async function handleRunButton() {
   
   try {
     // STEP 1: Install Workspace (if not already installed)
-    // Check if tokens are available, if not try to acquire them
+    // User is already authenticated via login - proceed
     const hosts = parseFabricHosts();
-    
-    // Check session status - tokens are managed server-side
-    const session = await checkSessionStatus();
-    if (!session) {
-      showStatus('No active session. Please reload NHI credential.');
-        hideRunProgress();
-        return;
-    }
     
     // Build templates list from ALL rows
     updateRunProgress(5, 'Collecting workspace templates from rows...');
@@ -5300,7 +5970,7 @@ async function handleRunButton() {
     if (templatesToCreate.length > 0) {
       // Execute preparation steps (5-20%)
       updateRunProgress(7, 'Executing preparation steps...');
-      showStatus('Executing preparation steps...');
+      logMsg('Executing preparation steps...');
       
       // Refresh repositories
       updateRunProgress(9, 'Refreshing repositories...');
@@ -5361,7 +6031,25 @@ async function handleRunButton() {
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ fabric_host, username, new_password })
           });
-          if (!res.ok) throw new Error(`HTTP ${res.status}`);
+          if (!res.ok) {
+            let errorMessage = `HTTP ${res.status}`;
+            try {
+              const errorData = await res.json();
+              errorMessage = errorData.detail || errorData.message || errorMessage;
+            } catch (e) {
+              // If JSON parsing fails, try to get text
+              try {
+                const errorText = await res.text();
+                if (errorText) {
+                  errorMessage = errorText;
+                }
+              } catch (e2) {
+                // Use default error message
+              }
+            }
+            logMsg(`Password change error on ${fabric_host}: ${errorMessage}`);
+            throw new Error(errorMessage);
+          }
         });
       }
       
@@ -5684,11 +6372,9 @@ async function handleRunButton() {
       renderTemplates();
       
       if (createdCount === totalTemplates) {
-        showStatus(`Created all ${templatesToCreate.length} workspace template(s) successfully`);
-        logMsg(`Created all ${templatesToCreate.length} workspace template(s) successfully: ${templatesToCreate.map(t => t.template_name).join(', ')}`);
+        showStatus(`Created all ${templatesToCreate.length} workspace template(s) successfully: ${templatesToCreate.map(t => t.template_name).join(', ')}`);
       } else {
-        showStatus(`Created ${createdCount}/${templatesToCreate.length} workspace template(s) successfully`);
-        logMsg(`Created ${createdCount}/${templatesToCreate.length} workspace template(s): ${templatesToCreate.map(t => t.template_name).join(', ')}`);
+        showStatus(`Created ${createdCount}/${templatesToCreate.length} workspace template(s) successfully: ${templatesToCreate.map(t => t.template_name).join(', ')}`);
       }
     } else {
       // All templates already exist, skip creation
@@ -5708,18 +6394,7 @@ async function handleRunButton() {
       showStatus('Executing SSH profiles on all hosts...');
       logMsg('Starting SSH profile execution');
       
-      // Get encryption password from NHI credential input field (no prompt needed)
-      const nhiPasswordInput = el('nhiDecryptPassword');
-      const encryptionPassword = nhiPasswordInput ? nhiPasswordInput.value.trim() : '';
-      
-      if (!encryptionPassword) {
-        showStatus('SSH profile execution requires encryption password. Please load NHI credential first.');
-        logMsg('SSH profile execution cancelled - encryption password not available');
-        hideRunProgress();
-        stopRunTimer();
-        return;
-      }
-      
+      // No encryption password required - uses FS_SERVER_SECRET
       try {
         // Filter out failed hosts before SSH execution
         const availableHostsForSsh = hosts.filter(({host}) => !failedHosts.has(host));
@@ -5733,7 +6408,7 @@ async function handleRunButton() {
             logMsg(`Skipping SSH execution on failed hosts: ${failedHostNames}. Executing on ${availableHostsForSsh.length} remaining host(s).`);
           }
           
-          const sshResults = await executeSshProfiles(availableHostsForSsh, sshProfileId, encryptionPassword, sshWaitTime);
+          const sshResults = await executeSshProfiles(availableHostsForSsh, sshProfileId, sshWaitTime);
           const sshSuccessCount = sshResults.filter(r => r.success).length;
           
           if (sshSuccessCount === availableHostsForSsh.length) {
@@ -5869,17 +6544,7 @@ async function handleRunButton() {
       return;
     }
     
-    // Session was already checked at the start of the function
-    // Re-check session status to ensure it's still valid
-    const sessionStatus = await checkSessionStatus();
-    if (!sessionStatus) {
-      showStatus(`Error: No active session. Please reload NHI credential.`);
-      logMsg(`Error: No active session`);
-      hideRunProgress();
-      stopRunTimer();
-      return;
-    }
-    
+    // User is already authenticated via login - proceed
     updateRunProgress(70, `Installing workspace: ${template_name} v${version}`);
     const totalHosts = hosts.length;
     const hostProgressMap = new Map(); // Track individual host progress
@@ -6061,7 +6726,6 @@ async function handleRunButton() {
 
 // Configuration save/retrieve functions
 function collectConfiguration() {
-  const apiBaseInput = el('apiBase');
   const fabricHostInput = el('fabricHost');
   const nhiSelect = el('nhiCredentialSelect');
   const expertModeInput = el('expertMode');
@@ -6076,11 +6740,10 @@ function collectConfiguration() {
   const hostsArray = Array.isArray(confirmedHosts) ? confirmedHosts : [];
   
   let config = {
-    apiBase: apiBaseInput ? apiBaseInput.value : '',
     fabricHost: fabricHostInput ? fabricHostInput.value : '',
     nhiCredentialId: nhiSelect ? (nhiSelect.value || '') : '',
     // Note: We don't save decrypted credentials or encryption password for security reasons
-    // User must load NHI credential with password after restoring configuration
+    // NHI credentials are automatically loaded when configuration is restored (no password needed)
     expertMode: expertModeInput ? expertModeInput.checked : false,
     newHostname: newHostnameInput ? newHostnameInput.value : '',
     chgPass: chgPassInput ? chgPassInput.value : '',
@@ -6111,22 +6774,25 @@ function collectConfiguration() {
 }
 
 async function restoreConfiguration(config) {
+  // Set flag to prevent button from being enabled during restore
+  isRestoringConfiguration = true;
+  
   try {
     
     // Ensure preparation section is loaded - wait for elements to exist
     let attempts = 0;
-    while (attempts < 30 && !el('apiBase')) {
+    while (attempts < 30 && !el('fabricHost')) {
       await new Promise(resolve => setTimeout(resolve, 100));
       attempts++;
     }
     
-    if (!el('apiBase')) {
+    if (!el('fabricHost')) {
       showStatus('Error: Preparation section not loaded. Please try again.');
       return;
     }
     
     // IMPORTANT: Disable Run button immediately when loading configuration
-    // It will only be enabled after explicit "Load Credentials" and "Confirm Hosts" clicks
+    // It will be enabled when hosts are available and tokens are acquired
     const runBtn = el('btnInstallSelected');
     if (runBtn) {
       runBtn.disabled = true;
@@ -6135,16 +6801,12 @@ async function restoreConfiguration(config) {
     // Reset state to ensure fresh start
     currentNhiId = null;
     decryptedClientId = '';
-    confirmedHosts = [];
+    confirmedHosts = []; // Clear confirmed hosts
     validatedHosts = [];
+    // Clear templates array to ensure fresh state - templates will be re-added when run starts
+    templates = [];
     
-    // Restore apiBase FIRST before any API calls are made
-    const apiBaseInput = el('apiBase');
-    if (apiBaseInput && config.apiBase !== undefined && config.apiBase) {
-      apiBaseInput.value = config.apiBase;
-    }
-    
-    // Restore other basic fields - always safe, no API calls
+    // Restore basic fields - always safe, no API calls
     const fabricHostInput = el('fabricHost');
     if (fabricHostInput && config.fabricHost !== undefined) {
       fabricHostInput.value = config.fabricHost || '';
@@ -6155,182 +6817,118 @@ async function restoreConfiguration(config) {
       expertModeInput.checked = config.expertMode || false;
     }
     
-    // Restore NHI credential selection if available, and auto-load with password prompt
+    // Restore NHI credential selection if available, and auto-load automatically (no password needed)
     if (config.nhiCredentialId) {
       const nhiSelect = el('nhiCredentialSelect');
       if (nhiSelect) {
-        // Ensure list is fresh, then set value
-        await loadNhiCredentialsForAuth();
+        // Load credentials if not already loaded (may have been loaded by initializePreparationSection)
+        if (!_nhiCredentialsCache) {
+          await loadNhiCredentialsForAuth();
+        } else {
+          // Just populate dropdown with cached data
+          populateNhiCredentialsDropdown(nhiSelect, _nhiCredentialsCache);
+        }
         nhiSelect.value = String(config.nhiCredentialId);
-        // Take Encryption Password from input to load the credential
+        
+        // Automatically load the credential (no password required)
         try {
-          const pwdInput = el('nhiDecryptPassword');
-          const pwd = pwdInput ? (pwdInput.value || '').trim() : '';
-          if (pwd) {
-            const res = await api(`/nhi/get/${config.nhiCredentialId}`, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ encryption_password: pwd })
-            });
-            if (res.ok) {
-              const nhiData = await res.json();
-              decryptedClientId = nhiData.client_id || '';
-              // Session-based: client_secret is no longer returned, tokens are managed server-side
-              currentNhiId = parseInt(config.nhiCredentialId);
-              // Session-based: tokens are managed server-side
-              // Session was created server-side by /nhi/get endpoint
-              // We'll check session status later when actually needed (e.g., before API calls)
-              // This avoids unnecessary 401 errors during configuration restore
-              // The session expiration will be checked when the user performs actions that require it
-              // Enable confirm button now that credentials are loaded
-              const confirmBtn = el('btnConfirmHosts');
-              if (confirmBtn) confirmBtn.disabled = false;
+          showStatus('Loading NHI credential...');
+          await loadSelectedNhiCredential();
+          
+          // Wait a bit for credential to load and hosts to be populated
+          await new Promise(resolve => setTimeout(resolve, 300));
+          
+          // Populate hosts from NHI credential (auto-confirmed)
+          if (window.validatedNhiHosts && window.validatedNhiHosts.length > 0) {
+            // Populate validated hosts from NHI credential (but don't set confirmedHosts yet)
+            validatedHosts = [...window.validatedNhiHosts];
+            
+            // Update manual input to match
+            const fabricHostInput = el('fabricHost');
+            if (fabricHostInput) {
+              const validatedHostsStr = validatedHosts.map(({host, port}) => 
+                host + (port !== undefined ? ':' + port : '')
+              ).join(' ');
+              fabricHostInput.value = validatedHostsStr;
+              renderHostChips();
+              updateValidationStatus();
+              fabricHostInput.readOnly = true;
+              fabricHostInput.disabled = false;
+              fabricHostInput.style.backgroundColor = '#f5f5f7';
+              fabricHostInput.style.cursor = 'not-allowed';
+            }
+            
+            // Make NHI credential input readonly
+            const fabricHostFromNhiInput = el('fabricHostFromNhi');
+            if (fabricHostFromNhiInput) {
+              const nhiHostsStr = window.validatedNhiHosts.map(({host, port}) => 
+                host + (port !== undefined ? ':' + port : '')
+              ).join(' ');
+              fabricHostFromNhiInput.value = nhiHostsStr;
+              fabricHostFromNhiInput.readOnly = true;
+              fabricHostFromNhiInput.disabled = false;
+              fabricHostFromNhiInput.style.backgroundColor = '#f5f5f7';
+              fabricHostFromNhiInput.style.cursor = 'not-allowed';
+            }
+            
+            // Auto-confirm hosts and acquire tokens
+            if (autoConfirmHosts()) {
+              // Render host list (but don't show hostsListRow)
+              await renderFabricHostList();
               
-              // IMPORTANT: Keep Run button disabled - user must still click "Confirm Hosts"
-              const runBtnAfterLoad = el('btnInstallSelected');
-              if (runBtnAfterLoad) runBtnAfterLoad.disabled = true;
-              
-              // Automatically confirm hosts if they are available from NHI credential
-              // This makes the configuration ready to run without manual confirmation
-              if (nhiData.hosts_with_tokens && Array.isArray(nhiData.hosts_with_tokens) && nhiData.hosts_with_tokens.length > 0) {
-                // Populate NHI hosts field if not already populated
-                const fabricHostFromNhiInput = el('fabricHostFromNhi');
-                if (fabricHostFromNhiInput) {
-                  const nhiHostsStr = nhiData.hosts_with_tokens.sort().join(' ');
-                  fabricHostFromNhiInput.value = nhiHostsStr;
-                  // Validate and populate hosts from NHI credential
-                  populateHostsFromInput(nhiHostsStr, 'fabricHostFromNhi', 'fabricHostFromNhiChips', 'fabricHostFromNhiStatus');
-                  
-                  // Wait a bit for validation to complete, then check validated hosts
-                  await new Promise(resolve => setTimeout(resolve, 100));
-                }
-                
-                // Check if we have validated hosts from NHI credential
-                if (window.validatedNhiHosts && window.validatedNhiHosts.length > 0) {
-                  // Automatically confirm hosts from NHI credential
-                  confirmedHosts = window.validatedNhiHosts.map(({host, port}) => ({host, port}));
-                  validatedHosts = [...window.validatedNhiHosts];
-                  
-                  // Update manual input to match
-                  const fabricHostInput = el('fabricHost');
-                  if (fabricHostInput) {
-                    const confirmedHostsStr = confirmedHosts.map(({host, port}) => 
-                      host + (port !== undefined ? ':' + port : '')
-                    ).join(' ');
-                    fabricHostInput.value = confirmedHostsStr;
-                    renderHostChips();
-                    updateValidationStatus();
-                    fabricHostInput.readOnly = true;
-                    fabricHostInput.disabled = false;
-                    fabricHostInput.style.backgroundColor = '#f5f5f7';
-                    fabricHostInput.style.cursor = 'not-allowed';
-                  }
-                  
-                  // Make NHI credential input readonly
-                  if (fabricHostFromNhiInput) {
-                    const nhiHostsStr = window.validatedNhiHosts.map(({host, port}) => 
-                      host + (port !== undefined ? ':' + port : '')
-                    ).join(' ');
-                    fabricHostFromNhiInput.value = nhiHostsStr;
-                    fabricHostFromNhiInput.readOnly = true;
-                    fabricHostFromNhiInput.disabled = false;
-                    fabricHostFromNhiInput.style.backgroundColor = '#f5f5f7';
-                    fabricHostFromNhiInput.style.cursor = 'not-allowed';
-                  }
-                  
-                  // Render host list and acquire tokens
-                  await renderFabricHostList();
-                  const hostsListRow = el('hostsListRow');
-                  if (hostsListRow) hostsListRow.style.display = '';
-                  showStatus('Hosts confirmed. Acquiring tokens...');
-                  
-                  // Automatically acquire tokens
-                  if (await acquireTokens()) {
-                    const addRowBtn = el('btnAddRow');
-                    if (addRowBtn) addRowBtn.disabled = false;
-                    showStatus('Configuration loaded and ready. Caching templates...', { hideAfterMs: 1000 });
-                    // Cache templates
-                    await cacheAllTemplates();
-                    // Now update Run button state - both credentials loaded AND hosts confirmed
-                    updateCreateEnabled();
-                  } else {
-                    showStatus('Configuration loaded but token acquisition failed. Please check credentials.');
-                    // Keep Run button disabled if token acquisition failed
-                    const runBtnTokenFail = el('btnInstallSelected');
-                    if (runBtnTokenFail) runBtnTokenFail.disabled = true;
-                  }
-                } else {
-                  // NHI credential loaded but hosts not validated yet, use confirmed hosts from config if available
-                  if (config.confirmedHosts && config.confirmedHosts.length > 0) {
-                    confirmedHosts = config.confirmedHosts.map(h => ({ host: h.host, port: h.port }));
-                    validatedHosts = config.confirmedHosts.map(h => ({ 
-                      host: h.host, 
-                      port: h.port, 
-                      isValid: true 
-                    }));
-                    await renderFabricHostList();
-                    renderHostChips();
-                    const fabricHostInput = el('fabricHost');
-                    if (fabricHostInput) {
-                      const hostString = validatedHosts.map(({host, port}) => 
-                        host + (port !== undefined ? ':' + port : '')
-                      ).join(' ');
-                      fabricHostInput.value = hostString;
-                    }
-                    showStatus('NHI credential loaded. Hosts confirmed from configuration.');
-                    // Update Run button state - credentials loaded AND hosts confirmed
-                    updateCreateEnabled();
-                  } else {
-                    showStatus('NHI credential loaded. Compare hosts from credential with Host List.');
-                    // Keep Run button disabled - hosts not confirmed yet
-                    const runBtnNoHosts = el('btnInstallSelected');
-                    if (runBtnNoHosts) runBtnNoHosts.disabled = true;
-                  }
-                }
-              } else if (config.confirmedHosts && config.confirmedHosts.length > 0) {
-                // Fallback: Use confirmed hosts from configuration if NHI credential doesn't have hosts
-                confirmedHosts = config.confirmedHosts.map(h => ({ host: h.host, port: h.port }));
-                validatedHosts = config.confirmedHosts.map(h => ({ 
-                  host: h.host, 
-                  port: h.port, 
-                  isValid: true 
-                }));
-                await renderFabricHostList();
-                renderHostChips();
-                const fabricHostInput = el('fabricHost');
-                if (fabricHostInput) {
-                  const hostString = validatedHosts.map(({host, port}) => 
-                    host + (port !== undefined ? ':' + port : '')
-                  ).join(' ');
-                  fabricHostInput.value = hostString;
-                }
-                showStatus('NHI credential loaded. Hosts confirmed from configuration.');
-                // Update Run button state - credentials loaded AND hosts confirmed
+              // Automatically acquire tokens
+              if (await acquireTokens()) {
+                // Enable Add Row button
+                const addRowBtn = el('btnAddRow');
+                if (addRowBtn) addRowBtn.disabled = false;
+                showStatus('Configuration loaded. Hosts confirmed and tokens acquired.', { hideAfterMs: 2000 });
                 updateCreateEnabled();
               } else {
-                showStatus('NHI credential loaded. Compare hosts from credential with Host List.');
-                // Keep Run button disabled - hosts not confirmed yet
-                const runBtnNoHosts2 = el('btnInstallSelected');
-                if (runBtnNoHosts2) runBtnNoHosts2.disabled = true;
+                showStatus('Configuration loaded but token acquisition failed. Please check credentials.');
               }
             } else {
-              const errText = await res.text().catch(() => 'Failed to load NHI credential');
-              showStatus(`Failed to load NHI credential: ${errText}`);
-              // Keep Run button disabled on error
-              const runBtnError = el('btnInstallSelected');
-              if (runBtnError) runBtnError.disabled = true;
+              await renderFabricHostList();
+              showStatus('Configuration loaded. No hosts available.');
+            }
+          } else if (config.confirmedHosts && config.confirmedHosts.length > 0) {
+            // Fallback: Use confirmed hosts from configuration if NHI credential doesn't have hosts
+            validatedHosts = config.confirmedHosts.map(h => ({ 
+              host: h.host, 
+              port: h.port, 
+              isValid: true 
+            }));
+            await renderFabricHostList();
+            renderHostChips();
+            const fabricHostInput = el('fabricHost');
+            if (fabricHostInput) {
+              const hostString = validatedHosts.map(({host, port}) => 
+                host + (port !== undefined ? ':' + port : '')
+              ).join(' ');
+              fabricHostInput.value = hostString;
+            }
+            
+            // Auto-confirm hosts and acquire tokens
+            if (autoConfirmHosts()) {
+              if (await acquireTokens()) {
+                const addRowBtn = el('btnAddRow');
+                if (addRowBtn) addRowBtn.disabled = false;
+                showStatus('Configuration loaded. Hosts confirmed and tokens acquired.', { hideAfterMs: 2000 });
+                updateCreateEnabled();
+              } else {
+                showStatus('Configuration loaded but token acquisition failed. Please check credentials.');
+              }
+            } else {
+              showStatus('Configuration loaded. No hosts available.');
             }
           } else {
-            showStatus('Enter Encryption Password to load NHI credential for this configuration');
-            // Keep Run button disabled - credentials not loaded yet
-            const runBtnNoPwd = el('btnInstallSelected');
-            if (runBtnNoPwd) runBtnNoPwd.disabled = true;
+            showStatus('NHI credential loaded. No hosts in credential.');
           }
         } catch (e) {
           showStatus('Error loading NHI credential for configuration');
+          logMsg(`Error loading NHI credential: ${e.message || e}`);
           // Keep Run button disabled on error
-          const runBtnError2 = el('btnInstallSelected');
-          if (runBtnError2) runBtnError2.disabled = true;
+          const runBtnError = el('btnInstallSelected');
+          if (runBtnError) runBtnError.disabled = true;
         }
       }
     } else {
@@ -6351,8 +6949,13 @@ async function restoreConfiguration(config) {
     // Restore SSH profile selection
     const sshProfileSelect = el('sshProfileSelect');
     if (sshProfileSelect && config.sshProfileId !== undefined) {
-      // Ensure SSH profiles are loaded first
-      await loadSshProfilesForPreparation();
+      // Load profiles if not already loaded (may have been loaded by initializePreparationSection)
+      if (!_sshProfilesCache) {
+        await loadSshProfilesForPreparation();
+      } else {
+        // Just populate dropdown with cached data
+        populateSshProfilesDropdown(sshProfileSelect, _sshProfilesCache);
+      }
       sshProfileSelect.value = config.sshProfileId || '';
     }
     
@@ -6368,12 +6971,11 @@ async function restoreConfiguration(config) {
       out.style.display = el('expertMode').checked ? 'block' : 'none';
     }
     
-    // Restore confirmed hosts if not already done during NHI credential loading
+    // Restore hosts to validatedHosts and auto-confirm if not already done during NHI credential loading
     // This handles cases where NHI credential wasn't loaded or doesn't have hosts
     try {
-      if ((!currentNhiId || confirmedHosts.length === 0) && config.confirmedHosts && config.confirmedHosts.length > 0) {
-        // Restore confirmed hosts from configuration
-        confirmedHosts = config.confirmedHosts.map(h => ({ host: h.host, port: h.port }));
+      if ((!currentNhiId || validatedHosts.length === 0) && config.confirmedHosts && config.confirmedHosts.length > 0) {
+        // Restore hosts to validatedHosts
         validatedHosts = config.confirmedHosts.map(h => ({ 
           host: h.host, 
           port: h.port, 
@@ -6388,19 +6990,35 @@ async function restoreConfiguration(config) {
           ).join(' ');
           fabricHostInput.value = hostString;
         }
+        
+        // Auto-confirm hosts and acquire tokens
+        if (autoConfirmHosts()) {
+          if (await acquireTokens()) {
+            const addRowBtn = el('btnAddRow');
+            if (addRowBtn) addRowBtn.disabled = false;
+            updateCreateEnabled();
+          }
+        }
       } else if (config.fabricHost && fabricHostInput) {
         const hosts = parseFabricHosts();
-        confirmedHosts = hosts.map(h => ({ host: h.host, port: h.port }));
         validatedHosts = hosts.map(h => ({ host: h.host, port: h.port, isValid: true }));
         await renderFabricHostList();
         renderHostChips();
+        
+        // Auto-confirm hosts and acquire tokens
+        if (autoConfirmHosts()) {
+          if (await acquireTokens()) {
+            const addRowBtn = el('btnAddRow');
+            if (addRowBtn) addRowBtn.disabled = false;
+            updateCreateEnabled();
+          }
+        }
       }
     } catch (err) {
       logMsg(`Warning: Error restoring hosts: ${err.message || err}`);
     }
     
-    // Note: User must load NHI credential with password to decrypt credentials
-    // We don't auto-load encrypted credentials for security reasons
+    // NHI credentials are automatically loaded when configuration is restored (no password needed)
     
     // Clear existing template rows
     const container = el('tplFormList');
@@ -6829,7 +7447,7 @@ async function restoreConfiguration(config) {
       logMsg(`Warning: Error updating install select: ${err.message || err}`);
     }
     
-    // Don't bypass gating conditions - user must still click "Load Credentials" and "Confirm Hosts"
+    // Auto-confirm hosts when configuration is loaded
     // Keep bypassGatingConditions = false so run button requires both conditions
     
     // Enable Add Row button (allowed even before hosts are confirmed when loading config)
@@ -6844,19 +7462,31 @@ async function restoreConfiguration(config) {
       installSelect.disabled = false;
     }
     
-    // Restore Run Workspace toggle
+    // Restore Run Workspace toggle - default to true if not specified
     const runWorkspaceEnabledInput = el('runWorkspaceEnabled');
-    if (runWorkspaceEnabledInput && config.runWorkspaceEnabled !== undefined) {
-      runWorkspaceEnabledInput.checked = config.runWorkspaceEnabled !== false; // Default to true if not specified
+    if (runWorkspaceEnabledInput) {
+      runWorkspaceEnabledInput.checked = config.runWorkspaceEnabled !== false; // Default to true if not specified or false
     }
     
-    // Call updateCreateEnabled to check if run button should be enabled
-    // This will disable the run button until both NHI credentials are loaded and hosts are confirmed
+    // Clear the restoring flag - restore is complete
+    isRestoringConfiguration = false;
+    
+    // Run button will be enabled when hosts are confirmed and tokens are acquired
+    const runBtnFinal = el('btnInstallSelected');
+    if (runBtnFinal) {
+      runBtnFinal.disabled = true;
+    }
+    
+    // Call updateCreateEnabled to ensure button state is correct
+    // This will keep the run button disabled until both NHI credentials are loaded and hosts are confirmed
     updateCreateEnabled();
     
-    showStatus('Configuration restored successfully. Please load credentials and confirm hosts before running.');
-    logMsg('Configuration restored - run button requires Load Credentials and Confirm Hosts');
+    showStatus('Configuration restored successfully. Credentials loaded automatically.');
+    logMsg('Configuration restored - credentials loaded automatically');
   } catch (error) {
+    // Clear the restoring flag even on error
+    isRestoringConfiguration = false;
+    
     // Catch any unexpected errors
     logMsg(`Error during restore: ${error.message || error}`);
     showStatus('Configuration partially restored - some errors occurred');
@@ -6865,8 +7495,14 @@ async function restoreConfiguration(config) {
     const btnAddRow = el('btnAddRow');
     if (btnAddRow) btnAddRow.disabled = false;
     
-    // Call updateCreateEnabled to check if run button should be enabled
-    // This will disable the run button until both NHI credentials are loaded and hosts are confirmed
+    // Disable Run button on error
+    const runBtnError = el('btnInstallSelected');
+    if (runBtnError) {
+      runBtnError.disabled = true;
+    }
+    
+    // Call updateCreateEnabled to ensure button state is correct
+    // This will keep the run button disabled until both NHI credentials are loaded and hosts are confirmed
     updateCreateEnabled();
   }
 }
@@ -6923,6 +7559,9 @@ function setupConfigButtons() {
           try {
             const res = await api(`/config/delete/${configId}`, { method: 'DELETE' });
             if (res.ok) {
+              successCount++;
+            } else if (res.status === 404) {
+              // Configuration doesn't exist - treat as success (already deleted)
               successCount++;
             } else {
               failCount++;
@@ -7062,16 +7701,7 @@ function setupEventButtons() {
   const utcEvent = localToUTC(date, time);
   
   try {
-    // If auto-run is enabled, ask for NHI credential password (hidden input)
-    let nhiPassword = null;
-    if (autoRun) {
-      nhiPassword = await promptForNhiPassword('Create Event');
-      if (nhiPassword === null) {
-        showStatus('Event creation cancelled');
-        return;
-      }
-    }
-
+    // No password needed - credentials are encrypted with FS_SERVER_SECRET
     const res = await api('/event/save', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -7081,7 +7711,7 @@ function setupEventButtons() {
         event_time: utcEvent.time || null,
         configuration_id: configId,
         auto_run: autoRun,
-        nhi_password: nhiPassword || null
+        nhi_password: null  // No longer needed - using FS_SERVER_SECRET
       })
     });
     
@@ -7163,16 +7793,7 @@ function setupEventButtons() {
       const utcEvent = localToUTC(date, time);
       
       try {
-        // If auto-run is enabled, ask for NHI credential password (hidden input)
-        let nhiPassword = null;
-        if (autoRun) {
-          nhiPassword = await promptForNhiPassword('Update Event');
-          if (nhiPassword === null) {
-            showStatus('Event update cancelled');
-            return;
-          }
-        }
-
+        // No password needed - credentials are encrypted with FS_SERVER_SECRET
         const res = await api('/event/save', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -7183,7 +7804,7 @@ function setupEventButtons() {
             event_time: utcEvent.time || null,
             configuration_id: configId,
             auto_run: autoRun,
-            nhi_password: nhiPassword || null
+            nhi_password: null  // No longer needed - using FS_SERVER_SECRET
           })
         });
         
@@ -7452,7 +8073,9 @@ async function handleTrackedRunButton() {
   const executionDetails = {
     fabric_creations: [],
     installations: [],
-    ssh_executions: []
+    ssh_executions: [],
+    hostname_changes: [],
+    password_changes: []
   };
   let hosts = []; // Declare hosts at function scope so it's accessible in catch block
   
@@ -7495,7 +8118,13 @@ async function handleTrackedRunButton() {
     
     hosts = getAllConfirmedHosts();
     if (hosts.length === 0) {
-      showStatus('No hosts configured. Please confirm hosts first.');
+      // Auto-confirm hosts if available
+    if (autoConfirmHosts()) {
+      // Hosts are now confirmed, continue
+    } else {
+      showStatus('No hosts configured. Please add at least one valid host.');
+      return;
+    }
       if (runId) {
         await api(`/run/update/${runId}`, {
           method: 'PUT',
@@ -7515,23 +8144,7 @@ async function handleTrackedRunButton() {
       runningTasksContainer.style.display = '';
     }
     
-    // Check session status - tokens are managed server-side
-    const session = await checkSessionStatus();
-    if (!session) {
-      showStatus('No active session. Please reload NHI credential.');
-      if (runId) {
-        await api(`/run/update/${runId}`, {
-          method: 'PUT',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ status: 'error', message: 'No active session', errors: ['No active session'] })
-        });
-      }
-      hideRunProgress();
-      stopRunTimer();
-      if (runBtn) runBtn.disabled = false;
-      return;
-    }
-    
+    // User is already authenticated via login - proceed
     // Build templates list from ALL rows
     updateRunProgress(5, 'Collecting workspace templates from rows...');
     logMsg('Collecting workspace templates from rows...');
@@ -7576,15 +8189,18 @@ async function handleTrackedRunButton() {
       const exists = templates.find(t => t.template_name === template_name && t.version === version);
       if (!exists) {
         templates.push({ template_name, repo_name, version, status: '', createProgress: 0, hosts: [] });
+      } else {
+        // Reset status for existing templates since we're starting a new run
+        // The preparation steps will delete all fabrics, so we need to recreate them
+        exists.status = '';
+        exists.createProgress = 0;
+        exists.hosts = [];
       }
     });
     
-    // Check which templates need to be created
-    const existingTemplates = templates.filter(t => t.status === 'created' || t.status === 'installed');
-    const existingKeys = new Set(existingTemplates.map(t => `${t.template_name}|||${t.version}`));
-    const templatesToCreate = allRowTemplates.filter(({template_name, version}) => 
-      !existingKeys.has(`${template_name}|||${version}`)
-    );
+    // Since preparation steps delete all fabrics, we need to create all templates
+    // Don't check existing status - always create templates that are in the rows
+    const templatesToCreate = allRowTemplates;
     
     // Track failed hosts across all operations
     const failedHosts = new Set();
@@ -7596,7 +8212,6 @@ async function handleTrackedRunButton() {
     if (templatesToCreate.length > 0) {
       // Execute preparation steps (5-20%)
       updateRunProgress(7, 'Executing preparation steps...');
-      showStatus('Executing preparation steps...');
       logMsg('Executing preparation steps...');
       
       // Refresh repositories
@@ -7606,7 +8221,6 @@ async function handleTrackedRunButton() {
         const res = await api('/repo/refresh', { method: 'POST', params: { fabric_host } });
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
       });
-      logMsg('Refresh Repositories completed successfully on all host(s)');
       
       // Uninstall workspaces (reset)
       updateRunProgress(11, 'Uninstalling workspaces...');
@@ -7615,7 +8229,6 @@ async function handleTrackedRunButton() {
         const res = await api('/runtime/reset', { method: 'POST', params: { fabric_host } });
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
       });
-      logMsg('Uninstall Workspaces completed successfully on all host(s)');
       
       // Remove workspaces (batch delete)
       updateRunProgress(13, 'Removing workspaces...');
@@ -7624,7 +8237,6 @@ async function handleTrackedRunButton() {
         const res = await api('/model/fabric/batch', { method: 'DELETE', params: { fabric_host } });
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
       });
-      logMsg('Remove Workspaces completed successfully on all host(s)');
       
       // Change hostname (if provided)
       const hostnameBase = el('newHostname').value.trim();
@@ -7642,8 +8254,19 @@ async function handleTrackedRunButton() {
             });
             if (!res.ok) throw new Error(`HTTP ${res.status}`);
             logMsg(`Hostname changed to ${hostname} for ${host}`);
+            executionDetails.hostname_changes.push({
+              host: host,
+              new_hostname: hostname,
+              success: true
+            });
           } catch (error) {
             logMsg(`Change hostname failed on ${host}: ${error.message || error}`);
+            executionDetails.hostname_changes.push({
+              host: host,
+              new_hostname: hostnameBase + (index + 1),
+              success: false,
+              error: error.message || String(error)
+            });
           }
         });
         await Promise.all(hostnamePromises);
@@ -7654,15 +8277,43 @@ async function handleTrackedRunButton() {
       if (new_password) {
         updateRunProgress(17, 'Changing guest user password...');
         logMsg('Changing guest user password...');
-        await executeOnAllHosts('Change password', async (fabric_host) => {
+        const passwordChangeResults = await executeOnAllHosts('Change password', async (fabric_host) => {
           const res = await api('/user/password', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ fabric_host, username: 'guest', new_password })
           });
-          if (!res.ok) throw new Error(`HTTP ${res.status}`);
+          if (!res.ok) {
+            let errorMessage = `HTTP ${res.status}`;
+            try {
+              const errorData = await res.json();
+              errorMessage = errorData.detail || errorData.message || errorMessage;
+            } catch (e) {
+              // If JSON parsing fails, try to get text
+              try {
+                const errorText = await res.text();
+                if (errorText) {
+                  errorMessage = errorText;
+                }
+              } catch (e2) {
+                // Use default error message
+              }
+            }
+            logMsg(`Password change error on ${fabric_host}: ${errorMessage}`);
+            throw new Error(errorMessage);
+          }
         });
-        logMsg('Change password completed successfully on all host(s)');
+        // Track password change results
+        if (passwordChangeResults) {
+          passwordChangeResults.forEach(result => {
+            executionDetails.password_changes.push({
+              host: result.host,
+              username: 'guest',
+              success: result.success || false,
+              error: result.error || null
+            });
+          });
+        }
       }
       
       // Add templates to create to the templates array
@@ -8060,11 +8711,9 @@ async function handleTrackedRunButton() {
       renderTemplates();
       
       if (createdCount === totalTemplates) {
-        showStatus(`Created all ${templatesToCreate.length} workspace template(s) successfully`);
-        logMsg(`Created all ${templatesToCreate.length} workspace template(s) successfully: ${templatesToCreate.map(t => t.template_name).join(', ')}`);
+        showStatus(`Created all ${templatesToCreate.length} workspace template(s) successfully: ${templatesToCreate.map(t => t.template_name).join(', ')}`);
       } else {
-        showStatus(`Created ${createdCount}/${templatesToCreate.length} workspace template(s) successfully`);
-        logMsg(`Created ${createdCount}/${templatesToCreate.length} workspace template(s): ${templatesToCreate.map(t => t.template_name).join(', ')}`);
+        showStatus(`Created ${createdCount}/${templatesToCreate.length} workspace template(s) successfully: ${templatesToCreate.map(t => t.template_name).join(', ')}`);
       }
     } else {
       updateRunProgress(60, 'All workspace templates already exist');
@@ -8083,31 +8732,7 @@ async function handleTrackedRunButton() {
       showStatus('Executing SSH profiles on all hosts...');
       logMsg('Starting SSH profile execution');
       
-      const nhiPasswordInput = el('nhiDecryptPassword');
-      const encryptionPassword = nhiPasswordInput ? nhiPasswordInput.value.trim() : '';
-      
-      if (!encryptionPassword) {
-        showStatus('SSH profile execution requires encryption password. Please load NHI credential first.');
-        logMsg('SSH profile execution cancelled - encryption password not available');
-        errors.push('SSH profile execution cancelled - encryption password not available');
-        hideRunProgress();
-        stopRunTimer();
-        if (runId) {
-          await api(`/run/update/${runId}`, {
-            method: 'PUT',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ 
-              status: 'error', 
-              message: 'SSH execution failed - encryption password not available',
-              errors: errors,
-              execution_details: executionDetails
-            })
-          });
-        }
-        if (runBtn) runBtn.disabled = false;
-        return;
-      }
-      
+      // No encryption password required - uses FS_SERVER_SECRET
       try {
         const availableHostsForSsh = hosts.filter(({host}) => !failedHosts.has(host));
         
@@ -8120,7 +8745,7 @@ async function handleTrackedRunButton() {
             logMsg(`Skipping SSH execution on failed hosts: ${failedHostNames}. Executing on ${availableHostsForSsh.length} remaining host(s).`);
           }
           
-          const sshResults = await executeSshProfiles(availableHostsForSsh, sshProfileId, encryptionPassword, sshWaitTime);
+          const sshResults = await executeSshProfiles(availableHostsForSsh, sshProfileId, sshWaitTime);
           const sshSuccessCount = sshResults.filter(r => r.success).length;
           
           // Track SSH execution results
@@ -8177,7 +8802,12 @@ async function handleTrackedRunButton() {
       const finalExecutionDetails = {
         ...executionDetails,
         hosts: hosts.map(({host}) => host),
-        duration_seconds: runDuration
+        duration_seconds: runDuration,
+        // Explicitly include hostname and password changes
+        hostname_changes: executionDetails.hostname_changes || [],
+        hostname_changes_count: executionDetails.hostname_changes ? executionDetails.hostname_changes.length : 0,
+        password_changes: executionDetails.password_changes || [],
+        password_changes_count: executionDetails.password_changes ? executionDetails.password_changes.length : 0
       };
       
       if (runId) {
@@ -8340,27 +8970,7 @@ async function handleTrackedRunButton() {
       return;
     }
     
-    const sessionStatus = await checkSessionStatus();
-    if (!sessionStatus) {
-      showStatus(`Error: No active session. Please reload NHI credential.`);
-      logMsg(`Error: No active session`);
-      hideRunProgress();
-      stopRunTimer();
-      if (runId) {
-        await api(`/run/update/${runId}`, {
-          method: 'PUT',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ 
-            status: 'error', 
-            message: 'No active session',
-            errors: errors,
-            execution_details: executionDetails
-          })
-        });
-      }
-      if (runBtn) runBtn.disabled = false;
-      return;
-    }
+    // User is already authenticated via login - proceed
     
     updateRunProgress(70, `Installing workspace: ${template_name} v${version}`);
     const totalHosts = hosts.length;
@@ -8568,7 +9178,12 @@ async function handleTrackedRunButton() {
     const finalExecutionDetails = {
       ...executionDetails,
       hosts: hosts.map(({host}) => host),
-      duration_seconds: runDuration
+      duration_seconds: runDuration,
+      // Explicitly include hostname and password changes
+      hostname_changes: executionDetails.hostname_changes || [],
+      hostname_changes_count: executionDetails.hostname_changes ? executionDetails.hostname_changes.length : 0,
+      password_changes: executionDetails.password_changes || [],
+      password_changes_count: executionDetails.password_changes ? executionDetails.password_changes.length : 0
     };
     
     // Transform ssh_executions to ssh_profile format if SSH profile was used
@@ -8662,7 +9277,12 @@ async function handleTrackedRunButton() {
         const finalExecutionDetails = {
           ...executionDetails,
           hosts: (hosts || []).map(({host}) => host),
-          duration_seconds: runDuration
+          duration_seconds: runDuration,
+          // Explicitly include hostname and password changes
+          hostname_changes: executionDetails.hostname_changes || [],
+          hostname_changes_count: executionDetails.hostname_changes ? executionDetails.hostname_changes.length : 0,
+          password_changes: executionDetails.password_changes || [],
+          password_changes_count: executionDetails.password_changes ? executionDetails.password_changes.length : 0
         };
         
         await api(`/run/update/${runId}`, {
@@ -8848,8 +9468,8 @@ async function loadNhiCredentials() {
     html += '<div style="display: flex; flex-direction: column; gap: 12px;">';
     
     credentials.forEach(cred => {
-      const createdDate = new Date(cred.created_at).toLocaleString();
-      const updatedDate = new Date(cred.updated_at).toLocaleString();
+      const createdDate = formatDateTime(cred.created_at);
+      const updatedDate = formatDateTime(cred.updated_at);
       
       html += `
         <div class="config-item" data-nhi-id="${cred.id}" style="padding: 12px; border: 1px solid #d2d2d7; border-radius: 4px; background: #f5f5f7;">
@@ -8952,17 +9572,11 @@ async function editNhi(nhiId) {
   try {
     showStatus(`Loading NHI credential for editing...`);
     
-    // Ask for encryption password (hidden while typing)
-    const encryptionPassword = await promptForNhiPassword('Edit NHI Credential');
-    if (!encryptionPassword) {
-      showStatus('Edit cancelled - password required');
-      return;
-    }
-    
+    // No password required - uses FS_SERVER_SECRET
     const getRes = await api(`/nhi/get/${nhiId}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ encryption_password: encryptionPassword })
+      body: JSON.stringify({})
     });
     if (!getRes.ok) {
       const errorText = await getRes.text().catch(() => 'Unknown error');
@@ -8982,15 +9596,13 @@ async function editNhi(nhiId) {
     // Populate form with NHI data
     el('nhiName').value = nhiData.name || '';
     el('nhiClientId').value = nhiData.client_id || '';
-  // Do not display client_secret when editing; disable editing of the field
-  const clientSecretInput = el('nhiClientSecret');
-  if (clientSecretInput) {
-    clientSecretInput.value = '';
-    clientSecretInput.disabled = true;
-    clientSecretInput.placeholder = 'Hidden (not editable)';
-  }
-    el('nhiEncryptionPassword').value = encryptionPassword; // Keep password for update
-    el('nhiConfirmPassword').value = encryptionPassword; // Pre-fill confirm with same password
+    // Client secret is not displayed when editing - user can optionally update it
+    const clientSecretInput = el('nhiClientSecret');
+    if (clientSecretInput) {
+      clientSecretInput.value = '';
+      clientSecretInput.disabled = false;
+      clientSecretInput.placeholder = 'Leave empty to keep existing, or enter new secret';
+    }
     
     // Populate fabric hosts field with hosts that have tokens
     const fabricHostsInput = el('nhiFabricHosts');
@@ -9028,11 +9640,9 @@ function cancelNhiEdit() {
   const clientSecretInput = el('nhiClientSecret');
   if (clientSecretInput) {
     clientSecretInput.disabled = false;
-    clientSecretInput.placeholder = 'Enter client secret';
+    clientSecretInput.placeholder = 'Enter client secret (required for new credentials, optional for updates)';
     clientSecretInput.value = '';
   }
-  el('nhiEncryptionPassword').value = '';
-  el('nhiConfirmPassword').value = '';
   const fabricHostsInput = el('nhiFabricHosts');
   if (fabricHostsInput) fabricHostsInput.value = '';
   
@@ -9055,7 +9665,8 @@ async function deleteNhi(nhiId) {
     showStatus('NHI credential deleted successfully');
     logMsg(`NHI credential ${nhiId} deleted`);
     
-    // Reload NHI credentials list
+    // Clear cache and reload NHI credentials list
+    clearNhiCredentialsCache();
     loadNhiCredentials();
     
     // Refresh dropdown in authentication section if it exists
@@ -9080,8 +9691,6 @@ function updateNhiButtons() {
   const name = el('nhiName').value.trim();
   const clientId = el('nhiClientId').value.trim();
   const clientSecret = el('nhiClientSecret').value.trim();
-  const encryptionPassword = el('nhiEncryptionPassword').value.trim();
-  const confirmPassword = el('nhiConfirmPassword').value.trim();
   
   // Validate name format
   const nameValid = isValidNhiName(name);
@@ -9095,26 +9704,12 @@ function updateNhiButtons() {
     }
   }
   
-  // Validate password match
-  const passwordMatchError = el('nhiPasswordMatchError');
-  let passwordsMatch = true;
-  if (passwordMatchError) {
-    if (confirmPassword && encryptionPassword !== confirmPassword) {
-      passwordMatchError.textContent = 'Passwords do not match';
-      passwordMatchError.style.display = 'inline';
-      passwordsMatch = false;
-    } else {
-      passwordMatchError.style.display = 'none';
-      passwordsMatch = true;
-    }
-  }
-  
-  // For create we require clientSecret; for update we do not
+  // For create we require clientSecret; for update we do not (clientSecret is optional)
   const creating = !editingNhiId;
   const requiredFieldsOk = creating
-    ? !!(name && clientId && clientSecret && encryptionPassword && confirmPassword)
-    : !!(name && clientId && encryptionPassword && confirmPassword);
-  const isValid = nameValid && passwordsMatch && requiredFieldsOk;
+    ? !!(name && clientId && clientSecret)
+    : !!(name && clientId);
+  const isValid = nameValid && requiredFieldsOk;
   
   if (saveBtn && saveBtn.style.display !== 'none') {
     saveBtn.disabled = !isValid;
@@ -9156,16 +9751,7 @@ function initNhiFormValidation() {
     clientSecretInput.addEventListener('change', updateNhiButtons);
   }
   
-  if (encryptionPasswordInput) {
-    encryptionPasswordInput.addEventListener('input', updateNhiButtons);
-    encryptionPasswordInput.addEventListener('change', updateNhiButtons);
-  }
-  
-  if (confirmPasswordInput) {
-    confirmPasswordInput.addEventListener('input', updateNhiButtons);
-    confirmPasswordInput.addEventListener('change', updateNhiButtons);
-    confirmPasswordInput.addEventListener('blur', updateNhiButtons);
-  }
+  // Password fields removed - no longer needed
   
   // Initial check
   updateNhiButtons();
@@ -9177,44 +9763,40 @@ function setupNhiButtons() {
   if (saveBtn && !saveBtn.onclick) {
     saveBtn.onclick = async () => {
       const name = el('nhiName').value.trim();
-  const clientId = el('nhiClientId').value.trim();
-  const clientSecret = el('nhiClientSecret').value.trim();
-  const encryptionPassword = el('nhiEncryptionPassword').value.trim();
-  const confirmPassword = el('nhiConfirmPassword').value.trim();
-  
-  if (!name || !clientId || !clientSecret || !encryptionPassword || !confirmPassword) {
-    showStatus('Please fill in all fields including encryption password and confirmation');
-    return;
-  }
-  
-  // Validate name format
-  if (!isValidNhiName(name)) {
-    showStatus('Name must contain only alphanumeric characters, dashes, and underscores');
-    return;
-  }
-  
-  // Validate password match
-  if (encryptionPassword !== confirmPassword) {
-    showStatus('Passwords do not match');
-    return;
-  }
-  
-  try {
-    // Get FabricStudio hosts from input field
-    const fabricHostsInput = el('nhiFabricHosts');
-    const fabricHosts = fabricHostsInput ? fabricHostsInput.value.trim() : '';
-    
-    const res = await api('/nhi/save', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        name: name,
-        client_id: clientId,
-        client_secret: clientSecret,
-        encryption_password: encryptionPassword,
-        fabric_hosts: fabricHosts  // Optional - space-separated list of hosts for token retrieval
-      })
-    });
+      const clientId = el('nhiClientId').value.trim();
+      const clientSecret = el('nhiClientSecret').value.trim();
+      
+      if (!name || !clientId || !clientSecret) {
+        showStatus('Please fill in name, client ID, and client secret');
+        return;
+      }
+      
+      // Validate name format
+      if (!isValidNhiName(name)) {
+        showStatus('Name must contain only alphanumeric characters, dashes, and underscores');
+        return;
+      }
+      
+      try {
+        // Get FabricStudio hosts from input field
+        const fabricHostsInput = el('nhiFabricHosts');
+        const fabricHosts = fabricHostsInput ? fabricHostsInput.value.trim() : '';
+        
+        const payload = {
+          name: name,
+          client_id: clientId,
+          client_secret: clientSecret
+        };
+        // Only include fabric_hosts if provided
+        if (fabricHosts) {
+          payload.fabric_hosts = fabricHosts;
+        }
+        
+        const res = await api('/nhi/save', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        });
     
     if (!res.ok) {
       const errorText = await res.text().catch(() => 'Unknown error');
@@ -9248,7 +9830,8 @@ function setupNhiButtons() {
     // Clear form
     cancelNhiEdit();
     
-    // Reload NHI credentials list
+    // Clear cache and reload NHI credentials list
+    clearNhiCredentialsCache();
     loadNhiCredentials();
     
     // Refresh dropdown in authentication section if it exists
@@ -9264,49 +9847,50 @@ function setupNhiButtons() {
   if (updateBtn && !updateBtn.onclick) {
     updateBtn.onclick = async () => {
       const name = el('nhiName').value.trim();
-  const clientId = el('nhiClientId').value.trim();
-  const encryptionPassword = el('nhiEncryptionPassword').value.trim();
-  const confirmPassword = el('nhiConfirmPassword').value.trim();
-  
-  if (!editingNhiId) {
-    showStatus('No NHI credential selected for editing');
-    return;
-  }
-  
-  // For update, clientSecret is not required and not editable
-  if (!name || !clientId || !encryptionPassword || !confirmPassword) {
-    showStatus('Please fill in all fields including encryption password and confirmation');
-    return;
-  }
-  
-  // Validate name format
-  if (!isValidNhiName(name)) {
-    showStatus('Name must contain only alphanumeric characters, dashes, and underscores');
-    return;
-  }
-  
-  // Validate password match
-  if (encryptionPassword !== confirmPassword) {
-    showStatus('Passwords do not match');
-    return;
-  }
-  
-  try {
-    // Get FabricStudio hosts from input field
-    const fabricHostsInput = el('nhiFabricHosts');
-    const fabricHosts = fabricHostsInput ? fabricHostsInput.value.trim() : '';
-    
-    const res = await api('/nhi/save', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        id: editingNhiId,
-        name: name,
-        client_id: clientId,
-        encryption_password: encryptionPassword,
-        fabric_hosts: fabricHosts  // Optional - space-separated list of hosts for token retrieval
-      })
-    });
+      const clientId = el('nhiClientId').value.trim();
+      const clientSecret = el('nhiClientSecret').value.trim();
+      
+      if (!editingNhiId) {
+        showStatus('No NHI credential selected for editing');
+        return;
+      }
+      
+      // For update, only name and clientId are required; clientSecret is optional
+      if (!name || !clientId) {
+        showStatus('Please fill in name and client ID');
+        return;
+      }
+      
+      // Validate name format
+      if (!isValidNhiName(name)) {
+        showStatus('Name must contain only alphanumeric characters, dashes, and underscores');
+        return;
+      }
+      
+      try {
+        // Get FabricStudio hosts from input field
+        const fabricHostsInput = el('nhiFabricHosts');
+        const fabricHosts = fabricHostsInput ? fabricHostsInput.value.trim() : '';
+        
+        const payload = {
+          id: editingNhiId,
+          name: name,
+          client_id: clientId
+        };
+        // Only include client_secret if provided (for updates)
+        if (clientSecret) {
+          payload.client_secret = clientSecret;
+        }
+        // Only include fabric_hosts if provided
+        if (fabricHosts) {
+          payload.fabric_hosts = fabricHosts;
+        }
+        
+        const res = await api('/nhi/save', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        });
     
     if (!res.ok) {
       const errorText = await res.text().catch(() => 'Unknown error');
@@ -9340,7 +9924,8 @@ function setupNhiButtons() {
     // Clear form and exit edit mode
     cancelNhiEdit();
     
-    // Reload NHI credentials list
+    // Clear cache and reload NHI credentials list
+    clearNhiCredentialsCache();
     loadNhiCredentials();
     
     // Refresh dropdown in authentication section if it exists
@@ -9442,8 +10027,8 @@ async function loadSshKeys() {
     let html = '<div style="display: flex; flex-direction: column; gap: 12px;">';
     
     keys.forEach(key => {
-      const createdDate = new Date(key.created_at).toLocaleString();
-      const updatedDate = new Date(key.updated_at).toLocaleString();
+      const createdDate = formatDateTime(key.created_at);
+      const updatedDate = formatDateTime(key.updated_at);
       // Truncate public key for display (first 50 chars)
       const publicKeyPreview = key.public_key.length > 50 ? key.public_key.substring(0, 50) + '...' : key.public_key;
       
@@ -9497,17 +10082,11 @@ async function editSshKey(sshKeyId) {
   try {
     showStatus(`Loading SSH key for editing...`);
     
-    // Ask for encryption password
-    const encryptionPassword = await promptForNhiPassword('Edit SSH Key');
-    if (!encryptionPassword) {
-      showStatus('Edit cancelled - password required');
-      return;
-    }
-    
+    // No password required - uses FS_SERVER_SECRET
     const res = await api(`/ssh-keys/get/${sshKeyId}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ encryption_password: encryptionPassword })
+      body: JSON.stringify({})
     });
     
     if (!res.ok) {
@@ -9521,10 +10100,9 @@ async function editSshKey(sshKeyId) {
     // Populate form fields
     el('sshKeyName').value = sshKeyData.name || '';
     el('sshKeyPublic').value = sshKeyData.public_key || '';
-    el('sshKeyPrivate').value = ''; // Clear private key field
-    el('sshKeyPrivate').placeholder = 'Hidden (not editable)';
-    el('sshKeyPrivate').disabled = true;
-    el('sshKeyEncryptionPassword').value = encryptionPassword;
+    el('sshKeyPrivate').value = ''; // Clear private key field - user can optionally update it
+    el('sshKeyPrivate').placeholder = 'Leave empty to keep existing, or enter new private key';
+    el('sshKeyPrivate').disabled = false;
     
     editingSshKeyId = sshKeyId;
     
@@ -9552,7 +10130,7 @@ function cancelSshKeyEdit() {
   el('sshKeyPrivate').value = '';
   el('sshKeyPrivate').placeholder = 'Enter private key (-----BEGIN OPENSSH PRIVATE KEY-----...)';
   el('sshKeyPrivate').disabled = false;
-  el('sshKeyEncryptionPassword').value = '';
+  // Password field removed - no longer needed
   
   // Hide error messages
   const nameError = el('sshKeyNameError');
@@ -9573,14 +10151,12 @@ function updateSshKeyButtons() {
   const nameInput = el('sshKeyName');
   const publicKeyInput = el('sshKeyPublic');
   const privateKeyInput = el('sshKeyPrivate');
-  const encryptionPasswordInput = el('sshKeyEncryptionPassword');
   
-  if (!nameInput || !publicKeyInput || !privateKeyInput || !encryptionPasswordInput) return;
+  if (!nameInput || !publicKeyInput || !privateKeyInput) return;
   
   const name = nameInput.value.trim();
   const publicKey = publicKeyInput.value.trim();
   const privateKey = privateKeyInput.value.trim();
-  const encryptionPassword = encryptionPasswordInput.value.trim();
   
   // Validate name format
   const nameValid = isValidSshKeyName(name);
@@ -9594,10 +10170,10 @@ function updateSshKeyButtons() {
     }
   }
   
-  // For create: all fields required
-  // For update: name, public key, and encryption password required (private key optional)
+  // For create: name, public key, and private key required
+  // For update: name and public key required (private key optional)
   const isCreate = !editingSshKeyId;
-  const requiredFieldsOk = name && publicKey && encryptionPassword && (isCreate ? privateKey : true);
+  const requiredFieldsOk = name && publicKey && (isCreate ? privateKey : true);
   
   const isValid = nameValid && requiredFieldsOk;
   
@@ -9638,10 +10214,7 @@ function initSshKeyFormValidation() {
     privateKeyInput.addEventListener('change', updateSshKeyButtons);
   }
   
-  if (encryptionPasswordInput) {
-    encryptionPasswordInput.addEventListener('input', updateSshKeyButtons);
-    encryptionPasswordInput.addEventListener('change', updateSshKeyButtons);
-  }
+  // Password field removed - no longer needed
   
   // Initial check
   updateSshKeyButtons();
@@ -9654,10 +10227,9 @@ function setupSshKeyButtons() {
       const name = el('sshKeyName').value.trim();
       const publicKey = el('sshKeyPublic').value.trim();
       const privateKey = el('sshKeyPrivate').value.trim();
-      const encryptionPassword = el('sshKeyEncryptionPassword').value.trim();
       
-      if (!name || !publicKey || !privateKey || !encryptionPassword) {
-        showStatus('Please fill in all fields including encryption password');
+      if (!name || !publicKey || !privateKey) {
+        showStatus('Please fill in name, public key, and private key');
         return;
       }
       
@@ -9674,8 +10246,7 @@ function setupSshKeyButtons() {
           body: JSON.stringify({
             name: name,
             public_key: publicKey,
-            private_key: privateKey,
-            encryption_password: encryptionPassword
+            private_key: privateKey
           })
         });
         
@@ -9705,15 +10276,13 @@ function setupSshKeyButtons() {
       const name = el('sshKeyName').value.trim();
       const publicKey = el('sshKeyPublic').value.trim();
       const privateKey = el('sshKeyPrivate').value.trim();
-      const encryptionPassword = el('sshKeyEncryptionPassword').value.trim();
-      
       if (!editingSshKeyId) {
         showStatus('No SSH key selected for editing');
         return;
       }
       
-      if (!name || !publicKey || !encryptionPassword) {
-        showStatus('Please fill in name, public key, and encryption password');
+      if (!name || !publicKey) {
+        showStatus('Please fill in name and public key');
         return;
       }
       
@@ -9727,11 +10296,11 @@ function setupSshKeyButtons() {
         const payload = {
           id: editingSshKeyId,
           name: name,
-          public_key: publicKey,
-          encryption_password: encryptionPassword
+          public_key: publicKey
         };
         
         // Only include private_key if provided (not empty)
+        const privateKey = el('sshKeyPrivate').value.trim();
         if (privateKey) {
           payload.private_key = privateKey;
         }
@@ -9821,8 +10390,8 @@ async function loadSshCommandProfiles() {
     let html = '<div style="display: flex; flex-direction: column; gap: 12px;">';
     
     profiles.forEach(profile => {
-      const createdDate = new Date(profile.created_at).toLocaleString();
-      const updatedDate = new Date(profile.updated_at).toLocaleString();
+      const createdDate = formatDateTime(profile.created_at);
+      const updatedDate = formatDateTime(profile.updated_at);
       // Count number of commands (lines)
       const commandCount = profile.commands.split('\n').filter(c => c.trim()).length;
       // Preview first few commands
@@ -10091,7 +10660,8 @@ function setupSshCommandProfileButtons() {
         cancelSshCommandProfileEdit();
         
         // Reload profiles list
-        loadSshCommandProfiles();
+        clearSshProfilesCache();
+      loadSshCommandProfiles();
       } catch (error) {
         showStatus(`Error saving SSH command profile: ${error.message || error}`);
       }
@@ -10148,7 +10718,8 @@ function setupSshCommandProfileButtons() {
         cancelSshCommandProfileEdit();
         
         // Reload profiles list
-        loadSshCommandProfiles();
+        clearSshProfilesCache();
+      loadSshCommandProfiles();
       } catch (error) {
         showStatus(`Error updating SSH command profile: ${error.message || error}`);
       }
@@ -10172,6 +10743,7 @@ async function deleteSshCommandProfile(profileId) {
     if (res.ok) {
       const data = await res.json();
       showStatus(data.message || 'SSH command profile deleted successfully');
+      clearSshProfilesCache();
       loadSshCommandProfiles();
     } else {
       const errorText = await res.text().catch(() => 'Unknown error');
@@ -10345,23 +10917,73 @@ async function promptSshProfileExecution(profileId, profileName, commandCount) {
       });
     };
 
-    // Update hosts display when NHI credential changes
-    nhiSelect.addEventListener('change', () => {
+    // Update hosts display when NHI credential changes - automatically load hosts
+    nhiSelect.addEventListener('change', async () => {
       const nhiId = nhiSelect.value;
       hostsConfirmed = false; // Reset confirmation when credential changes
       if (nhiId) {
         hostInput.style.display = 'none';
         hostLabel.style.display = 'none';
         hostsDisplay.style.display = 'block';
-        hostsDisplay.innerHTML = '<div style="font-size: 12px; color: #86868b; margin-bottom: 8px;">Hosts will be loaded from NHI credential when password is entered</div>';
+        hostsDisplay.innerHTML = '<div style="font-size: 12px; color: #86868b; margin-bottom: 8px;">Loading hosts from NHI credential...</div>';
         hostsDisplay.appendChild(hostsChipsContainer);
         hostsDisplay.setAttribute('data-nhi-id', nhiId);
         selectedHosts = [];
         renderHostChips();
-        // Execute button stays enabled so user can click it to load hosts
-        executeBtn.disabled = false;
-        executeBtn.style.opacity = '1';
-        executeBtn.style.cursor = 'pointer';
+        
+        // Automatically load hosts without password
+        executeBtn.disabled = true;
+        executeBtn.textContent = 'Loading hosts...';
+        executeBtn.style.opacity = '0.5';
+        executeBtn.style.cursor = 'not-allowed';
+        
+        try {
+          const nhiRes = await api(`/nhi/get/${nhiId}`);
+          
+          if (!nhiRes.ok) {
+            const errorText = await nhiRes.text().catch(() => 'Unknown error');
+            hostsDisplay.innerHTML = `<div style="font-size: 12px; color: #dc2626; margin-bottom: 8px;">Failed to load hosts: ${errorText}</div>`;
+            hostsDisplay.appendChild(hostsChipsContainer);
+            executeBtn.disabled = false;
+            executeBtn.textContent = 'Execute';
+            executeBtn.style.opacity = '1';
+            executeBtn.style.cursor = 'pointer';
+            return;
+          }
+          
+          const nhiData = await nhiRes.json();
+          const hostsList = nhiData.hosts_with_tokens || [];
+          
+          if (hostsList.length === 0) {
+            hostsDisplay.innerHTML = '<div style="font-size: 12px; color: #dc2626; margin-bottom: 8px;">No hosts found in this NHI credential</div>';
+            hostsDisplay.appendChild(hostsChipsContainer);
+            executeBtn.disabled = false;
+            executeBtn.textContent = 'Execute';
+            executeBtn.style.opacity = '1';
+            executeBtn.style.cursor = 'pointer';
+            return;
+          }
+          
+          // Populate selected hosts and render chips
+          selectedHosts = hostsList.map(h => ({ host: h, port: 22 }));
+          renderHostChips();
+          updateConfirmButton();
+          
+          hostsDisplay.innerHTML = `<div style="font-size: 12px; color: #10b981; margin-bottom: 8px;">Loaded ${hostsList.length} host(s). Review and confirm:</div>`;
+          hostsDisplay.appendChild(hostsChipsContainer);
+          
+          executeBtn.disabled = true;
+          executeBtn.textContent = 'Execute';
+          executeBtn.style.opacity = '0.5';
+          executeBtn.style.cursor = 'not-allowed';
+        } catch (error) {
+          hostsDisplay.innerHTML = `<div style="font-size: 12px; color: #dc2626; margin-bottom: 8px;">Error loading hosts: ${error.message || error}</div>`;
+          hostsDisplay.appendChild(hostsChipsContainer);
+          executeBtn.disabled = false;
+          executeBtn.textContent = 'Execute';
+          executeBtn.style.opacity = '1';
+          executeBtn.style.cursor = 'pointer';
+        }
       } else {
         hostInput.style.display = 'block';
         hostLabel.style.display = 'block';
@@ -10370,6 +10992,7 @@ async function promptSshProfileExecution(profileId, profileName, commandCount) {
         selectedHosts = [];
         renderHostChips();
         executeBtn.disabled = false; // Enable execute for manual host entry
+        executeBtn.textContent = 'Execute';
         executeBtn.style.opacity = '1';
         executeBtn.style.cursor = 'pointer';
       }
@@ -10377,28 +11000,7 @@ async function promptSshProfileExecution(profileId, profileName, commandCount) {
     });
 
     // Password input
-    const passwordLabel = document.createElement('label');
-    passwordLabel.textContent = 'Encryption Password:';
-    passwordLabel.style.display = 'block';
-    passwordLabel.style.marginBottom = '6px';
-    passwordLabel.style.color = '#424245';
-    passwordLabel.style.fontSize = '13px';
-    passwordLabel.style.fontWeight = '500';
-    dialog.appendChild(passwordLabel);
-
-    const passwordInput = document.createElement('input');
-    passwordInput.id = 'sshExecPasswordInput';
-    passwordInput.type = 'password';
-    passwordInput.placeholder = 'Enter encryption password (must match NHI credential and SSH key)';
-    passwordInput.style.width = '100%';
-    passwordInput.style.boxSizing = 'border-box';
-    passwordInput.style.margin = '0 0 16px 0';
-    passwordInput.style.padding = '6px 10px';
-    passwordInput.style.border = '1px solid #d2d2d7';
-    passwordInput.style.minHeight = '32px';
-    passwordInput.style.fontSize = '13px';
-    passwordInput.style.color = '#1d1d1f';
-    dialog.appendChild(passwordInput);
+    // Password field removed - no longer needed (uses FS_SERVER_SECRET)
 
     const errorDiv = document.createElement('div');
     errorDiv.id = 'sshExecError';
@@ -10486,92 +11088,15 @@ async function promptSshProfileExecution(profileId, profileName, commandCount) {
     executeBtn.onclick = async () => {
       const nhiId = nhiSelect.value;
       const host = hostInput.value.trim();
-      const password = passwordInput.value.trim();
-      
-      if (!password) {
-        errorDiv.textContent = 'Password is required';
-        errorDiv.style.display = 'block';
-        return;
-      }
       
       let hosts = [];
       
       // If NHI credential is selected, check if hosts are already loaded and confirmed
       if (nhiId) {
         if (!hostsConfirmed || selectedHosts.length === 0) {
-          // Load hosts using the password
-          errorDiv.style.display = 'none';
-          executeBtn.disabled = true;
-          executeBtn.textContent = 'Loading hosts...';
-          
-          // Update hosts display message
-          const messageDiv = hostsDisplay.querySelector('div');
-          if (messageDiv) {
-            messageDiv.textContent = 'Loading hosts...';
-          }
-          
-          try {
-            const nhiRes = await api(`/nhi/get/${nhiId}`, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ encryption_password: password })
-            });
-            
-            if (!nhiRes.ok) {
-              const errorText = await nhiRes.text().catch(() => 'Unknown error');
-              errorDiv.textContent = `Failed to load hosts: ${errorText}`;
-              errorDiv.style.display = 'block';
-              executeBtn.disabled = false;
-              executeBtn.textContent = 'Execute';
-              executeBtn.style.opacity = '1';
-              executeBtn.style.cursor = 'pointer';
-              if (messageDiv) {
-                messageDiv.textContent = 'Failed to load hosts';
-              }
-              return;
-            }
-            
-            const nhiData = await nhiRes.json();
-            const hostsList = nhiData.hosts_with_tokens || [];
-            
-            if (hostsList.length === 0) {
-              errorDiv.textContent = 'No hosts found in this NHI credential';
-              errorDiv.style.display = 'block';
-              executeBtn.disabled = false;
-              executeBtn.textContent = 'Execute';
-              executeBtn.style.opacity = '1';
-              executeBtn.style.cursor = 'pointer';
-              if (messageDiv) {
-                messageDiv.textContent = 'No hosts found in this NHI credential';
-              }
-              return;
-            }
-            
-            // Populate selected hosts and render chips
-            selectedHosts = hostsList.map(h => ({ host: h, port: 22 }));
-            renderHostChips();
-            updateConfirmButton();
-            
-            if (messageDiv) {
-              messageDiv.textContent = `Loaded ${hostsList.length} host(s). Review and confirm:`;
-            }
-            
-            executeBtn.disabled = true;
-            executeBtn.textContent = 'Execute';
-            executeBtn.style.opacity = '0.5';
-            executeBtn.style.cursor = 'not-allowed';
-            return; // Wait for user to confirm hosts
-          } catch (error) {
-            errorDiv.textContent = `Error loading hosts: ${error.message || error}`;
-            errorDiv.style.display = 'block';
-            executeBtn.disabled = false;
-            executeBtn.textContent = 'Execute';
-            const messageDiv = hostsDisplay.querySelector('div');
-            if (messageDiv) {
-              messageDiv.textContent = 'Error loading hosts';
-            }
-            return;
-          }
+          errorDiv.textContent = 'Please confirm the loaded hosts before executing';
+          errorDiv.style.display = 'block';
+          return;
         } else {
           // Hosts already confirmed, use selected hosts
           hosts = selectedHosts.map(h => ({ host: typeof h === 'string' ? h : h.host, port: typeof h === 'object' ? (h.port || 22) : 22 }));
@@ -10585,41 +11110,12 @@ async function promptSshProfileExecution(profileId, profileName, commandCount) {
         hosts = [{ host, port: 22 }];
       }
       
-      // Validate password against both NHI credential (if provided) and SSH key
-      executeBtn.textContent = 'Validating password...';
-      
-      try {
-        const validateRes = await api('/ssh-profiles/validate-password', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            nhi_credential_id: nhiId ? parseInt(nhiId) : null,
-            ssh_profile_id: parseInt(profileId),
-            encryption_password: password
-          })
-        });
-        
-        const validateData = await validateRes.json();
-        if (!validateData.valid) {
-          errorDiv.textContent = validateData.error || 'Password validation failed';
-          errorDiv.style.display = 'block';
-          executeBtn.disabled = false;
-          executeBtn.textContent = 'Execute';
-          return;
-        }
-        
-        document.body.removeChild(overlay);
-        resolve({
-          nhi_credential_id: nhiId ? parseInt(nhiId) : null,
-          hosts: hosts,
-          encryption_password: password
-        });
-      } catch (error) {
-        errorDiv.textContent = `Validation error: ${error.message || error}`;
-        errorDiv.style.display = 'block';
-        executeBtn.disabled = false;
-        executeBtn.textContent = 'Execute';
-      }
+      // No password needed - uses FS_SERVER_SECRET
+      document.body.removeChild(overlay);
+      resolve({
+        nhi_credential_id: nhiId ? parseInt(nhiId) : null,
+        hosts: hosts
+      });
     };
     buttonContainer.appendChild(executeBtn);
 
@@ -10629,11 +11125,7 @@ async function promptSshProfileExecution(profileId, profileName, commandCount) {
 
     // Focus on first input
     setTimeout(() => {
-      if (nhiSelect.value) {
-        passwordInput.focus();
-      } else {
-        hostInput.focus();
-      }
+      hostInput.focus();
     }, 100);
   });
 }
@@ -10670,7 +11162,7 @@ async function runSshCommandProfile(profileId) {
       return; // User cancelled
     }
     
-    const { nhi_credential_id, hosts, encryption_password } = execData;
+    const { nhi_credential_id, hosts } = execData;
     
     // Execute SSH profile on all hosts
     showStatus(`Executing SSH profile '${profile.name}' on ${hosts.length} host(s)...`);
@@ -10690,7 +11182,6 @@ async function runSshCommandProfile(profileId) {
             fabric_host: host,
             ssh_profile_id: profileId,
             ssh_port: port,
-            encryption_password: encryption_password,
             nhi_credential_id: nhi_credential_id,
             wait_time_seconds: 0  // No wait time for manual execution
           }),
@@ -10753,35 +11244,72 @@ async function runSshCommandProfile(profileId) {
 }
 
 // Load SSH profiles for preparation section dropdown
+// Cache for SSH profiles to avoid duplicate calls
+let _sshProfilesCache = null;
+let _sshProfilesLoading = null;
+
 async function loadSshProfilesForPreparation() {
   const sshProfileSelect = el('sshProfileSelect');
   if (!sshProfileSelect) return;
   
-  try {
-    const res = await api('/ssh-command-profiles/list');
-    if (!res.ok) {
+  // If already loading, wait for that request
+  if (_sshProfilesLoading) {
+    await _sshProfilesLoading;
+    if (_sshProfilesCache) {
+      populateSshProfilesDropdown(sshProfileSelect, _sshProfilesCache);
       return;
     }
-    
-    const data = await res.json();
-    const profiles = data.profiles || [];
-    
-    // Clear existing options except the first one
-    sshProfileSelect.innerHTML = '<option value="">None (select SSH profile)</option>';
-    
-    // Add SSH profiles to dropdown
-    profiles.forEach(profile => {
-      const option = document.createElement('option');
-      option.value = profile.id;
-      option.textContent = profile.name;
-      sshProfileSelect.appendChild(option);
-    });
-  } catch (error) {
   }
+  
+  // If we have cached data, use it
+  if (_sshProfilesCache) {
+    populateSshProfilesDropdown(sshProfileSelect, _sshProfilesCache);
+    return;
+  }
+  
+  // Load profiles
+  _sshProfilesLoading = (async () => {
+    try {
+      const res = await api('/ssh-command-profiles/list');
+      if (!res.ok) {
+        return;
+      }
+      
+      const data = await res.json();
+      const profiles = data.profiles || [];
+      _sshProfilesCache = profiles;
+      populateSshProfilesDropdown(sshProfileSelect, profiles);
+    } catch (error) {
+      // Silent failure
+    } finally {
+      _sshProfilesLoading = null;
+    }
+  })();
+  
+  await _sshProfilesLoading;
+}
+
+function populateSshProfilesDropdown(select, profiles) {
+  // Clear existing options except the first one
+  select.innerHTML = '<option value="">None (select SSH profile)</option>';
+  
+  // Add SSH profiles to dropdown
+  profiles.forEach(profile => {
+    const option = document.createElement('option');
+    option.value = profile.id;
+    option.textContent = profile.name;
+    select.appendChild(option);
+  });
+}
+
+// Clear SSH profiles cache (call after save/delete/update)
+function clearSshProfilesCache() {
+  _sshProfilesCache = null;
+  _requestCache.clear(); // Clear API cache for /ssh-command-profiles/list
 }
 
 // Execute SSH profiles on all hosts
-async function executeSshProfiles(hosts, sshProfileId, encryptionPassword, waitTimeSeconds = 60) {
+async function executeSshProfiles(hosts, sshProfileId, waitTimeSeconds = 60) {
   const results = [];
   
   // Calculate timeout based on SSH operation requirements:
@@ -10823,13 +11351,12 @@ async function executeSshProfiles(hosts, sshProfileId, encryptionPassword, waitT
       const res = await api('/ssh-profiles/execute', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          fabric_host: host,
-          ssh_profile_id: parseInt(sshProfileId),
-          ssh_port: port || 22,
-          encryption_password: encryptionPassword,
-          wait_time_seconds: waitTimeSeconds || 0
-        }),
+          body: JSON.stringify({
+            fabric_host: host,
+            ssh_profile_id: parseInt(sshProfileId),
+            ssh_port: port || 22,
+            wait_time_seconds: waitTimeSeconds || 0
+          }),
         timeout: timeout // Use calculated timeout
       });
       
@@ -10964,7 +11491,7 @@ async function loadServerLogs() {
     html += '<th style="padding: 10px; text-align: left;">Message</th>';
     html += '</tr></thead><tbody>';
     logs.forEach(l => {
-      const ts = new Date(l.created_at).toLocaleString();
+      const ts = formatDateTime(l.created_at);
       html += '<tr style="border-bottom: 1px solid #eee;">';
       html += `<td style="padding: 8px; font-size: 12px;">${ts}</td>`;
       html += `<td style="padding: 8px; font-size: 12px;">${l.level || '-'}</td>`;
@@ -11083,7 +11610,7 @@ async function loadAuditLogs() {
     html += '</tr></thead><tbody>';
     
     logs.forEach(log => {
-      const timestamp = new Date(log.created_at).toLocaleString();
+      const timestamp = formatDateTime(log.created_at);
       const actionDisplay = log.action.replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase());
       
       html += '<tr style="border-bottom: 1px solid #e5e5e7;">';
@@ -11187,7 +11714,7 @@ async function loadReports() {
     for (const run of runs) {
       const statusColor = run.status === 'success' ? '#34d399' : run.status === 'error' ? '#f87171' : '#fbbf24';
       const statusText = run.status === 'success' ? 'Success' : run.status === 'error' ? 'Error' : 'Running';
-      const startDate = run.started_at ? new Date(run.started_at).toLocaleString() : 'N/A';
+      const startDate = run.started_at ? formatDateTime(run.started_at) : 'N/A';
       const duration = run.duration_seconds ? `${Math.round(run.duration_seconds)}s` : 'N/A';
       
       html += `
@@ -11244,8 +11771,8 @@ async function showRunReport(runId) {
     
     const statusColor = report.status === 'success' ? '#34d399' : report.status === 'error' ? '#f87171' : '#fbbf24';
     const statusText = report.status === 'success' ? 'Success' : report.status === 'error' ? 'Error' : 'Running';
-    const startDate = report.started_at ? new Date(report.started_at).toLocaleString() : 'N/A';
-    const endDate = report.completed_at ? new Date(report.completed_at).toLocaleString() : 'N/A';
+    const startDate = report.started_at ? formatDateTime(report.started_at) : 'N/A';
+    const endDate = report.completed_at ? formatDateTime(report.completed_at) : 'N/A';
     const duration = report.execution_details?.duration_seconds ? `${Math.round(report.execution_details.duration_seconds)}s` : 'N/A';
     
     let html = `
@@ -11263,45 +11790,8 @@ async function showRunReport(runId) {
     
     const details = report.execution_details || {};
     
-    // SSH Execution Summary (if SSH profile was used)
+    // Get sshProfile for use in Host Summary (but don't display standalone section)
     const sshProfile = details.ssh_profile;
-    if (sshProfile) {
-      html += '<h4 style="margin-top: 24px; margin-bottom: 12px;">SSH Commands Execution</h4>';
-      html += `<div style="border: 1px solid #d2d2d7; border-radius: 4px; padding: 12px; background: #fafafa; margin-bottom: 24px;">`;
-      html += `<p style="margin-bottom: 8px;"><strong>Profile:</strong> ${sshProfile.profile_name || 'N/A'} (ID: ${sshProfile.profile_id})</p>`;
-      html += `<p style="margin-bottom: 8px;"><strong>Wait Time:</strong> ${sshProfile.wait_time_seconds || 0}s between commands</p>`;
-      html += `<p style="margin-bottom: 12px;"><strong>Commands:</strong> ${(sshProfile.commands || []).length} command(s)</p>`;
-      
-      if (sshProfile.commands && sshProfile.commands.length > 0) {
-        html += '<div style="margin-bottom: 12px;"><strong>Command List:</strong><ul style="margin: 8px 0 0 20px; font-family: monospace; font-size: 12px;">';
-        for (const cmd of sshProfile.commands) {
-          html += `<li style="margin-bottom: 4px;">${cmd}</li>`;
-        }
-        html += '</ul></div>';
-      }
-      
-      // Per-host SSH execution results
-      if (sshProfile.hosts && sshProfile.hosts.length > 0) {
-        html += '<div style="margin-top: 12px;"><strong>Execution Results:</strong><div style="margin-top: 8px; display: flex; flex-direction: column; gap: 8px;">';
-        for (const hostResult of sshProfile.hosts) {
-          const successIcon = hostResult.success ? '✓' : '✗';
-          const successColor = hostResult.success ? '#34d399' : '#f87171';
-          html += `<div style="padding: 8px; border-left: 3px solid ${successColor}; background: white;">
-            <div style="font-weight: 600; margin-bottom: 4px;">
-              ${successIcon} <strong>Host:</strong> ${hostResult.host}
-            </div>
-            <div style="font-size: 12px; color: #86868b;">
-              Commands Executed: ${hostResult.commands_executed || 0} | 
-              Commands Failed: ${hostResult.commands_failed || 0}
-              ${hostResult.error ? `<br><span style="color: #f87171;">Error: ${hostResult.error}</span>` : ''}
-            </div>
-          </div>`;
-        }
-        html += '</div></div>';
-      }
-      
-      html += '</div>';
-    }
     
     const hosts = details.hosts || [];
     
@@ -11310,36 +11800,93 @@ async function showRunReport(runId) {
       html += '<div style="display: flex; flex-direction: column; gap: 16px;">';
       
       for (const host of hosts) {
-        html += `<div style="border: 1px solid #d2d2d7; border-radius: 4px; padding: 12px; background: #fafafa;">`;
+        html += `<div style="border: 1px solid #d2d2d7; border-radius: 6px; padding: 16px; background: #fafafa;">`;
         html += `<h5 style="margin: 0 0 12px 0; font-size: 14px; font-weight: 600;">Host: ${host}</h5>`;
         
-        // Fabric Creations
-        const creations = (details.fabric_creations || []).filter(c => c.host === host);
-        if (creations.length > 0) {
-          html += '<div style="margin-bottom: 12px;"><strong>Fabric Creations:</strong><ul style="margin: 8px 0 0 20px;">';
-          for (const creation of creations) {
-            const successIcon = creation.success ? '✓' : '✗';
-            const successColor = creation.success ? '#34d399' : '#f87171';
-            const duration = creation.duration_seconds ? `${Math.round(creation.duration_seconds)}s` : 'N/A';
-            html += `<li style="color: ${successColor}; margin-bottom: 4px;">
-              ${successIcon} ${creation.template_name} v${creation.version} (${duration})
-              ${creation.errors ? ` - ${creation.errors.join('; ')}` : ''}
+        // Hostname Changes (1st)
+        const hostnameChanges = (details.hostname_changes || []).filter(h => h.host === host);
+        if (hostnameChanges.length > 0) {
+          html += '<div style="margin-top: 8px; padding: 8px; background: #fef3c7; border-left: 3px solid #f59e0b; border-radius: 4px;">';
+          html += '<div style="font-weight: 600; color: #92400e; margin-bottom: 4px; font-size: 13px;">Hostname Changes:</div>';
+          html += '<ul style="margin: 4px 0 0 16px; font-size: 11px; color: #92400e;">';
+          for (const hc of hostnameChanges) {
+            const statusIcon = hc.success ? '✓' : '✗';
+            const statusColor = hc.success ? '#047857' : '#dc2626';
+            html += `<li style="color: ${statusColor}; margin-bottom: 2px;">
+              <span style="font-weight: bold;">${statusIcon}</span>
+              <code>${hc.host}</code>: Changed to <strong>${hc.new_hostname || 'N/A'}</strong>${hc.error ? ` - ${hc.error}` : ''}
             </li>`;
           }
           html += '</ul></div>';
         }
         
-        // Installations
+        // Password Changes (2nd)
+        const passwordChanges = (details.password_changes || []).filter(p => p.host === host);
+        if (passwordChanges.length > 0) {
+          html += '<div style="margin-top: 8px; padding: 8px; background: #fef3c7; border-left: 3px solid #f59e0b; border-radius: 4px;">';
+          html += '<div style="font-weight: 600; color: #92400e; margin-bottom: 4px; font-size: 13px;">Password Changes:</div>';
+          html += '<ul style="margin: 4px 0 0 16px; font-size: 11px; color: #92400e;">';
+          for (const pc of passwordChanges) {
+            const statusIcon = pc.success ? '✓' : '✗';
+            const statusColor = pc.success ? '#047857' : '#dc2626';
+            html += `<li style="color: ${statusColor}; margin-bottom: 2px;">
+              <span style="font-weight: bold;">${statusIcon}</span>
+              <code>${pc.host}</code>: Changed password for user <strong>${pc.username || 'guest'}</strong>${pc.error ? ` - ${pc.error}` : ''}
+            </li>`;
+          }
+          html += '</ul></div>';
+        }
+        
+        // Fabric Creations (3rd)
+        const creations = (details.fabric_creations || []).filter(c => c.host === host);
+        if (creations.length > 0) {
+          html += '<div style="margin-top: 8px; padding: 8px; background: #f0fdf4; border-left: 3px solid #10b981; border-radius: 4px;">';
+          html += '<div style="font-weight: 600; color: #047857; margin-bottom: 4px; font-size: 13px;">Fabric Creations:</div>';
+          html += '<ul style="margin: 4px 0 0 16px; font-size: 11px; color: #047857;">';
+          for (const creation of creations) {
+            const statusIcon = creation.success ? '✓' : '✗';
+            const statusColor = creation.success ? '#047857' : '#dc2626';
+            const duration = creation.duration_seconds ? ` (${Math.round(creation.duration_seconds)}s)` : '';
+            const errors = creation.errors && creation.errors.length > 0 ? ` - ${creation.errors.join('; ')}` : '';
+            html += `<li style="color: ${statusColor}; margin-bottom: 2px;">
+              <span style="font-weight: bold;">${statusIcon}</span>
+              <strong>${creation.template_name || ''}</strong> v${creation.version || ''}${duration}${errors}
+            </li>`;
+          }
+          html += '</ul></div>';
+        }
+        
+        // SSH Commands (4th)
+        if (sshProfile && sshProfile.hosts) {
+          const hostSshResult = sshProfile.hosts.find(h => h.host === host);
+          if (hostSshResult) {
+            html += '<div style="margin-top: 8px; padding: 8px; background: #f0f9ff; border-left: 3px solid #3b82f6; border-radius: 4px;">';
+            html += '<div style="font-weight: 600; color: #1e40af; margin-bottom: 4px; font-size: 13px;">SSH Commands:</div>';
+            html += '<div style="font-size: 11px; color: #1e40af; margin-left: 8px;">';
+            const statusIcon = hostSshResult.success ? '✓' : '✗';
+            const statusColor = hostSshResult.success ? '#10b981' : '#ef4444';
+            html += `<div style="margin-bottom: 2px;">
+              <span style="color: ${statusColor}; font-weight: bold;">${statusIcon}</span>
+              <code>${host}</code>: ${hostSshResult.commands_executed || 0} executed, ${hostSshResult.commands_failed || 0} failed${hostSshResult.error ? ` - ${hostSshResult.error}` : ''}
+            </div>`;
+            html += '</div></div>';
+          }
+        }
+        
+        // Installations (5th)
         const installations = (details.installations || []).filter(i => i.host === host);
         if (installations.length > 0) {
-          html += '<div style="margin-bottom: 12px;"><strong>Installations:</strong><ul style="margin: 8px 0 0 20px;">';
+          html += '<div style="margin-top: 8px; padding: 8px; background: #f0fdf4; border-left: 3px solid #10b981; border-radius: 4px;">';
+          html += '<div style="font-weight: 600; color: #047857; margin-bottom: 4px; font-size: 13px;">Installations:</div>';
+          html += '<ul style="margin: 4px 0 0 16px; font-size: 11px; color: #047857;">';
           for (const install of installations) {
-            const successIcon = install.success ? '✓' : '✗';
-            const successColor = install.success ? '#34d399' : '#f87171';
-            const duration = install.duration_seconds ? `${Math.round(install.duration_seconds)}s` : 'N/A';
-            html += `<li style="color: ${successColor}; margin-bottom: 4px;">
-              ${successIcon} ${install.template_name} v${install.version} (${duration})
-              ${install.errors ? ` - ${install.errors.join('; ')}` : ''}
+            const statusIcon = install.success ? '✓' : '✗';
+            const statusColor = install.success ? '#047857' : '#dc2626';
+            const duration = install.duration_seconds ? ` (${Math.round(install.duration_seconds)}s)` : '';
+            const errors = install.errors && install.errors.length > 0 ? ` - ${install.errors.join('; ')}` : '';
+            html += `<li style="color: ${statusColor}; margin-bottom: 2px;">
+              <span style="font-weight: bold;">${statusIcon}</span>
+              <strong>${install.template_name || ''}</strong> v${install.version || ''} on ${install.host || 'N/A'}${duration}${errors}
             </li>`;
           }
           html += '</ul></div>';
@@ -11353,12 +11900,13 @@ async function showRunReport(runId) {
     
     // Errors
     if (report.errors && report.errors.length > 0) {
-      html += '<h4 style="margin-top: 24px; margin-bottom: 12px; color: #f87171;">Errors</h4>';
-      html += '<ul style="margin-left: 20px;">';
+      html += '<div style="margin-top: 24px; padding: 12px; background: #fef2f2; border: 1px solid #fecaca; border-radius: 4px;">';
+      html += '<div style="font-weight: 600; color: #dc2626; margin-bottom: 8px; font-size: 13px;">Errors:</div>';
+      html += '<ul style="margin: 0; padding-left: 20px; color: #991b1b; font-size: 12px;">';
       for (const error of report.errors) {
-        html += `<li style="color: #f87171; margin-bottom: 8px;">${error}</li>`;
+        html += `<li style="margin-bottom: 4px;">${error}</li>`;
       }
-      html += '</ul>';
+      html += '</ul></div>';
     }
     
     detailContent.innerHTML = html;

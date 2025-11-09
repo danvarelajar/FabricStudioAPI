@@ -111,8 +111,18 @@ $DOCKER_CMD up -d
 echo ""
 echo "✅ FabricStudio API is starting!"
 echo ""
+
+# Get port and protocol from .env or use defaults
+PORT=${PORT:-8000}
+HTTPS_ENABLED=${HTTPS_ENABLED:-false}
+if [ "${HTTPS_ENABLED}" = "true" ] || [ "${HTTPS_ENABLED}" = "1" ]; then
+    PROTOCOL="https"
+else
+    PROTOCOL="http"
+fi
+
 echo "📊 View logs: $DOCKER_CMD logs -f"
-echo "🌐 Access at: http://localhost:8000"
+echo "🌐 Access at: ${PROTOCOL}://localhost:${PORT}"
 echo "🛑 Stop with: $DOCKER_CMD down"
 echo ""
 echo "💡 Tip: Use './docker-start.sh --rebuild' to rebuild without cache"
