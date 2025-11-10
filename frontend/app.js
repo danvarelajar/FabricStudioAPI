@@ -1396,6 +1396,7 @@ function setActionsEnabled(enabled) {
 const _requestCache = new Map();
 const _requestCacheTimeout = 5000; // Cache for 5 seconds
 const _pendingRequests = new Map(); // Track in-flight requests to deduplicate
+const _htmlCache = new Map(); // Cache for HTML section content
 // Generic API wrapper with optional params - cookies are included automatically
 async function api(path, options = {}) {
   // Always use current origin as base URL
@@ -1464,10 +1465,7 @@ async function api(path, options = {}) {
         }
       });
     }
-    // Add cache-busting and disable browser cache
-    if ((options.method || 'GET').toUpperCase() === 'GET') {
-      url.searchParams.set('_ts', Date.now());
-    }
+    // Disable browser cache
     headers.set('Cache-Control', 'no-cache');
     
     // Add timeout to fetch request
@@ -1549,10 +1547,7 @@ async function api(path, options = {}) {
         }
       });
     }
-    // Add cache-busting and disable browser cache
-    if (method === 'GET') {
-      url.searchParams.set('_ts', Date.now());
-    }
+    // Disable browser cache
     headers.set('Cache-Control', 'no-cache');
     
     // Add timeout to fetch request
@@ -1598,9 +1593,6 @@ async function api(path, options = {}) {
           url.searchParams.set(k, v);
         }
       });
-    }
-    if (method === 'GET') {
-      url.searchParams.set('_ts', Date.now());
     }
     headers.set('Cache-Control', 'no-cache');
     
@@ -2485,6 +2477,16 @@ async function loadSection(sectionName) {
     return;
   }
   
+  // Check cache first to avoid duplicate requests
+  if (_htmlCache.has(sectionName)) {
+    container.innerHTML = _htmlCache.get(sectionName);
+    // Wait for DOM to update, then initialize section-specific functionality
+    setTimeout(() => {
+      initializeSection(sectionName);
+    }, 50);
+    return;
+  }
+  
   const url = `/${sectionName}.html`;
   
   try {
@@ -2498,6 +2500,8 @@ async function loadSection(sectionName) {
     }
     
     const html = await response.text();
+    // Cache the HTML content
+    _htmlCache.set(sectionName, html);
     container.innerHTML = html;
     
     // Verify content was inserted
@@ -3980,13 +3984,13 @@ async function loadConfigurationById(configId) {
         // Click to switch to preparation section
         prepItem.click();
         
-        // Wait for section to load
-        await new Promise(resolve => setTimeout(resolve, 300));
+        // Wait for section to load (reduced from 300ms)
+        await new Promise(resolve => setTimeout(resolve, 100));
       }
       
-      // Wait for preparation section elements to be available
+      // Wait for preparation section elements to be available (reduced timeout)
       let attempts = 0;
-      const maxAttempts = 50; // Increased timeout
+      const maxAttempts = 20; // Reduced from 50 (2 seconds max instead of 5)
       while (attempts < maxAttempts && !el('fabricHost')) {
         await new Promise(resolve => setTimeout(resolve, 100));
         attempts++;
@@ -3998,14 +4002,11 @@ async function loadConfigurationById(configId) {
         return;
       }
       
-      // Wait a bit more for section to fully initialize
-      await new Promise(resolve => setTimeout(resolve, 200));
-      
-      // Ensure preparation section is initialized
+      // Ensure preparation section is initialized (removed unnecessary wait)
       if (typeof initializePreparationSection === 'function') {
         // Re-initialize to ensure all handlers are set up
         initializePreparationSection();
-        await new Promise(resolve => setTimeout(resolve, 200));
+        // Removed 200ms wait - initialization is synchronous
       }
     } else {
       showStatus('Error: Could not find preparation section menu item');
@@ -4016,12 +4017,7 @@ async function loadConfigurationById(configId) {
     // Restore configuration
     await restoreConfiguration(configData.config_data);
     
-    // Wait for async operations in restoreConfiguration to complete
-    // Template restoration can take time (each template row takes ~1-2 seconds)
-    const templatesCount = configData.config_data.templates ? configData.config_data.templates.length : 0;
-    const waitTime = templatesCount > 0 ? Math.max(2000, templatesCount * 1500) + 500 : 500;
-    await new Promise(resolve => setTimeout(resolve, waitTime));
-    
+    // No need for additional wait - restoreConfiguration already handles all async operations
     showStatus(`Configuration '${configName}' loaded successfully`);
     logMsg(`Configuration loaded: ${configName}`);
     hideLoadingScreen();
@@ -6850,9 +6846,9 @@ async function restoreConfiguration(config) {
   
   try {
     
-    // Ensure preparation section is loaded - wait for elements to exist
+    // Ensure preparation section is loaded - wait for elements to exist (reduced timeout)
     let attempts = 0;
-    while (attempts < 30 && !el('fabricHost')) {
+    while (attempts < 15 && !el('fabricHost')) {
       await new Promise(resolve => setTimeout(resolve, 100));
       attempts++;
     }
@@ -6906,8 +6902,8 @@ async function restoreConfiguration(config) {
           showStatus('Loading NHI credential...');
           await loadSelectedNhiCredential();
           
-          // Wait a bit for credential to load and hosts to be populated
-          await new Promise(resolve => setTimeout(resolve, 300));
+          // Wait for credential to load and hosts to be populated (reduced from 300ms)
+          await new Promise(resolve => setTimeout(resolve, 100));
           
           // Populate hosts from NHI credential (auto-confirmed)
           if (window.validatedNhiHosts && window.validatedNhiHosts.length > 0) {
@@ -7178,12 +7174,12 @@ async function restoreConfiguration(config) {
           const finalTemplate = trimmedTemplate;
           const finalVersion = trimmedVersion;
           
-          // Add the row first
+            // Add the row first
           try {
             addTplRow({ repo_name: finalRepo, template_name: finalTemplate, version: finalVersion });
             
-            // Get the row we just added
-            await new Promise(resolve => setTimeout(resolve, 200));
+            // Get the row we just added (reduced from 200ms)
+            await new Promise(resolve => setTimeout(resolve, 50));
             const rows = document.querySelectorAll('.tpl-row');
             if (rows.length === 0) {
               continue;
@@ -7221,8 +7217,7 @@ async function restoreConfiguration(config) {
                 // Ensure repo value persists - add a flag to prevent clearing
                 r._restoredFromCache = true;
                 
-                // Populate templates for this repo from cache directly
-                await new Promise(resolve => setTimeout(resolve, 100));
+                // Populate templates for this repo from cache directly (removed unnecessary wait)
                 const templatesForRepo = cachedTemplates.filter(t => t.repo_name === finalRepo);
                 const uniqueNames = Array.from(new Set(templatesForRepo.map(t => t.template_name).filter(Boolean))).sort();
                 const templateOptions = uniqueNames.map(name => {
@@ -7239,9 +7234,8 @@ async function restoreConfiguration(config) {
                   r.value = finalRepo;
                 }
                 
-                // Set template value
+                // Set template value (removed unnecessary wait)
                 if (uniqueNames.includes(finalTemplate)) {
-                  await new Promise(resolve => setTimeout(resolve, 100));
                   
                   // Set template value WITHOUT triggering change events that would try to load from API
                   // We're using cache, so we'll populate versions directly from cache
@@ -7339,7 +7333,7 @@ async function restoreConfiguration(config) {
               // Load repositories if needed
               if (r._loadRepositories) {
                 try {
-                  if (host && token) {
+                  if (host) {
                     const loaded = await r._loadRepositories();
                     if (loaded) {
                       // Wait for repos to populate
@@ -7356,7 +7350,7 @@ async function restoreConfiguration(config) {
               
               // Fallback: Set repo value and let event handlers populate templates/versions (may trigger API calls)
               // Only do this if we have tokens available
-              if (finalRepo && host && token) {
+              if (finalRepo && host) {
                 const repoOpt = Array.from(r.options).find(opt => opt.value === finalRepo);
                 if (repoOpt) {
                   r.value = finalRepo;
@@ -7374,7 +7368,7 @@ async function restoreConfiguration(config) {
                   await new Promise(resolve => setTimeout(resolve, 300));
                   templateFiltered.setValue(finalTemplate);
                   // Only dispatch change if we're using API path (have token)
-                  if (host && token) {
+                  if (host) {
                     templateFiltered.select.dispatchEvent(new Event('change'));
                     await new Promise(resolve => setTimeout(resolve, 1000));
                   }
@@ -7387,7 +7381,7 @@ async function restoreConfiguration(config) {
                 const versionOpt = Array.from(v.options).find(opt => opt.value === finalVersion);
                 if (versionOpt) {
                   v.value = finalVersion;
-                  if (host && token) {
+                  if (host) {
                     v.dispatchEvent(new Event('change'));
                   }
                 } else {
@@ -9688,11 +9682,7 @@ async function editNhi(nhiId) {
     showStatus(`Loading NHI credential for editing...`);
     
     // No password required - uses FS_SERVER_SECRET
-    const getRes = await api(`/nhi/get/${nhiId}`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({})
-    });
+    const getRes = await api(`/nhi/get/${nhiId}`);
     if (!getRes.ok) {
       const errorText = await getRes.text().catch(() => 'Unknown error');
       showStatus(`Failed to retrieve NHI credential: ${errorText}`);
@@ -11919,14 +11909,14 @@ async function showRunReport(runId) {
       const legacyExecutions = details.ssh_executions;
       sshProfile = {
         profile_id: details.ssh_profile_id || null,
-        profile_name: 'SSH Profile',
+        profile_name: details.ssh_profile_name || 'SSH Profile',
         wait_time_seconds: details.ssh_wait_time_seconds || null,
-        commands: [],
+        commands: details.ssh_commands || [],
         hosts: legacyExecutions.map(exec => ({
           host: exec.host,
           success: exec.success,
-          commands_executed: exec.success ? 0 : 0,
-          commands_failed: exec.success ? 0 : 0,
+          commands_executed: exec.success ? (details.ssh_commands ? details.ssh_commands.length : 0) : 0,
+          commands_failed: exec.success ? 0 : (details.ssh_commands ? details.ssh_commands.length : 0),
           error: exec.error || null,
           output: exec.output || null
         }))
@@ -11940,8 +11930,8 @@ async function showRunReport(runId) {
     const hosts = details.hosts || [];
 
     // SSH Profile Section (standalone, before Host Summary)
-    // Show if sshProfile exists and has any meaningful data
-    if (sshProfile && (sshProfile.profile_id || sshProfile.profile_name || (sshProfile.hosts && sshProfile.hosts.length > 0))) {
+    // Show if sshProfile exists and has any meaningful data (hosts, profile info, or commands)
+    if (sshProfile && ((sshProfile.profile_id || sshProfile.profile_name) || (sshProfile.hosts && sshProfile.hosts.length > 0) || (sshProfile.commands && sshProfile.commands.length > 0))) {
       html += '<h4 style="margin-top: 24px; margin-bottom: 12px;">SSH Profile Execution</h4>';
       html += '<div style="border: 1px solid #d2d2d7; border-radius: 6px; padding: 16px; background: #fafafa; margin-bottom: 24px;">';
       html += '<div style="margin-bottom: 12px;">';
@@ -11966,10 +11956,15 @@ async function showRunReport(runId) {
         sshProfile.hosts.forEach(h => {
           const statusIcon = h.success ? '✓' : '✗';
           const statusColor = h.success ? '#10b981' : '#ef4444';
-          html += `<li style="margin-bottom: 4px;">
-            <span style="color: ${statusColor}; font-weight: bold;">${statusIcon}</span>
-            <code>${h.host}</code>: ${h.commands_executed || 0} executed, ${h.commands_failed || 0} failed${h.error ? ` - ${h.error}` : ''}
-          </li>`;
+          html += `<li style="margin-bottom: 8px;">
+            <div>
+              <span style="color: ${statusColor}; font-weight: bold;">${statusIcon}</span>
+              <code>${h.host}</code>: ${h.commands_executed || 0} executed, ${h.commands_failed || 0} failed${h.error ? ` - ${h.error}` : ''}
+            </div>`;
+          if (h.output) {
+            html += `<div style="margin-top: 4px; padding: 8px; background: #f9fafb; border-radius: 4px; font-family: monospace; font-size: 11px; color: #374151; white-space: pre-wrap; max-height: 200px; overflow-y: auto;">${h.output}</div>`;
+          }
+          html += `</li>`;
         });
         html += '</ul></div>';
       }

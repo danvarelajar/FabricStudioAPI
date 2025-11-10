@@ -408,14 +408,76 @@ def get_access_token_from_request(request: Request, fabric_host: str = None, nhi
         logger.error(f"Error retrieving token from nhi_tokens: {e}", exc_info=True)
         return None
 
-def get_access_token_for_host(fabric_host: str, nhi_credential_id: Optional[int] = None) -> Optional[str]:
+def get_access_token_for_host(fabric_host: str, nhi_credential_id: int) -> Optional[str]:
     """
-    Get access token for a fabric host from nhi_tokens table (for background tasks).
-    This is similar to get_access_token_from_request but doesn't require a request object.
+    Get access token for a fabric host from nhi_tokens table (for NHI credentials only).
+    This requires a specific nhi_credential_id to ensure credentials are independent.
     
     Args:
         fabric_host: Fabric host address
-        nhi_credential_id: Optional NHI credential ID to use
+        nhi_credential_id: REQUIRED NHI credential ID (credentials must be independent)
+    
+    Returns:
+        Access token string or None if not found
+    """
+    if not fabric_host or nhi_credential_id is None:
+        return None
+    
+    try:
+        conn = db_connect_with_retry()
+        if not conn:
+            return None
+        
+        c = conn.cursor()
+        now = datetime.now(timezone.utc)
+        
+        # Always require nhi_credential_id to ensure credentials are independent
+        c.execute('''
+            SELECT token_encrypted, token_expires_at
+            FROM nhi_tokens
+            WHERE nhi_credential_id = ? AND fabric_host = ?
+            ORDER BY token_expires_at DESC
+            LIMIT 1
+        ''', (nhi_credential_id, fabric_host))
+        
+        token_row = c.fetchone()
+        
+        if token_row:
+            token_encrypted, token_expires_at_str = token_row
+            if token_expires_at_str:
+                try:
+                    expires_at = datetime.fromisoformat(token_expires_at_str)
+                    if expires_at > now:
+                        # Token is valid, decrypt it
+                        try:
+                            decrypted_token = decrypt_with_server_secret(token_encrypted)
+                            # Calculate remaining seconds until expiration
+                            remaining_seconds = int((expires_at - now).total_seconds())
+                            logger.debug(f"Found valid cached token for {fabric_host} (NHI credential {nhi_credential_id}), expires in {remaining_seconds} seconds")
+                            conn.close()
+                            return decrypted_token
+                        except Exception as e:
+                            logger.error(f"Failed to decrypt token from nhi_tokens for {fabric_host}: {e}")
+                            conn.close()
+                            return None
+                    else:
+                        logger.debug(f"Cached token for {fabric_host} (NHI credential {nhi_credential_id}) has expired")
+                except (ValueError, TypeError) as e:
+                    logger.error(f"Invalid token expiration date format for {fabric_host}: {e}")
+        
+        conn.close()
+    except Exception as e:
+        logger.error(f"Error retrieving token from nhi_tokens for {fabric_host}: {e}")
+    
+    return None
+
+def get_system_token(fabric_host: str) -> Optional[str]:
+    """
+    Get system token for a fabric host from system_tokens table.
+    These are internal tokens (LEAD_FABRIC_HOST) and are never exposed.
+    
+    Args:
+        fabric_host: Fabric host address
     
     Returns:
         Access token string or None if not found
@@ -431,24 +493,12 @@ def get_access_token_for_host(fabric_host: str, nhi_credential_id: Optional[int]
         c = conn.cursor()
         now = datetime.now(timezone.utc)
         
-        # Build query based on whether nhi_credential_id is provided
-        if nhi_credential_id:
-            c.execute('''
-                SELECT token_encrypted, token_expires_at
-                FROM nhi_tokens
-                WHERE nhi_credential_id = ? AND fabric_host = ?
-                ORDER BY token_expires_at DESC
-                LIMIT 1
-            ''', (nhi_credential_id, fabric_host))
-        else:
-            # Get most recent valid token for this fabric_host
-            c.execute('''
-                SELECT token_encrypted, token_expires_at
-                FROM nhi_tokens
-                WHERE fabric_host = ? AND token_expires_at > ?
-                ORDER BY token_expires_at DESC
-                LIMIT 1
-            ''', (fabric_host, now.isoformat()))
+        c.execute('''
+            SELECT token_encrypted, token_expires_at
+            FROM system_tokens
+            WHERE fabric_host = ? AND token_expires_at > ?
+            LIMIT 1
+        ''', (fabric_host, now.isoformat()))
         
         token_row = c.fetchone()
         
@@ -461,98 +511,30 @@ def get_access_token_for_host(fabric_host: str, nhi_credential_id: Optional[int]
                         # Token is valid, decrypt it
                         try:
                             decrypted_token = decrypt_with_server_secret(token_encrypted)
-                            # Calculate remaining seconds until expiration
                             remaining_seconds = int((expires_at - now).total_seconds())
-                            logger.debug(f"Found valid cached token for {fabric_host}, expires in {remaining_seconds} seconds")
+                            logger.debug(f"Found valid system token for {fabric_host}, expires in {remaining_seconds} seconds")
                             conn.close()
                             return decrypted_token
                         except Exception as e:
-                            logger.error(f"Failed to decrypt token from nhi_tokens for {fabric_host}: {e}")
+                            logger.error(f"Failed to decrypt system token for {fabric_host}: {e}")
                             conn.close()
                             return None
                     else:
-                        logger.debug(f"Cached token for {fabric_host} has expired")
+                        logger.debug(f"System token for {fabric_host} has expired")
                 except (ValueError, TypeError) as e:
                     logger.error(f"Invalid token expiration date format for {fabric_host}: {e}")
         
         conn.close()
     except Exception as e:
-        logger.error(f"Error retrieving token from nhi_tokens for {fabric_host}: {e}")
+        logger.error(f"Error retrieving system token for {fabric_host}: {e}")
     
     return None
 
-def get_or_create_system_nhi_credential(client_id: str, client_secret: str) -> Optional[int]:
-    """
-    Get or create a system NHI credential for LEAD_FABRIC_HOST background tasks.
-    This allows tokens to be stored and reused across service restarts.
-    
-    Args:
-        client_id: Client ID from environment
-        client_secret: Client secret from environment
-    
-    Returns:
-        NHI credential ID or None if creation fails
-    """
-    if not client_id or not client_secret:
-        return None
-    
-    try:
-        conn = db_connect_with_retry()
-        if not conn:
-            return None
-        
-        c = conn.cursor()
-        
-        # Look for existing system credential with matching client_id
-        c.execute('SELECT id FROM nhi_credentials WHERE client_id = ?', (client_id,))
-        row = c.fetchone()
-        
-        if row:
-            nhi_id = row[0]
-            logger.debug(f"Found existing system NHI credential {nhi_id} for client_id")
-            conn.close()
-            return nhi_id
-        
-        # Create new system credential
-        from .crypto import encrypt_client_secret
-        encryption_password = Config.FS_SERVER_SECRET
-        encrypted_secret = encrypt_client_secret(client_secret, encryption_password)
-        
-        # Use a system name that won't conflict with user-created credentials
-        system_name = f"__SYSTEM_LEAD_{client_id[:8]}__"
-        
-        try:
-            c.execute('''
-                INSERT INTO nhi_credentials (name, client_id, client_secret_encrypted, updated_at)
-                VALUES (?, ?, ?, CURRENT_TIMESTAMP)
-            ''', (system_name, client_id, encrypted_secret))
-            conn.commit()
-            nhi_id = c.lastrowid
-            logger.info(f"Created system NHI credential {nhi_id} for LEAD_FABRIC_HOST background tasks")
-            conn.close()
-            return nhi_id
-        except sqlite3.IntegrityError:
-            # Race condition: another thread created it
-            conn.rollback()
-            c.execute('SELECT id FROM nhi_credentials WHERE client_id = ?', (client_id,))
-            row = c.fetchone()
-            if row:
-                nhi_id = row[0]
-                logger.debug(f"System NHI credential was created by another thread: {nhi_id}")
-                conn.close()
-                return nhi_id
-            conn.close()
-            return None
-    except Exception as e:
-        logger.error(f"Error getting/creating system NHI credential: {e}", exc_info=True)
-        if conn:
-            conn.close()
-        return None
-
 def get_access_token_with_cache(fabric_host: str, client_id: str, client_secret: str) -> Optional[dict]:
     """
-    Get access token for a fabric host, checking cache first before making OAuth2 request.
-    This is used by background tasks to avoid unnecessary token requests.
+    Get access token for a fabric host, checking system_tokens cache first before making OAuth2 request.
+    This is used by background tasks (LEAD_FABRIC_HOST) to avoid unnecessary token requests.
+    System tokens are stored separately from NHI credentials and are never exposed.
     
     Args:
         fabric_host: Fabric host address
@@ -565,48 +547,46 @@ def get_access_token_with_cache(fabric_host: str, client_id: str, client_secret:
     if not fabric_host or not client_id or not client_secret:
         return None
     
-    # First, try to get existing valid token from database
-    token = get_access_token_for_host(fabric_host)
+    # First, try to get existing valid system token from database
+    token = get_system_token(fabric_host)
     if token:
-        logger.info(f"Using cached valid token for {fabric_host} (no OAuth2 request needed)")
+        logger.info(f"Using cached system token for {fabric_host} (no OAuth2 request needed)")
         # Return token data in expected format
         # Note: expires_in is None for cached tokens, but the token is already validated as not expired
         return {"access_token": token, "expires_in": None, "from_cache": True}
     
     # No valid token found, get a new one
-    logger.info(f"No valid cached token found for {fabric_host}, requesting new token from OAuth2 endpoint")
+    logger.info(f"No valid cached system token found for {fabric_host}, requesting new token from OAuth2 endpoint")
     token_data = get_access_token(client_id, client_secret, fabric_host)
     
     if not token_data or not token_data.get("access_token"):
         return None
     
-    # Store the new token in database for future use
+    # Store the new token in system_tokens table (separate from NHI credentials)
     try:
-        nhi_id = get_or_create_system_nhi_credential(client_id, client_secret)
-        if nhi_id:
-            expires_in = token_data.get("expires_in")
-            if expires_in:
-                expires_at = datetime.now() + timedelta(seconds=expires_in)
-                token_expires_at = expires_at.isoformat()
-                token_encrypted = encrypt_with_server_secret(token_data.get("access_token"))
-                
-                conn = db_connect_with_retry()
-                if conn:
-                    try:
-                        c = conn.cursor()
-                        c.execute('''
-                            INSERT OR REPLACE INTO nhi_tokens 
-                            (nhi_credential_id, fabric_host, token_encrypted, token_expires_at, updated_at)
-                            VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
-                        ''', (nhi_id, fabric_host, token_encrypted, token_expires_at))
-                        conn.commit()
-                        logger.debug(f"Stored new token for {fabric_host} (expires at {token_expires_at})")
-                    except Exception as e:
-                        logger.warning(f"Failed to store token for {fabric_host}: {e}")
-                    finally:
-                        conn.close()
+        expires_in = token_data.get("expires_in")
+        if expires_in:
+            expires_at = datetime.now() + timedelta(seconds=expires_in)
+            token_expires_at = expires_at.isoformat()
+            token_encrypted = encrypt_with_server_secret(token_data.get("access_token"))
+            
+            conn = db_connect_with_retry()
+            if conn:
+                try:
+                    c = conn.cursor()
+                    c.execute('''
+                        INSERT OR REPLACE INTO system_tokens 
+                        (fabric_host, token_encrypted, token_expires_at, updated_at)
+                        VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+                    ''', (fabric_host, token_encrypted, token_expires_at))
+                    conn.commit()
+                    logger.debug(f"Stored new system token for {fabric_host} (expires at {token_expires_at})")
+                except Exception as e:
+                    logger.warning(f"Failed to store system token for {fabric_host}: {e}")
+                finally:
+                    conn.close()
     except Exception as e:
-        logger.warning(f"Error storing token for {fabric_host}: {e}")
+        logger.warning(f"Error storing system token for {fabric_host}: {e}")
     
     return token_data
 
@@ -996,7 +976,7 @@ def init_db():
         )
     ''')
     
-    # Create NHI tokens table to store tokens per host
+    # Create NHI tokens table to store tokens per host (user-created NHI credentials only)
     c.execute('''
         CREATE TABLE IF NOT EXISTS nhi_tokens (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1008,6 +988,19 @@ def init_db():
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (nhi_credential_id) REFERENCES nhi_credentials(id) ON DELETE CASCADE,
             UNIQUE(nhi_credential_id, fabric_host)
+        )
+    ''')
+    
+    # Create system_tokens table for internal/system tokens (LEAD_FABRIC_HOST)
+    # These are never exposed and are completely separate from NHI credentials
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS system_tokens (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            fabric_host TEXT NOT NULL UNIQUE,
+            token_encrypted TEXT NOT NULL,
+            token_expires_at TIMESTAMP NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     ''')
     
@@ -1398,6 +1391,8 @@ def init_db():
     c.execute('CREATE INDEX IF NOT EXISTS idx_event_schedules_auto_run_date ON event_schedules(auto_run, event_date)')
     c.execute('CREATE INDEX IF NOT EXISTS idx_nhi_tokens_cred_host ON nhi_tokens(nhi_credential_id, fabric_host)')
     c.execute('CREATE INDEX IF NOT EXISTS idx_nhi_tokens_expires ON nhi_tokens(token_expires_at)')
+    c.execute('CREATE INDEX IF NOT EXISTS idx_system_tokens_host ON system_tokens(fabric_host)')
+    c.execute('CREATE INDEX IF NOT EXISTS idx_system_tokens_expires ON system_tokens(token_expires_at)')
     c.execute('CREATE INDEX IF NOT EXISTS idx_event_executions_event_status ON event_executions(event_id, status)')
     c.execute('CREATE INDEX IF NOT EXISTS idx_event_executions_started_at ON event_executions(started_at DESC)')
     c.execute('CREATE INDEX IF NOT EXISTS idx_sessions_last_used ON sessions(last_used)')

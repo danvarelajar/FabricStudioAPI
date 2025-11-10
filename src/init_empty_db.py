@@ -57,7 +57,7 @@ def init_empty_db():
         )
     ''')
     
-    # Create NHI tokens table
+    # Create NHI tokens table (user-created NHI credentials only)
     c.execute('''
         CREATE TABLE nhi_tokens (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -69,6 +69,19 @@ def init_empty_db():
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (nhi_credential_id) REFERENCES nhi_credentials(id) ON DELETE CASCADE,
             UNIQUE(nhi_credential_id, fabric_host)
+        )
+    ''')
+    
+    # Create system_tokens table for internal/system tokens (LEAD_FABRIC_HOST)
+    # These are never exposed and are completely separate from NHI credentials
+    c.execute('''
+        CREATE TABLE system_tokens (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            fabric_host TEXT NOT NULL UNIQUE,
+            token_encrypted TEXT NOT NULL,
+            token_expires_at TIMESTAMP NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     ''')
     
