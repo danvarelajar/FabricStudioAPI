@@ -3,9 +3,7 @@ let confirmedHosts = []; // Array of {host, port}
 let templates = []; // Array of template objects
 let editingConfigId = null; // Track if we're editing an existing configuration
 let editingEventId = null; // Track if we're editing an existing event
-// Store decrypted NHI credentials in memory (not in DOM)
-let decryptedClientId = '';
-let decryptedClientSecret = '';
+// Session-based: credentials are managed server-side, no need to store client_id/client_secret
 let currentNhiId = null; // Track which NHI credential is currently loaded
 let sessionExpiresAt = null; // Track session expiration time
 let sessionStatusCache = null; // Cache for session status check
@@ -49,163 +47,6 @@ window.addEventListener('unhandledrejection', (event) => {
 });
 
 const el = (id) => document.getElementById(id);
-// Password modal prompt used for NHI password (hidden while typing)
-async function promptForNhiPassword(titleText) {
-  return new Promise((resolve) => {
-    const overlay = document.createElement('div');
-    overlay.style.position = 'fixed';
-    overlay.style.top = '0';
-    overlay.style.left = '0';
-    overlay.style.right = '0';
-    overlay.style.bottom = '0';
-    overlay.style.background = 'rgba(0,0,0,0.4)';
-    overlay.style.display = 'flex';
-    overlay.style.alignItems = 'center';
-    overlay.style.justifyContent = 'center';
-    overlay.style.zIndex = '9999';
-
-    const dialog = document.createElement('div');
-    dialog.style.background = 'white';
-    dialog.style.border = '1px solid #d2d2d7';
-    dialog.style.boxShadow = '0 4px 12px rgba(0,0,0,0.2)';
-    dialog.style.width = '420px';
-    dialog.style.maxWidth = '90%';
-    dialog.style.padding = '16px';
-    dialog.style.borderRadius = '0';
-
-    const title = document.createElement('div');
-    title.textContent = titleText || 'Enter NHI credential password';
-    title.style.fontWeight = '600';
-    title.style.marginBottom = '10px';
-    dialog.appendChild(title);
-
-    const label = document.createElement('label');
-    label.textContent = 'NHI Password';
-    label.style.display = 'block';
-    label.style.marginBottom = '6px';
-    dialog.appendChild(label);
-
-    const input = document.createElement('input');
-    input.type = 'password';
-    input.autocomplete = 'current-password';
-    input.style.width = '100%';
-    input.style.boxSizing = 'border-box';
-    input.style.margin = '0 0 12px 0';
-    input.style.padding = '6px 10px';
-    input.style.border = '1px solid #d2d2d7';
-    input.style.minHeight = '32px';
-    dialog.appendChild(input);
-
-    const actions = document.createElement('div');
-    actions.style.display = 'flex';
-    actions.style.justifyContent = 'flex-end';
-    actions.style.gap = '8px';
-
-    const cancelBtn = document.createElement('button');
-    cancelBtn.type = 'button';
-    cancelBtn.textContent = 'Cancel';
-    cancelBtn.onclick = () => { document.body.removeChild(overlay); resolve(null); };
-
-    const okBtn = document.createElement('button');
-    okBtn.type = 'button';
-    okBtn.textContent = 'OK';
-    okBtn.onclick = () => { const val = input.value; document.body.removeChild(overlay); resolve(val); };
-
-    actions.appendChild(cancelBtn);
-    actions.appendChild(okBtn);
-    dialog.appendChild(actions);
-    overlay.appendChild(dialog);
-    document.body.appendChild(overlay);
-
-    // Focus and submit on Enter/Escape
-    input.focus();
-    input.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter') okBtn.click();
-      if (e.key === 'Escape') cancelBtn.click();
-    });
-  });
-}
-
-// Styled prompt modal
-async function promptStyled(titleText, labelText, inputType = 'text') {
-  return new Promise((resolve) => {
-    const overlay = document.createElement('div');
-    overlay.style.position = 'fixed';
-    overlay.style.top = '0';
-    overlay.style.left = '0';
-    overlay.style.right = '0';
-    overlay.style.bottom = '0';
-    overlay.style.background = 'rgba(0,0,0,0.4)';
-    overlay.style.display = 'flex';
-    overlay.style.alignItems = 'center';
-    overlay.style.justifyContent = 'center';
-    overlay.style.zIndex = '9999';
-
-    const dialog = document.createElement('div');
-    dialog.style.background = 'white';
-    dialog.style.border = '1px solid #d2d2d7';
-    dialog.style.boxShadow = '0 4px 12px rgba(0,0,0,0.2)';
-    dialog.style.width = '420px';
-    dialog.style.maxWidth = '90%';
-    dialog.style.padding = '16px';
-    dialog.style.borderRadius = '0';
-
-    const title = document.createElement('div');
-    title.textContent = titleText || 'Enter value';
-    title.style.fontWeight = '600';
-    title.style.marginBottom = '10px';
-    title.style.color = '#1d1d1f';
-    dialog.appendChild(title);
-
-    const label = document.createElement('div');
-    label.innerHTML = (labelText || 'Value').replace(/\n/g, '<br>');
-    label.style.display = 'block';
-    label.style.marginBottom = '6px';
-    label.style.color = '#424245';
-    label.style.fontSize = '13px';
-    dialog.appendChild(label);
-
-    const input = document.createElement('input');
-    input.type = inputType;
-    input.style.width = '100%';
-    input.style.boxSizing = 'border-box';
-    input.style.margin = '0 0 12px 0';
-    input.style.padding = '6px 10px';
-    input.style.border = '1px solid #d2d2d7';
-    input.style.minHeight = '32px';
-    input.style.fontSize = '13px';
-    input.style.color = '#1d1d1f';
-    dialog.appendChild(input);
-
-    const actions = document.createElement('div');
-    actions.style.display = 'flex';
-    actions.style.justifyContent = 'flex-end';
-    actions.style.gap = '8px';
-
-    const cancelBtn = document.createElement('button');
-    cancelBtn.type = 'button';
-    cancelBtn.textContent = 'Cancel';
-    cancelBtn.onclick = () => { document.body.removeChild(overlay); resolve(null); };
-
-    const okBtn = document.createElement('button');
-    okBtn.type = 'button';
-    okBtn.textContent = 'OK';
-    okBtn.onclick = () => { const val = input.value; document.body.removeChild(overlay); resolve(val); };
-
-    actions.appendChild(cancelBtn);
-    actions.appendChild(okBtn);
-    dialog.appendChild(actions);
-    overlay.appendChild(dialog);
-    document.body.appendChild(overlay);
-
-    // Focus and submit on Enter/Escape
-    input.focus();
-    input.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter') okBtn.click();
-      if (e.key === 'Escape') cancelBtn.click();
-    });
-  });
-}
 
 // Styled alert modal
 function alertStyled(titleText, messageText, isError = false) {
@@ -796,8 +637,6 @@ async function checkSessionStatus() {
 }
 function handleSessionExpired() {
   // Clear any cached data
-  decryptedClientId = '';
-  // Session-based: client_secret is no longer used
   currentNhiId = null;
   sessionExpiresAt = null;
   // Clear session status cache to force fresh check
@@ -1074,8 +913,6 @@ async function loadSelectedNhiCredential() {
         showStatus(`Failed to load NHI credential: ${errorText}`);
       }
       
-      decryptedClientId = '';
-      // Session-based: client_secret is no longer used
       currentNhiId = null;
       sessionExpiresAt = null;
       // Session-based: tokens are managed server-side
@@ -1134,9 +971,7 @@ async function loadSelectedNhiCredential() {
       showStatus('Invalid response format from server');
       return;
     }
-    decryptedClientId = nhiData.client_id || '';
-    // Session-based: client_secret is no longer returned, tokens are managed server-side
-    // decryptedClientSecret is not needed anymore - session handles tokens
+    // Session-based: client_id/client_secret are not needed - tokens are managed server-side
     currentNhiId = parseInt(nhiId);
     
     // Update session with selected NHI credential ID
@@ -1243,8 +1078,6 @@ async function loadSelectedNhiCredential() {
       statusSpan.style.color = '#f87171';
     }
     showStatus(`Error loading NHI credential: ${error.message || error}`);
-    decryptedClientId = '';
-      // Session-based: client_secret is no longer used
     currentNhiId = null;
       sessionExpiresAt = null;
       // Session-based: tokens are managed server-side
@@ -1664,9 +1497,7 @@ function resetPreparationForNewRun() {
     const hostSourceNhi = el('hostSourceNhi');
     if (hostSourceNhi) hostSourceNhi.checked = false;
 
-    // Clear any decrypted/stored credentials and tokens
-    if (typeof decryptedClientId !== 'undefined') decryptedClientId = '';
-    // Session-based: client_secret is no longer used
+    // Clear any stored credentials and tokens
     if (typeof currentNhiId !== 'undefined') currentNhiId = null;
     if (typeof showStatus === 'function') showStatus('Preparation reset');
     // Session-based: tokens are managed server-side, no need to clear local tokens
@@ -1774,7 +1605,7 @@ async function acquireTokens() {
   
   // Check if NHI credential is loaded - if not, try to load it from the UI
   try {
-    if (!currentNhiId || !decryptedClientId) {
+    if (!currentNhiId) {
       const nhiSelect = el('nhiCredentialSelect');
       const selectedId = nhiSelect ? (nhiSelect.value || '') : '';
       if (selectedId) {
@@ -2063,7 +1894,7 @@ function updateCreateEnabled() {
   }
   
   // Check if NHI credentials are loaded
-  const nhiLoaded = currentNhiId && decryptedClientId;
+  const nhiLoaded = !!currentNhiId;
   if (!nhiLoaded) {
     runBtn.disabled = true;
     return;
@@ -2503,10 +2334,6 @@ async function loadSection(sectionName) {
     // Cache the HTML content
     _htmlCache.set(sectionName, html);
     container.innerHTML = html;
-    
-    // Verify content was inserted
-    if (container.children.length > 0) {
-    }
     
     // Wait for DOM to update, then initialize section-specific functionality
     setTimeout(() => {
@@ -3030,7 +2857,6 @@ function displayConfigName(name) {
     } else {
       display.style.display = 'none';
     }
-  } else {
   }
 }
 
@@ -3129,8 +2955,6 @@ function resetPreparationSection() {
   validatedHosts = [];
   if (window.validatedNhiHosts) window.validatedNhiHosts = [];
   // Session-based: tokens are managed server-side, no need to clear local tokens
-  decryptedClientId = '';
-  // Session-based: client_secret is no longer used
   currentNhiId = null;
   
   // Clear fabric host list
@@ -6867,7 +6691,6 @@ async function restoreConfiguration(config) {
     
     // Reset state to ensure fresh start
     currentNhiId = null;
-    decryptedClientId = '';
     confirmedHosts = []; // Clear confirmed hosts
     validatedHosts = [];
     // Clear templates array to ensure fresh state - templates will be re-added when run starts

@@ -1,7 +1,5 @@
-from fastapi import FastAPI, HTTPException, BackgroundTasks, Request, Header, APIRouter
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Request
 from fastapi.responses import FileResponse, JSONResponse
-from fastapi.staticfiles import StaticFiles
-from starlette.types import ASGIApp
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.exceptions import RequestValidationError
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -11,7 +9,7 @@ from contextlib import asynccontextmanager
 import sqlite3
 import json
 import random
-from datetime import datetime, date, time as dt_time, timedelta, timezone
+from datetime import datetime, timedelta, timezone
 import paramiko
 import io
 import threading
@@ -73,8 +71,6 @@ app = FastAPI(
     lifespan=app_lifespan,
 )
 
-# Create API router for versioning
-api_v1 = APIRouter(prefix="/api/v1")
 
 # Rate limiting configuration (using Config)
 RATE_LIMIT_REQUESTS = Config.RATE_LIMIT_REQUESTS
