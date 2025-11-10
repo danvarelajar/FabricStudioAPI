@@ -451,7 +451,6 @@ def get_access_token_for_host(fabric_host: str, nhi_credential_id: Optional[int]
             ''', (fabric_host, now.isoformat()))
         
         token_row = c.fetchone()
-        conn.close()
         
         if token_row:
             token_encrypted, token_expires_at_str = token_row
@@ -462,17 +461,154 @@ def get_access_token_for_host(fabric_host: str, nhi_credential_id: Optional[int]
                         # Token is valid, decrypt it
                         try:
                             decrypted_token = decrypt_with_server_secret(token_encrypted)
+                            # Calculate remaining seconds until expiration
+                            remaining_seconds = int((expires_at - now).total_seconds())
+                            logger.debug(f"Found valid cached token for {fabric_host}, expires in {remaining_seconds} seconds")
+                            conn.close()
                             return decrypted_token
                         except Exception as e:
                             logger.error(f"Failed to decrypt token from nhi_tokens for {fabric_host}: {e}")
+                            conn.close()
                             return None
+                    else:
+                        logger.debug(f"Cached token for {fabric_host} has expired")
                 except (ValueError, TypeError) as e:
                     logger.error(f"Invalid token expiration date format for {fabric_host}: {e}")
-                    return None
+        
+        conn.close()
     except Exception as e:
         logger.error(f"Error retrieving token from nhi_tokens for {fabric_host}: {e}")
     
     return None
+
+def get_or_create_system_nhi_credential(client_id: str, client_secret: str) -> Optional[int]:
+    """
+    Get or create a system NHI credential for LEAD_FABRIC_HOST background tasks.
+    This allows tokens to be stored and reused across service restarts.
+    
+    Args:
+        client_id: Client ID from environment
+        client_secret: Client secret from environment
+    
+    Returns:
+        NHI credential ID or None if creation fails
+    """
+    if not client_id or not client_secret:
+        return None
+    
+    try:
+        conn = db_connect_with_retry()
+        if not conn:
+            return None
+        
+        c = conn.cursor()
+        
+        # Look for existing system credential with matching client_id
+        c.execute('SELECT id FROM nhi_credentials WHERE client_id = ?', (client_id,))
+        row = c.fetchone()
+        
+        if row:
+            nhi_id = row[0]
+            logger.debug(f"Found existing system NHI credential {nhi_id} for client_id")
+            conn.close()
+            return nhi_id
+        
+        # Create new system credential
+        from .crypto import encrypt_client_secret
+        encryption_password = Config.FS_SERVER_SECRET
+        encrypted_secret = encrypt_client_secret(client_secret, encryption_password)
+        
+        # Use a system name that won't conflict with user-created credentials
+        system_name = f"__SYSTEM_LEAD_{client_id[:8]}__"
+        
+        try:
+            c.execute('''
+                INSERT INTO nhi_credentials (name, client_id, client_secret_encrypted, updated_at)
+                VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+            ''', (system_name, client_id, encrypted_secret))
+            conn.commit()
+            nhi_id = c.lastrowid
+            logger.info(f"Created system NHI credential {nhi_id} for LEAD_FABRIC_HOST background tasks")
+            conn.close()
+            return nhi_id
+        except sqlite3.IntegrityError:
+            # Race condition: another thread created it
+            conn.rollback()
+            c.execute('SELECT id FROM nhi_credentials WHERE client_id = ?', (client_id,))
+            row = c.fetchone()
+            if row:
+                nhi_id = row[0]
+                logger.debug(f"System NHI credential was created by another thread: {nhi_id}")
+                conn.close()
+                return nhi_id
+            conn.close()
+            return None
+    except Exception as e:
+        logger.error(f"Error getting/creating system NHI credential: {e}", exc_info=True)
+        if conn:
+            conn.close()
+        return None
+
+def get_access_token_with_cache(fabric_host: str, client_id: str, client_secret: str) -> Optional[dict]:
+    """
+    Get access token for a fabric host, checking cache first before making OAuth2 request.
+    This is used by background tasks to avoid unnecessary token requests.
+    
+    Args:
+        fabric_host: Fabric host address
+        client_id: Client ID
+        client_secret: Client secret
+    
+    Returns:
+        Token data dict with 'access_token' and 'expires_in', or None if failed
+    """
+    if not fabric_host or not client_id or not client_secret:
+        return None
+    
+    # First, try to get existing valid token from database
+    token = get_access_token_for_host(fabric_host)
+    if token:
+        logger.info(f"Using cached valid token for {fabric_host} (no OAuth2 request needed)")
+        # Return token data in expected format
+        # Note: expires_in is None for cached tokens, but the token is already validated as not expired
+        return {"access_token": token, "expires_in": None, "from_cache": True}
+    
+    # No valid token found, get a new one
+    logger.info(f"No valid cached token found for {fabric_host}, requesting new token from OAuth2 endpoint")
+    token_data = get_access_token(client_id, client_secret, fabric_host)
+    
+    if not token_data or not token_data.get("access_token"):
+        return None
+    
+    # Store the new token in database for future use
+    try:
+        nhi_id = get_or_create_system_nhi_credential(client_id, client_secret)
+        if nhi_id:
+            expires_in = token_data.get("expires_in")
+            if expires_in:
+                expires_at = datetime.now() + timedelta(seconds=expires_in)
+                token_expires_at = expires_at.isoformat()
+                token_encrypted = encrypt_with_server_secret(token_data.get("access_token"))
+                
+                conn = db_connect_with_retry()
+                if conn:
+                    try:
+                        c = conn.cursor()
+                        c.execute('''
+                            INSERT OR REPLACE INTO nhi_tokens 
+                            (nhi_credential_id, fabric_host, token_encrypted, token_expires_at, updated_at)
+                            VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+                        ''', (nhi_id, fabric_host, token_encrypted, token_expires_at))
+                        conn.commit()
+                        logger.debug(f"Stored new token for {fabric_host} (expires at {token_expires_at})")
+                    except Exception as e:
+                        logger.warning(f"Failed to store token for {fabric_host}: {e}")
+                    finally:
+                        conn.close()
+    except Exception as e:
+        logger.warning(f"Error storing token for {fabric_host}: {e}")
+    
+    return token_data
 
 # Database setup - use Config module
 DB_PATH = Config.DB_PATH
@@ -7172,8 +7308,8 @@ def refresh_repositories_periodically():
             logger.info(f"Starting periodic repository refresh for {fabric_host}")
             
             try:
-                # Get access token using credentials from .env
-                token_data = get_access_token(client_id, client_secret, fabric_host)
+                # Get access token using credentials from .env, checking cache first
+                token_data = get_access_token_with_cache(fabric_host, client_id, client_secret)
                 
                 if not token_data or not token_data.get("access_token"):
                     error_msg = "Failed to get access token"
@@ -7270,43 +7406,47 @@ def refresh_template_cache_periodically():
             failure_reason = None
 
             try:
-                # Get access token using credentials from .env
-                token_data = get_access_token(client_id, client_secret, fabric_host)
+                # Get access token using credentials from .env, checking cache first
+                logger.debug(f"Requesting access token for {fabric_host}")
+                token_data = get_access_token_with_cache(fabric_host, client_id, client_secret)
 
                 if not token_data or not token_data.get("access_token"):
                     failure_reason = "Failed to get access token"
                     logger.error(f"{failure_reason} for {fabric_host}")
                     logger.warning(f"Template cache refresh skipped for {fabric_host} - host may be unreachable or credentials invalid")
                     logger.warning(f"Check network connectivity, VPN connection, firewall rules, or verify LEAD_FABRIC_HOST is correct")
-                    raise RuntimeError(failure_reason)
-
-                token = token_data.get("access_token")
-
-                # Fetch all templates
-                templates = list_all_templates(fabric_host, token) or []
-
-                if templates:
-                    # Cache the templates
-                    cache_templates(templates)
+                    refresh_status = "failed"
                 else:
-                    logger.warning(f"No templates found for {fabric_host}")
+                    token = token_data.get("access_token")
+                    logger.debug(f"Access token obtained, fetching templates from {fabric_host}")
 
-                refresh_status = "completed"
+                    # Fetch all templates
+                    templates = list_all_templates(fabric_host, token) or []
+
+                    if templates:
+                        # Cache the templates
+                        cache_templates(templates)
+                        logger.info(f"Periodic template cache refresh completed for {fabric_host}: {len(templates)} templates cached")
+                        refresh_status = "completed"
+                    else:
+                        logger.warning(f"No templates found for {fabric_host}")
+                        refresh_status = "completed"  # Still mark as completed even if no templates found
 
             except Exception as e:
                 if failure_reason is None:
                     failure_reason = str(e)
                 logger.error(f"Error refreshing template cache for {fabric_host}: {e}", exc_info=True)
-
-            finally:
-                if refresh_status == "completed":
-                    logger.info(
-                        f"Template cache refresh finished for {fabric_host}: {len(templates)} template(s) cached"
-                    )
-                else:
-                    logger.warning(
-                        f"Template cache refresh for {fabric_host} did not complete successfully: {failure_reason or 'unknown error'}"
-                    )
+                refresh_status = "failed"
+            
+            # Always log final status
+            if refresh_status == "completed":
+                logger.info(
+                    f"Template cache refresh finished for {fabric_host}: {len(templates)} template(s) cached"
+                )
+            else:
+                logger.warning(
+                    f"Template cache refresh for {fabric_host} did not complete successfully: {failure_reason or 'unknown error'}"
+                )
         
         except Exception as e:
             logger.error(f"Error in template cache refresh background task: {e}", exc_info=True)
