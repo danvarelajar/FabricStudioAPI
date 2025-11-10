@@ -764,7 +764,6 @@ def get_token_refresh_lock(host: str) -> threading.Lock:
         if host not in _token_refresh_locks:
             _token_refresh_locks[host] = threading.Lock()
         return _token_refresh_locks[host]
-
 def init_db():
     """Initialize the SQLite database with configurations and event_schedules tables"""
     conn = db_connect_with_retry()
@@ -1529,7 +1528,6 @@ def _audit_log_worker():
         except Exception as e:
             logger.error(f"Error in audit log worker: {e}", exc_info=True)
             time.sleep(0.1)  # Brief pause on error
-
 def _write_audit_batch(batch: list):
     """Write a batch of audit logs to the database"""
     if not batch:
@@ -2325,8 +2323,6 @@ class TemplateReq(BaseModel):
     template_name: str
     repo_name: str
     version: str
-
-
 class CreateFabricReq(BaseModel):
     fabric_host: str
     template_id: int
@@ -3110,7 +3106,6 @@ def get_latest_refresh_status(fabric_host: str):
         return None
     finally:
         conn.close()
-
 # Template cache functions
 def cache_templates(templates: list):
     """
@@ -3882,8 +3877,6 @@ def save_event(req: CreateEventReq, request: Request):
         raise HTTPException(500, f"Database error: {str(e)}")
     finally:
         conn.close()
-
-
 @app.get("/event/list")
 def list_events():
     """List all event schedules"""
@@ -4272,8 +4265,6 @@ def execute_event(event_id: int, background_tasks: BackgroundTasks):
         raise HTTPException(500, f"Database error: {str(e)}")
     finally:
         conn.close()
-
-
 def run_configuration(config_data: dict, event_name: str, event_id: Optional[int] = None):
     """Execute a configuration (same logic as frontend Run button)"""
     
@@ -4894,7 +4885,6 @@ def run_configuration(config_data: dict, event_name: str, event_id: Optional[int
                 ssh_profile_id = int(ssh_profile_id)
             except (ValueError, TypeError):
                 ssh_profile_id = None
-        
         ssh_wait_time = config_data.get('sshWaitTime', 0)  # Get wait time from config (default: 0)
         ssh_execution_details = None  # Track SSH execution details
         if ssh_profile_id:
@@ -5632,7 +5622,6 @@ class SaveSshCommandProfileReq(BaseModel):
     commands: str
     description: Optional[str] = None
     ssh_key_id: Optional[int] = None
-
 @app.post("/ssh-command-profiles/save")
 def save_ssh_command_profile(req: SaveSshCommandProfileReq, request: Request):
     """Save or update an SSH command profile"""
@@ -6383,8 +6372,6 @@ def list_nhi():
         raise HTTPException(500, f"Database error: {str(e)}")
     finally:
         conn.close()
-
-
 @app.get("/nhi/get/{nhi_id}")
 async def get_nhi(nhi_id: int, request: Request):
     """Retrieve an NHI credential by ID - no password required, uses FS_SERVER_SECRET"""
@@ -7150,7 +7137,6 @@ def cleanup_executions_periodically():
         except Exception as e:
             logger.error(f"Error in execution cleanup thread: {e}", exc_info=True)
             time.sleep(3600)  # Wait 1 hour before retrying on error
-
 def refresh_repositories_periodically():
     """Background task to refresh repositories periodically for LEAD_FABRIC_HOST using CLIENT_ID and CLIENT_SECRET from .env"""
     # Run immediately on startup, then wait for interval
@@ -7279,33 +7265,48 @@ def refresh_template_cache_periodically():
             
             logger.info(f"Starting periodic template cache refresh for {fabric_host}")
             
+            templates = []
+            refresh_status = "failed"
+            failure_reason = None
+
             try:
                 # Get access token using credentials from .env
                 token_data = get_access_token(client_id, client_secret, fabric_host)
-                
+
                 if not token_data or not token_data.get("access_token"):
-                    error_msg = "Failed to get access token"
-                    logger.error(f"{error_msg} for {fabric_host}")
+                    failure_reason = "Failed to get access token"
+                    logger.error(f"{failure_reason} for {fabric_host}")
                     logger.warning(f"Template cache refresh skipped for {fabric_host} - host may be unreachable or credentials invalid")
                     logger.warning(f"Check network connectivity, VPN connection, firewall rules, or verify LEAD_FABRIC_HOST is correct")
-                    # Wait for interval before retrying (don't spam retries)
-                    time.sleep(Config.TEMPLATE_CACHE_REFRESH_INTERVAL_HOURS * 60 * 60)
-                    continue
-                
+                    raise RuntimeError(failure_reason)
+
                 token = token_data.get("access_token")
-                
+
                 # Fetch all templates
-                templates = list_all_templates(fabric_host, token)
-                
+                templates = list_all_templates(fabric_host, token) or []
+
                 if templates:
                     # Cache the templates
                     cache_templates(templates)
-                    logger.info(f"Periodic template cache refresh completed for {fabric_host}: {len(templates)} templates cached")
                 else:
                     logger.warning(f"No templates found for {fabric_host}")
-            
+
+                refresh_status = "completed"
+
             except Exception as e:
+                if failure_reason is None:
+                    failure_reason = str(e)
                 logger.error(f"Error refreshing template cache for {fabric_host}: {e}", exc_info=True)
+
+            finally:
+                if refresh_status == "completed":
+                    logger.info(
+                        f"Template cache refresh finished for {fabric_host}: {len(templates)} template(s) cached"
+                    )
+                else:
+                    logger.warning(
+                        f"Template cache refresh for {fabric_host} did not complete successfully: {failure_reason or 'unknown error'}"
+                    )
         
         except Exception as e:
             logger.error(f"Error in template cache refresh background task: {e}", exc_info=True)
@@ -7714,5 +7715,3 @@ async def serve_static_files(file_path: str):
         media_type = "font/woff2"
     
     return FileResponse(full_path, media_type=media_type)
-
-

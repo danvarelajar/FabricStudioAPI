@@ -794,7 +794,6 @@ async function checkSessionStatus() {
     return null;
   }
 }
-
 function handleSessionExpired() {
   // Clear any cached data
   decryptedClientId = '';
@@ -1393,12 +1392,10 @@ function setActionsEnabled(enabled) {
     if (!enabled) runBtn.disabled = true; else updateCreateEnabled();
   }
 }
-
 // Request cache to prevent duplicate calls (for GET requests only)
 const _requestCache = new Map();
 const _requestCacheTimeout = 5000; // Cache for 5 seconds
 const _pendingRequests = new Map(); // Track in-flight requests to deduplicate
-
 // Generic API wrapper with optional params - cookies are included automatically
 async function api(path, options = {}) {
   // Always use current origin as base URL
@@ -2097,7 +2094,6 @@ function updateCreateEnabled() {
   // The Run button will handle Install Workspace first
   runBtn.disabled = !allNonEmpty;
 }
-
 // Helper function to create filtered dropdown (input + datalist)
 function createFilteredDropdown(placeholder, width = '130px') {
   const container = document.createElement('div');
@@ -2570,6 +2566,16 @@ function initializeSection(sectionName) {
 }
 
 function initializePreparationSection() {
+  // Clear actionStatus when initializing preparation section
+  const actionStatus = el('actionStatus');
+  if (actionStatus) {
+    actionStatus.style.display = 'none';
+    const messageEl = el('actionStatusMessage');
+    if (messageEl) messageEl.innerHTML = '';
+    const progressSection = el('actionStatusProgress');
+    if (progressSection) progressSection.style.display = 'none';
+  }
+  
   // Initialize validatedHosts array
   if (typeof validatedHosts === 'undefined') {
     validatedHosts = [];
@@ -2856,7 +2862,6 @@ function initializePreparationSection() {
   updateInstallSelect();
   renderTemplates(false);
 }
-
 function initMenu() {
   const menuItems = document.querySelectorAll('.menu-item');
   
@@ -3521,7 +3526,6 @@ async function viewEventExecutions(eventId) {
     showStatus(`Error loading execution records: ${error.message || error}`);
   }
 }
-
 function showExecutionModal(data) {
   const { event_id, event_name, executions } = data;
   
@@ -4086,7 +4090,6 @@ async function editConfiguration(configId) {
     hideLoadingScreen();
   }
 }
-
 async function populateConfigEditForm(name, config) {
   
   // Set configuration name
@@ -4873,7 +4876,6 @@ function updateEditInstallSelectFromRows(preserveValue) {
   const valueToPreserve = preserveValue !== undefined ? preserveValue : select.value;
   updateEditInstallSelect(templates, valueToPreserve);
 }
-
 function updateEditInstallSelect(templates, selectedValue) {
   const select = el('editInstallSelect');
   if (!select) {
@@ -5512,7 +5514,6 @@ async function loadUsers() {
     usersListEl.innerHTML = `<p style="color: #f87171; font-size: 13px;">Error loading users: ${error.message || error}</p>`;
   }
 }
-
 function showCreateUserDialog() {
   return new Promise((resolve) => {
     const overlay = document.createElement('div');
@@ -5921,7 +5922,6 @@ function hideRunProgress() {
   stopRunTimer();
   runStartTime = null;
 }
-
 // Handler function for run button
 async function handleRunButton() {
   clearConfigName();
@@ -6445,6 +6445,34 @@ async function handleRunButton() {
             logMsg(`Skipping SSH execution on failed hosts: ${failedHostNames}. Executing on ${availableHostsForSsh.length} remaining host(s).`);
           }
           
+          // Capture SSH profile metadata for reporting
+          const sshProfileOption = sshProfileSelect?.options[sshProfileSelect.selectedIndex];
+          let sshProfileNameForRun = sshProfileOption ? sshProfileOption.text : 'N/A';
+          let sshCommandsList = [];
+          try {
+            const sshProfileDetails = await getSshProfileDetailsById(sshProfileId);
+            if (sshProfileDetails) {
+              if (sshProfileDetails.name) {
+                sshProfileNameForRun = sshProfileDetails.name;
+              }
+              if (typeof sshProfileDetails.commands === 'string') {
+                sshCommandsList = sshProfileDetails.commands
+                  .split('\n')
+                  .map(cmd => cmd.trim())
+                  .filter(Boolean);
+              }
+            }
+          } catch (metaError) {
+            logMsg(`Warning: Unable to fetch SSH profile details: ${metaError.message || metaError}`);
+          }
+
+          executionDetails.ssh_profile_info = {
+            profile_id: parseInt(sshProfileId, 10) || null,
+            profile_name: sshProfileNameForRun,
+            wait_time_seconds: sshWaitTime,
+            commands: sshCommandsList
+          };
+
           const sshResults = await executeSshProfiles(availableHostsForSsh, sshProfileId, sshWaitTime);
           const sshSuccessCount = sshResults.filter(r => r.success).length;
           
@@ -6580,12 +6608,10 @@ async function handleRunButton() {
       stopRunTimer();
       return;
     }
-    
     // User is already authenticated via login - proceed
     updateRunProgress(70, `Installing workspace: ${template_name} v${version}`);
     const totalHosts = hosts.length;
     const hostProgressMap = new Map(); // Track individual host progress
-    
     logMsg(`Installing workspace ${template_name} v${version} on ${totalHosts} host(s)`);
     
     // Install on all hosts in parallel
@@ -6712,11 +6738,9 @@ async function handleRunButton() {
         return {host, success: false, error: error.message || error};
       }
     });
-
     const results = await Promise.allSettled(installPromises);
     const settledResults = results.map(r => r.status === 'fulfilled' ? r.value : {host: 'unknown', success: false, error: r.reason?.message || 'Promise rejected'});
     const successCount = settledResults.filter(r => r.success).length;
-    
     // Status is already updated per host in the promise handlers above
     renderTemplates();
     
@@ -6813,6 +6837,16 @@ function collectConfiguration() {
 async function restoreConfiguration(config) {
   // Set flag to prevent button from being enabled during restore
   isRestoringConfiguration = true;
+  
+  // Clear actionStatus when restoring configuration
+  const actionStatus = el('actionStatus');
+  if (actionStatus) {
+    actionStatus.style.display = 'none';
+    const messageEl = el('actionStatusMessage');
+    if (messageEl) messageEl.innerHTML = '';
+    const progressSection = el('actionStatusProgress');
+    if (progressSection) progressSection.style.display = 'none';
+  }
   
   try {
     
@@ -7095,7 +7129,6 @@ async function restoreConfiguration(config) {
       window.cachedTemplates = cachedTemplates;
     } catch (error) {
     }
-    
     // Restore template rows sequentially - use cached templates if API not available
     if (config.templates && config.templates.length > 0) {
       
@@ -7504,10 +7537,8 @@ async function restoreConfiguration(config) {
     if (runWorkspaceEnabledInput) {
       runWorkspaceEnabledInput.checked = config.runWorkspaceEnabled !== false; // Default to true if not specified or false
     }
-    
     // Clear the restoring flag - restore is complete
     isRestoringConfiguration = false;
-    
     // Run button will be enabled when hosts are confirmed and tokens are acquired
     const runBtnFinal = el('btnInstallSelected');
     if (runBtnFinal) {
@@ -7685,7 +7716,6 @@ function cancelEventEdit() {
   
   updateCreateEventButton();
 }
-
 // Set up event schedule button handlers
 function setupEventButtons() {
   const createBtn = el('btnCreateEvent');
@@ -8102,7 +8132,6 @@ function attachRunButtonHandler() {
     runBtn.onclick = handleTrackedRunButton;
   }
 }
-
 // Tracked Run: execute step-by-step with detailed logging and track in Reports
 async function handleTrackedRunButton() {
   let runId = null;
@@ -8782,6 +8811,34 @@ async function handleTrackedRunButton() {
             logMsg(`Skipping SSH execution on failed hosts: ${failedHostNames}. Executing on ${availableHostsForSsh.length} remaining host(s).`);
           }
           
+          // Capture SSH profile metadata for reporting
+          const sshProfileOption = sshProfileSelect?.options[sshProfileSelect.selectedIndex];
+          let sshProfileNameForRun = sshProfileOption ? sshProfileOption.text : 'N/A';
+          let sshCommandsList = [];
+          try {
+            const sshProfileDetails = await getSshProfileDetailsById(sshProfileId);
+            if (sshProfileDetails) {
+              if (sshProfileDetails.name) {
+                sshProfileNameForRun = sshProfileDetails.name;
+              }
+              if (typeof sshProfileDetails.commands === 'string') {
+                sshCommandsList = sshProfileDetails.commands
+                  .split('\n')
+                  .map(cmd => cmd.trim())
+                  .filter(Boolean);
+              }
+            }
+          } catch (metaError) {
+            logMsg(`Warning: Unable to fetch SSH profile details: ${metaError.message || metaError}`);
+          }
+
+          executionDetails.ssh_profile_info = {
+            profile_id: parseInt(sshProfileId, 10) || null,
+            profile_name: sshProfileNameForRun,
+            wait_time_seconds: sshWaitTime,
+            commands: sshCommandsList
+          };
+
           const sshResults = await executeSshProfiles(availableHostsForSsh, sshProfileId, sshWaitTime);
           const sshSuccessCount = sshResults.filter(r => r.success).length;
           
@@ -8816,7 +8873,6 @@ async function handleTrackedRunButton() {
         errors.push(`SSH execution error: ${error.message || error}`);
       }
     }
-    
     // Install the selected workspace (after SSH profiles execute)
     // Check if Run Workspace is enabled
     const runWorkspaceEnabledInput = el('runWorkspaceEnabled');
@@ -8847,6 +8903,32 @@ async function handleTrackedRunButton() {
         password_changes_count: executionDetails.password_changes ? executionDetails.password_changes.length : 0
       };
       
+      const sshProfileInfo = executionDetails.ssh_profile_info;
+      const sshExecutions = executionDetails.ssh_executions || [];
+
+      if ((sshProfileInfo && (sshProfileInfo.profile_id || sshProfileInfo.profile_name || (sshProfileInfo.commands && sshProfileInfo.commands.length > 0))) || sshExecutions.length > 0) {
+        const commandsList = Array.isArray(sshProfileInfo?.commands) ? sshProfileInfo.commands : [];
+        const hostResults = sshExecutions.map(exec => ({
+          host: exec.host,
+          success: exec.success,
+          commands_executed: exec.success ? commandsList.length : 0,
+          commands_failed: exec.success ? 0 : commandsList.length,
+          error: exec.error || null,
+          output: exec.output || null
+        }));
+
+        finalExecutionDetails.ssh_profile = {
+          profile_id: sshProfileInfo?.profile_id ?? null,
+          profile_name: sshProfileInfo?.profile_name || 'N/A',
+          wait_time_seconds: sshProfileInfo?.wait_time_seconds ?? null,
+          commands: commandsList,
+          hosts: hostResults
+        };
+      }
+
+      delete finalExecutionDetails.ssh_executions;
+      delete finalExecutionDetails.ssh_profile_info;
+      
       if (runId) {
         await api(`/run/update/${runId}`, {
           method: 'PUT',
@@ -8863,7 +8945,6 @@ async function handleTrackedRunButton() {
       if (runBtn) runBtn.disabled = false;
       return;
     }
-    
     updateRunProgress(64, 'Preparing to install selected workspace...');
     logMsg('Preparing to install selected workspace...');
     const opt = el('installSelect').value;
@@ -8903,7 +8984,6 @@ async function handleTrackedRunButton() {
     } else {
       [template_name, version] = opt.split('|||');
     }
-    
     // Get repo_name from rows if needed
     if (!repo_name) {
       document.querySelectorAll('.tpl-row').forEach(row => {
@@ -9226,7 +9306,7 @@ async function handleTrackedRunButton() {
     // Transform ssh_executions to ssh_profile format if SSH profile was used
     const sshProfileSelectForReport = el('sshProfileSelect');
     const sshProfileIdForReport = sshProfileSelectForReport?.value;
-    if (sshProfileIdForReport && executionDetails.ssh_executions && executionDetails.ssh_executions.length > 0) {
+    if (sshProfileIdForReport) {
       const sshProfileName = sshProfileSelectForReport?.options[sshProfileSelectForReport.selectedIndex]?.text || 'N/A';
       const sshWaitTimeInput = el('sshWaitTime');
       const sshWaitTime = sshWaitTimeInput ? (parseInt(sshWaitTimeInput.value) || 60) : 60;
@@ -9246,26 +9326,37 @@ async function handleTrackedRunButton() {
         // Ignore errors
       }
       
+      // Build hosts array from ssh_executions if available, otherwise create empty array
+      const sshHosts = executionDetails.ssh_executions && executionDetails.ssh_executions.length > 0
+        ? executionDetails.ssh_executions.map(exec => ({
+            host: exec.host,
+            success: exec.success,
+            commands_executed: exec.success ? sshCommands.length : 0,
+            commands_failed: exec.success ? 0 : sshCommands.length,
+            error: exec.error || null,
+            output: exec.output || null
+          }))
+        : [];
+      
       finalExecutionDetails.ssh_profile = {
         profile_id: parseInt(sshProfileIdForReport),
         profile_name: sshProfileName,
         wait_time_seconds: sshWaitTime,
         commands: sshCommands,
-        hosts: executionDetails.ssh_executions.map(exec => ({
-          host: exec.host,
-          success: exec.success,
-          commands_executed: exec.success ? sshCommands.length : 0,
-          commands_failed: exec.success ? 0 : sshCommands.length,
-          error: exec.error || null,
-          output: exec.output || null
-        }))
+        hosts: sshHosts
       };
       // Remove ssh_executions as we're using ssh_profile now
       delete finalExecutionDetails.ssh_executions;
+      
+      // Debug: Log what we're saving
+      console.log('Saving SSH profile to report:', JSON.stringify(finalExecutionDetails.ssh_profile, null, 2));
     }
     
     if (runId) {
       try {
+        // Debug: Log full execution details being saved
+        console.log('Saving execution_details to report:', JSON.stringify(finalExecutionDetails, null, 2));
+        
         await api(`/run/update/${runId}`, {
           method: 'PUT',
           headers: { 'Content-Type': 'application/json' },
@@ -9285,20 +9376,9 @@ async function handleTrackedRunButton() {
     renderTemplates();
     stopRunTimer();
     
-    // Navigate to Reports after a short delay
+    // Re-enable button after a short delay (keep progress visible, no automatic redirection)
     setTimeout(() => {
-      const reportsMenuItem = document.querySelector('.submenu-item[data-section="reports"]');
-      if (reportsMenuItem) {
-        const group = reportsMenuItem.closest('.menu-group');
-        if (group) group.classList.add('expanded');
-        reportsMenuItem.click();
-        logMsg('Navigating to Reports section...');
-      }
-      
-      setTimeout(() => {
-        hideRunProgress();
-        if (runBtn) runBtn.disabled = false;
-      }, 2000);
+      if (runBtn) runBtn.disabled = false;
     }, 1500);
   } catch (error) {
     const errorMsg = `Run error: ${error.message || error}`;
@@ -9470,7 +9550,6 @@ function attachSaveButtonHandler() {
     saveBtn.onclick = handleSaveConfigButton;
   }
 }
-
 // NHI Management functions
 let editingNhiId = null; // Track if we're editing an existing NHI credential
 
@@ -9604,7 +9683,6 @@ async function loadNhiCredentials() {
     nhiList.innerHTML = `<p style="color: #f87171;">Error loading NHI credentials: ${error.message || error}</p>`;
   }
 }
-
 async function editNhi(nhiId) {
   try {
     showStatus(`Loading NHI credential for editing...`);
@@ -9689,7 +9767,6 @@ function cancelNhiEdit() {
   
   updateNhiButtons();
 }
-
 async function deleteNhi(nhiId) {
   try {
     const res = await api(`/nhi/delete/${nhiId}`, { method: 'DELETE' });
@@ -10256,7 +10333,6 @@ function initSshKeyFormValidation() {
   // Initial check
   updateSshKeyButtons();
 }
-
 function setupSshKeyButtons() {
   const saveBtn = el('btnSaveSshKey');
   if (saveBtn && !saveBtn.onclick) {
@@ -10402,7 +10478,6 @@ let editingSshProfileId = null;
 function isValidSshProfileName(name) {
   return /^[a-zA-Z0-9_-]+$/.test(name);
 }
-
 async function loadSshCommandProfiles() {
   const profilesList = el('sshProfilesList');
   if (!profilesList) return;
@@ -10492,7 +10567,6 @@ async function loadSshCommandProfiles() {
     profilesList.innerHTML = `<p style="color: #f87171;">Error loading SSH command profiles: ${error.message || error}</p>`;
   }
 }
-
 async function editSshCommandProfile(profileId) {
   try {
     showStatus(`Loading SSH command profile for editing...`);
@@ -10790,7 +10864,6 @@ async function deleteSshCommandProfile(profileId) {
     showStatus(`Error deleting SSH command profile: ${error.message || error}`);
   }
 }
-
 // Custom dialog for SSH profile execution
 async function promptSshProfileExecution(profileId, profileName, commandCount) {
   return new Promise((resolve) => {
@@ -11166,21 +11239,11 @@ async function promptSshProfileExecution(profileId, profileName, commandCount) {
     }, 100);
   });
 }
-
 // Run SSH command profile manually
 async function runSshCommandProfile(profileId) {
   try {
     // Get profile details first
-    const res = await api('/ssh-command-profiles/list');
-    if (!res.ok) {
-      showStatus('Failed to load SSH command profile details', { error: true });
-      return;
-    }
-    
-    const data = await res.json();
-    const profiles = data.profiles || [];
-    const profile = profiles.find(p => p.id === profileId);
-    
+    const profile = await getSshProfileDetailsById(profileId);
     if (!profile) {
       showStatus('SSH command profile not found', { error: true });
       return;
@@ -11279,11 +11342,34 @@ async function runSshCommandProfile(profileId) {
     showStatus(`Error running SSH command profile: ${error.message || error}`, { error: true });
   }
 }
-
 // Load SSH profiles for preparation section dropdown
 // Cache for SSH profiles to avoid duplicate calls
 let _sshProfilesCache = null;
 let _sshProfilesLoading = null;
+
+async function getSshProfileDetailsById(profileId) {
+  const parsedId = parseInt(profileId, 10);
+  if (!parsedId) {
+    return null;
+  }
+
+  if (_sshProfilesCache) {
+    const cachedProfile = _sshProfilesCache.find(p => parseInt(p.id, 10) === parsedId);
+    if (cachedProfile && typeof cachedProfile.commands === 'string') {
+      return cachedProfile;
+    }
+  }
+
+  try {
+    const res = await api(`/ssh-command-profiles/get/${parsedId}`);
+    if (!res.ok) {
+      return null;
+    }
+    return await res.json();
+  } catch (error) {
+    return null;
+  }
+}
 
 async function loadSshProfilesForPreparation() {
   const sshProfileSelect = el('sshProfileSelect');
@@ -11568,7 +11654,6 @@ async function exportServerLogs() {
   document.body.removeChild(a);
   window.URL.revokeObjectURL(dl);
 }
-
 function applyFilters() {
   const actionFilter = el('filterAction');
   const userFilter = el('filterUser');
@@ -11619,7 +11704,7 @@ async function loadAuditLogs() {
       url += `&date_from=${encodeURIComponent(currentFilters.date_from)}`;
     }
     if (currentFilters.date_to) {
-      url += `&date_to=${encodeURIComponent(currentFilters.date_to)}`;
+      url += `&date_from=${encodeURIComponent(currentFilters.date_to)}`;
     }
     
     const res = await api(url);
@@ -11783,7 +11868,6 @@ async function loadReports() {
     listEl.innerHTML = `<p style="color: #f87171;">Error loading reports: ${error.message || error}</p>`;
   }
 }
-
 async function showRunReport(runId) {
   const detailView = el('reportDetailView');
   const detailContent = el('reportDetailContent');
@@ -11827,10 +11911,70 @@ async function showRunReport(runId) {
     
     const details = report.execution_details || {};
     
-    // Get sshProfile for use in Host Summary (but don't display standalone section)
-    const sshProfile = details.ssh_profile;
-    
+    // Get sshProfile for display
+    let sshProfile = details.ssh_profile;
+
+    // Legacy support: convert ssh_executions if ssh_profile is missing
+    if (!sshProfile && Array.isArray(details.ssh_executions) && details.ssh_executions.length > 0) {
+      const legacyExecutions = details.ssh_executions;
+      sshProfile = {
+        profile_id: details.ssh_profile_id || null,
+        profile_name: 'SSH Profile',
+        wait_time_seconds: details.ssh_wait_time_seconds || null,
+        commands: [],
+        hosts: legacyExecutions.map(exec => ({
+          host: exec.host,
+          success: exec.success,
+          commands_executed: exec.success ? 0 : 0,
+          commands_failed: exec.success ? 0 : 0,
+          error: exec.error || null,
+          output: exec.output || null
+        }))
+      };
+    }
+
+    // Debug: Log SSH profile data
+    console.log('Report execution_details:', JSON.stringify(details, null, 2));
+    console.log('SSH Profile data (normalized):', JSON.stringify(sshProfile, null, 2));
+
     const hosts = details.hosts || [];
+
+    // SSH Profile Section (standalone, before Host Summary)
+    // Show if sshProfile exists and has any meaningful data
+    if (sshProfile && (sshProfile.profile_id || sshProfile.profile_name || (sshProfile.hosts && sshProfile.hosts.length > 0))) {
+      html += '<h4 style="margin-top: 24px; margin-bottom: 12px;">SSH Profile Execution</h4>';
+      html += '<div style="border: 1px solid #d2d2d7; border-radius: 6px; padding: 16px; background: #fafafa; margin-bottom: 24px;">';
+      html += '<div style="margin-bottom: 12px;">';
+      html += `<div style="font-size: 13px; margin-bottom: 4px;"><strong>Profile:</strong> ${sshProfile.profile_name || 'N/A'} (ID: ${sshProfile.profile_id || 'N/A'})</div>`;
+      html += `<div style="font-size: 13px; margin-bottom: 4px;"><strong>Wait Time:</strong> ${sshProfile.wait_time_seconds || 0} seconds</div>`;
+      html += `<div style="font-size: 13px; margin-bottom: 4px;"><strong>Commands:</strong> ${sshProfile.commands ? sshProfile.commands.length : 0} command(s)</div>`;
+      if (sshProfile.commands && sshProfile.commands.length > 0) {
+        html += '<div style="margin-top: 8px; padding: 8px; background: #f9fafb; border-radius: 4px; font-family: monospace; font-size: 11px;">';
+        html += '<div style="font-weight: 600; margin-bottom: 4px;">Command List:</div>';
+        html += '<ul style="margin: 0; padding-left: 20px;">';
+        sshProfile.commands.forEach(cmd => {
+          html += `<li style="margin-bottom: 2px;">${cmd}</li>`;
+        });
+        html += '</ul></div>';
+      }
+      html += '</div>';
+      
+      if (sshProfile.hosts && sshProfile.hosts.length > 0) {
+        html += '<div style="margin-top: 12px; padding-top: 12px; border-top: 1px solid #d2d2d7;">';
+        html += '<div style="font-weight: 600; margin-bottom: 8px; font-size: 13px;">Host Results:</div>';
+        html += '<ul style="margin: 0; padding-left: 20px; font-size: 12px;">';
+        sshProfile.hosts.forEach(h => {
+          const statusIcon = h.success ? '✓' : '✗';
+          const statusColor = h.success ? '#10b981' : '#ef4444';
+          html += `<li style="margin-bottom: 4px;">
+            <span style="color: ${statusColor}; font-weight: bold;">${statusIcon}</span>
+            <code>${h.host}</code>: ${h.commands_executed || 0} executed, ${h.commands_failed || 0} failed${h.error ? ` - ${h.error}` : ''}
+          </li>`;
+        });
+        html += '</ul></div>';
+      }
+      html += '</div>';
+    }
     
     if (hosts.length > 0) {
       html += '<h4 style="margin-top: 24px; margin-bottom: 12px;">Host Summary</h4>';
