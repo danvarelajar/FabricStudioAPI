@@ -5,18 +5,19 @@ A FastAPI-based web application for managing FabricStudio configurations, NHI cr
 ## Features
 
 - **User Authentication**: Secure user authentication with encrypted password storage
-- **FabricStudio Runs**: Configure and manage FabricStudio hosts, authenticate, and create/run workspaces
+- **FabricStudio Runs**: Unified configuration management - create, edit, save, and run FabricStudio configurations without needing to contact hosts
 - **SSH Profile Execution**: Execute SSH commands on fabric hosts before workspace installation, with configurable wait times between commands
 - **NHI Management**: Store and manage NHI credentials with encrypted client secrets
 - **SSH Key Management**: Securely store and manage SSH key pairs (public and encrypted private keys)
 - **SSH Command Profiles**: Create reusable SSH command profiles with optional SSH key association
 - **Session-Based Token Management**: Secure server-side token storage with automatic refresh
 - **Automatic Token Refresh**: Tokens refresh automatically before expiration (proactive and on-demand)
-- **Configuration Management**: Save, load, and edit FabricStudio configurations
+- **Configuration Management**: Save, load, edit, and run FabricStudio configurations with automatic cache management for fresh data
 - **Event Scheduling**: Schedule automated tasks with date and time support, including validation to prevent past scheduling
 - **Execution History**: Track detailed execution history for scheduled events, including SSH command execution results
+- **Run Reports**: View detailed reports with Host Summary and SSH Profile Execution results
 - **Template Caching**: Cache templates for faster access
-- **Expert Mode Logging**: Detailed logging with timestamps for debugging
+- **Progress Logging**: Essential progress logging with timestamps for tracking installation progress
 - **Modern UI**: Clean, responsive interface with Inter font family and styled navigation menu
 
 ## Setup
@@ -410,8 +411,7 @@ FabricStudioAPI/
 │   ├── index.html        # Main HTML file
 │   ├── app.js            # Frontend JavaScript
 │   ├── styles.css        # Stylesheet
-│   ├── preparation.html  # FabricStudio Runs section
-│   ├── configurations.html # Configurations section
+│   ├── configurations.html # Unified Configurations section (create, edit, list, and run configurations)
 │   ├── event-schedule.html # Event Schedule section
 │   ├── nhi-management.html # NHI Management section
 │   ├── ssh-command-profiles.html # SSH Command Profiles section
