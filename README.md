@@ -53,30 +53,27 @@ The application will be available at `http://localhost:8000` (or the port config
 
 ### Initial Users
 
-On first deployment, the application automatically creates initial users defined in `scripts/create_users.py`. By default, the following user is created:
+**Users are NOT created automatically.** You must create users manually after the first deployment.
 
-- **Username**: `admin`
-- **Password**: `FortinetAssistant1!`
+**To create initial users:**
 
-**To customize initial users:**
-1. Edit `scripts/create_users.py`
-2. Modify the `INITIAL_USERS` list with your desired usernames and passwords
-3. Rebuild and restart the container:
+1. **Edit `scripts/create_users.py`** to customize which users to create:
+   - Modify the `INITIAL_USERS` list with your desired usernames and passwords
+   - Default user: `admin` with password `FortinetAssistant1!`
+
+2. **Run the user creation script:**
    ```bash
-   docker-compose down
-   docker-compose build
-   docker-compose up -d
+   python scripts/create_users.py
    ```
 
-**To manually create or update users:**
-```bash
-docker-compose exec fabricstudio-api python scripts/create_users.py
-```
+   The script will create users defined in `INITIAL_USERS` if they don't already exist. It will not modify existing users.
 
 **To reset a user password:**
 ```bash
-docker-compose exec fabricstudio-api python scripts/reset_user_password.py <username>
+python scripts/reset_user_password.py <username>
 ```
+
+**Note:** The user creation script can be run multiple times safely - it only creates users that don't exist and won't overwrite existing users.
 
 ## Container Deployment
 
@@ -197,8 +194,6 @@ docker-compose logs -f fabricstudio-api
 **Execute commands in container:**
 ```bash
 docker-compose exec fabricstudio-api <command>
-# Example:
-docker-compose exec fabricstudio-api python scripts/create_users.py
 ```
 
 ### Troubleshooting

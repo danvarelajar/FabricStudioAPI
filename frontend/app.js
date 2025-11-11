@@ -1119,7 +1119,76 @@ async function loadSelectedNhiCredential() {
 // Default API base to the current page origin to avoid cross-origin mismatches (localhost vs 127.0.0.1)
 // Initialize global state variables
 let validatedHosts = [];
+let isRunInProgress = false;
 if (!window.validatedNhiHosts) window.validatedNhiHosts = [];
+
+const RUN_WARNING_ELEMENT_ID = 'runInProgressWarning';
+
+function showRunInProgressWarning() {
+  let warning = document.getElementById(RUN_WARNING_ELEMENT_ID);
+  const actionStatus = el('actionStatus');
+
+  if (!warning) {
+    warning = document.createElement('div');
+    warning.id = RUN_WARNING_ELEMENT_ID;
+    warning.style.marginTop = '8px';
+    warning.style.padding = '10px 12px';
+    warning.style.border = '1px solid #d2d2d7';
+    warning.style.background = '#f5f5f7';
+    warning.style.color = '#1d1d1f';
+    warning.style.fontSize = '13px';
+    warning.style.fontWeight = '500';
+    warning.style.borderRadius = '0';
+    warning.style.display = 'none';
+    warning.style.lineHeight = '1.5';
+    warning.style.fontFamily = "'Inter', ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, 'Helvetica Neue', Arial, 'Noto Sans', 'Liberation Sans', sans-serif";
+    warning.style.boxSizing = 'border-box';
+    warning.innerHTML = '<span style="color: #b45309; font-weight: 600;">⚠</span> Do not navigate away from this page while the installation is running.';
+
+    // Place warning near actionStatus if it exists, otherwise near Run button
+    if (actionStatus && actionStatus.parentElement) {
+      actionStatus.parentElement.insertBefore(warning, actionStatus);
+    } else {
+      const runBtn = el('btnInstallSelected');
+      if (runBtn && runBtn.parentElement) {
+        runBtn.parentElement.appendChild(warning);
+      } else {
+        document.body.appendChild(warning);
+      }
+    }
+  }
+
+  // Match the width of actionStatus
+  if (actionStatus) {
+    const actionStatusWidth = actionStatus.offsetWidth || actionStatus.clientWidth;
+    if (actionStatusWidth > 0) {
+      warning.style.width = actionStatusWidth + 'px';
+    } else {
+      // If actionStatus is not visible yet, use its computed style
+      const computedStyle = window.getComputedStyle(actionStatus);
+      if (computedStyle.width && computedStyle.width !== 'auto') {
+        warning.style.width = computedStyle.width;
+      } else {
+        // Fallback: match the container width
+        if (actionStatus.parentElement) {
+          warning.style.width = '100%';
+        }
+      }
+    }
+  } else {
+    // Fallback if actionStatus doesn't exist
+    warning.style.width = '100%';
+  }
+
+  warning.style.display = 'block';
+}
+
+function hideRunInProgressWarning() {
+  const warning = document.getElementById(RUN_WARNING_ELEMENT_ID);
+  if (warning) {
+    warning.style.display = 'none';
+  }
+}
 
 // Note: Preparation section initialization is now in initializePreparationSection()
 // which is called when the preparation section is loaded
@@ -1141,7 +1210,6 @@ function showStatus(msg, opts = {}) {
   const messageEl = el('actionStatusMessage');
   if (!box || !messageEl) return;
   
-  // Update message
   messageEl.innerHTML = msg.replace(/\n/g, '<br>');
   box.style.display = '';
   
@@ -1170,8 +1238,9 @@ function showStatus(msg, opts = {}) {
   logMsg(msg);
   if (opts.hideAfterMs) {
     const ms = opts.hideAfterMs;
+    const messageHtml = msg.replace(/\n/g, '<br>');
     setTimeout(() => { 
-      if (messageEl.innerHTML === msg.replace(/\n/g, '<br>')) {
+      if (messageEl.innerHTML === messageHtml) {
         box.style.display = 'none';
         if (progressSection) progressSection.style.display = 'none';
       }
@@ -1582,7 +1651,6 @@ document.addEventListener('DOMContentLoaded', () => {
     };
   }
 });
-
 // Delegate reset click in case the button is injected after DOMContentLoaded
 document.addEventListener('click', (e) => {
   const target = e.target;
@@ -1592,7 +1660,6 @@ document.addEventListener('click', (e) => {
     if (typeof showStatus === 'function') showStatus('Preparation reset');
   }
 });
-
 // Token acquisition function (now called from Install Workspace)
 async function acquireTokens() {
   // Auto-confirm hosts if not already confirmed
@@ -1625,8 +1692,6 @@ async function acquireTokens() {
   await renderFabricHostList();
   return true;
 }
-
-// cacheAllTemplates() function removed - cache population is no longer used
 
 function updateInstallSelect() {
   const select = el('installSelect');
@@ -1691,6 +1756,12 @@ function updateInstallSelect() {
   const hasOptions = select.options.length > 0;
   const installBtn = el('btnInstallSelected');
   if (installBtn) {
+    // If a run is in progress, always keep the button disabled
+    if (isRunInProgress) {
+      installBtn.disabled = true;
+      return;
+    }
+    
     // Button should only be enabled if:
     // 1. Hosts are confirmed (auto-confirmed when available)
     // 2. AND (there are options OR all rows are filled)
@@ -1868,6 +1939,11 @@ let isRestoringConfiguration = false;
 function updateCreateEnabled() {
   const runBtn = el('btnInstallSelected');
   if (!runBtn) return;
+  
+  if (isRunInProgress) {
+    runBtn.disabled = true;
+    return;
+  }
   
   // If we're bypassing gating conditions (configuration was loaded), always enable the button
   if (bypassGatingConditions) {
@@ -2343,7 +2419,6 @@ async function loadSection(sectionName) {
     container.innerHTML = `<div class="content-section"><p style="color: #f87171;">Error loading ${sectionName} section: ${error.message}</p></div>`;
   }
 }
-
 function initializeSection(sectionName) {
   // Section-specific initialization
   if (sectionName === 'configurations') {
@@ -3114,7 +3189,6 @@ function utcToLocal(dateStr, timeStr) {
     return { date: dateStr, time: timeStr || null };
   }
 }
-
 // Load and display events
 async function loadEvents() {
   if (!eventsList) return;
@@ -3190,7 +3264,7 @@ async function loadEvents() {
             }
           } else {
             // Fallback to native Date
-            const utcTimePart = (event.event_time && event.event_time.trim()) ? event.event_time.trim() + ':00' : '00:00:00';
+            const utcTimePart = (event.event_time && event.event_time.trim()) ? event.event_time.trim() + ':00:00' : '00:00:00';
             const utcDateTimeStr = event.event_date + 'T' + utcTimePart + 'Z';
             const utcDateObj = new Date(utcDateTimeStr);
             
@@ -5516,6 +5590,10 @@ function showCreateUserDialog() {
           const data = await res.json();
           showUserManagementStatus(data.message || 'User created successfully');
           closeDialog();
+          // Clear API cache for /user/list to ensure fresh data
+          const cacheKey = '/user/list?';
+          _requestCache.delete(cacheKey);
+          _pendingRequests.delete(cacheKey);
           await loadUsers(); // Refresh users list
           resolve({ username, password });
         } else {
@@ -5587,6 +5665,10 @@ async function deleteUser(userId, username) {
     if (res.ok) {
       const data = await res.json();
       showUserManagementStatus(data.message || `User '${username}' deleted successfully`);
+      // Clear API cache for /user/list to ensure fresh data
+      const cacheKey = '/user/list?';
+      _requestCache.delete(cacheKey);
+      _pendingRequests.delete(cacheKey);
       await loadUsers(); // Refresh users list
     } else {
       const error = await res.json().catch(() => ({ detail: 'Failed to delete user' }));
@@ -5757,8 +5839,14 @@ async function handleRunButton() {
     return;
   }
   
-  const runBtn = el('btnInstallSelected');
+  runBtn = runBtn || el('btnInstallSelected');
   if (runBtn) runBtn.disabled = true;
+  if (saveBtn) saveBtn.disabled = true;
+  
+  isRunInProgress = true;
+  showRunInProgressWarning();
+  showStatus('Installation started.');
+  
   updateRunProgress(0, 'Starting...');
   startRunTimer();
   
@@ -6433,7 +6521,6 @@ async function handleRunButton() {
     const totalHosts = hosts.length;
     const hostProgressMap = new Map(); // Track individual host progress
     logMsg(`Installing workspace ${template_name} v${version} on ${totalHosts} host(s)`);
-    
     // Install on all hosts in parallel
     const installPromises = installTargets.map(async ({target, host}, hostIdx) => {
       try {
@@ -6583,7 +6670,6 @@ async function handleRunButton() {
   } finally {
     // Re-enable button - check if we have options in dropdown or filled rows
     updateInstallSelect(); // This will update button state
-    const runBtn = el('btnInstallSelected');
     if (runBtn && runBtn.disabled) {
       // Make sure button isn't stuck disabled
       const rows = Array.from(document.querySelectorAll('.tpl-row'));
@@ -6657,6 +6743,7 @@ function collectConfiguration() {
 async function restoreConfiguration(config) {
   // Set flag to prevent button from being enabled during restore
   isRestoringConfiguration = true;
+  const runBtn = el('btnInstallSelected');
   
   // Clear actionStatus when restoring configuration
   const actionStatus = el('actionStatus');
@@ -6684,7 +6771,6 @@ async function restoreConfiguration(config) {
     
     // IMPORTANT: Disable Run button immediately when loading configuration
     // It will be enabled when hosts are available and tokens are acquired
-    const runBtn = el('btnInstallSelected');
     if (runBtn) {
       runBtn.disabled = true;
     }
@@ -6817,14 +6903,12 @@ async function restoreConfiguration(config) {
           showStatus('Error loading NHI credential for configuration');
           logMsg(`Error loading NHI credential: ${e.message || e}`);
           // Keep Run button disabled on error
-          const runBtnError = el('btnInstallSelected');
-          if (runBtnError) runBtnError.disabled = true;
+          if (runBtn) runBtn.disabled = true;
         }
       }
     } else {
       // No NHI credential in config - keep Run button disabled
-      const runBtnNoNhi = el('btnInstallSelected');
-      if (runBtnNoNhi) runBtnNoNhi.disabled = true;
+      if (runBtn) runBtn.disabled = true;
     }
     const newHostnameInput = el('newHostname');
     if (newHostnameInput && config.newHostname !== undefined) {
@@ -7962,8 +8046,33 @@ async function handleTrackedRunButton() {
   };
   let hosts = []; // Declare hosts at function scope so it's accessible in catch block
   
+  let runBtn = el('btnInstallSelected');
+  const saveBtn = el('btnSaveConfig');
+
+  // Helper function to clean up run state (but keep Run button disabled)
+  const cleanupRunState = () => {
+    hideRunInProgressWarning();
+    if (saveBtn) saveBtn.disabled = false;
+    hideRunProgress();
+    stopRunTimer();
+  };
+  
+  // Helper function to fully complete the run and re-enable Run button
+  const completeRun = () => {
+    isRunInProgress = false;
+    cleanupRunState();
+    if (runBtn) runBtn.disabled = false;
+  };
+
+  if (runBtn) runBtn.disabled = true;
+  if (saveBtn) saveBtn.disabled = true;
+
+  isRunInProgress = true;
+  showRunInProgressWarning();
+  showStatus('Installation started.');
+  
   try {
-    const runBtn = el('btnInstallSelected');
+    runBtn = runBtn || el('btnInstallSelected');
     if (runBtn) runBtn.disabled = true;
     
     // Show expert mode output during run
@@ -8006,6 +8115,14 @@ async function handleTrackedRunButton() {
       // Hosts are now confirmed, continue
     } else {
       showStatus('No hosts configured. Please add at least one valid host.');
+      if (runId) {
+        await api(`/run/update/${runId}`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ status: 'error', message: 'No hosts configured', errors: ['No hosts configured'] })
+        });
+      }
+      completeRun();
       return;
     }
       if (runId) {
@@ -8015,9 +8132,7 @@ async function handleTrackedRunButton() {
           body: JSON.stringify({ status: 'error', message: 'No hosts configured', errors: ['No hosts configured'] })
         });
       }
-      hideRunProgress();
-      stopRunTimer();
-      if (runBtn) runBtn.disabled = false;
+      completeRun();
       return;
     }
     
@@ -8054,9 +8169,7 @@ async function handleTrackedRunButton() {
           body: JSON.stringify({ status: 'error', message: 'No templates found', errors: ['No workspace templates found in rows'] })
         });
       }
-      hideRunProgress();
-      stopRunTimer();
-      if (runBtn) runBtn.disabled = false;
+      completeRun();
       return;
     }
     
@@ -8249,7 +8362,7 @@ async function handleTrackedRunButton() {
               })
             });
           }
-          if (runBtn) runBtn.disabled = false;
+          completeRun();
           return;
         }
         
@@ -8566,7 +8679,7 @@ async function handleTrackedRunButton() {
               })
             });
           }
-          if (runBtn) runBtn.disabled = false;
+          completeRun();
           return;
         }
         
@@ -8759,7 +8872,7 @@ async function handleTrackedRunButton() {
         });
       }
       
-      if (runBtn) runBtn.disabled = false;
+      completeRun();
       return;
     }
     updateRunProgress(64, 'Preparing to install selected workspace...');
@@ -8791,7 +8904,7 @@ async function handleTrackedRunButton() {
               })
             });
           }
-          if (runBtn) runBtn.disabled = false;
+          completeRun();
           return;
         }
         const first = created[0];
@@ -8837,7 +8950,7 @@ async function handleTrackedRunButton() {
           })
         });
       }
-      if (runBtn) runBtn.disabled = false;
+      completeRun();
       return;
     }
     
@@ -8900,7 +9013,7 @@ async function handleTrackedRunButton() {
           })
         });
       }
-      if (runBtn) runBtn.disabled = false;
+      completeRun();
       return;
     }
     
@@ -9193,16 +9306,11 @@ async function handleTrackedRunButton() {
     renderTemplates();
     stopRunTimer();
     
-    // Re-enable button after a short delay (keep progress visible, no automatic redirection)
-    setTimeout(() => {
-      if (runBtn) runBtn.disabled = false;
-    }, 1500);
+    completeRun();
   } catch (error) {
     const errorMsg = `Run error: ${error.message || error}`;
     showStatus(errorMsg, { error: true, showProgress: false });
     logMsg(errorMsg);
-    hideRunProgress();
-    stopRunTimer();
     
     // Update run record with error
     if (runId) {
@@ -9234,27 +9342,9 @@ async function handleTrackedRunButton() {
       }
     }
     
-    const runBtn = el('btnInstallSelected');
-    if (runBtn) runBtn.disabled = false;
+    completeRun();
   } finally {
     updateInstallSelect();
-    const runBtn = el('btnInstallSelected');
-    if (runBtn && runBtn.disabled) {
-      const rows = Array.from(document.querySelectorAll('.tpl-row'));
-      const allFilled = rows.length > 0 && rows.every(r => {
-        const selects = r.querySelectorAll('select');
-        const repoSelect = selects[0];
-        const templateFiltered = r._templateFiltered;
-        const versionSelect = selects.length > 2 ? selects[selects.length - 1] : (selects[1] || null);
-        const repo_name = repoSelect?.value || '';
-        const template_name = templateFiltered ? templateFiltered.getValue() : '';
-        const version = versionSelect?.value || '';
-        return repo_name && template_name && version;
-      });
-      if (allFilled) {
-        runBtn.disabled = false;
-      }
-    }
   }
 }
 

@@ -793,7 +793,6 @@ def validate_fabric_host(host: str) -> str:
             raise HTTPException(400, "Invalid host format")
 
     return host
-
 def validate_template_name(name: str) -> str:
     """Validate template name format (allows spaces)"""
     if not name or len(name) > 100:
@@ -1447,31 +1446,14 @@ def init_db():
     conn.commit()
     conn.close()
     
-    # Create initial users if they don't exist (using create_user function for consistency)
-    # Users are defined in scripts/create_users.py - import and use that logic
-    try:
-        import sys
-        import os
-        # Add project root to path to allow importing scripts
-        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        if project_root not in sys.path:
-            sys.path.insert(0, project_root)
-        from scripts.create_users import ensure_initial_users
-        ensure_initial_users()
-    except (ImportError, Exception) as e:
-        # Fallback: if script can't be imported, use direct creation
-        logger.warning(f"Could not import create_users script ({e}), using fallback user creation")
-        initial_users = [
-            ("admin", "FortinetAssistant1!")
-        ]
-        for username, password in initial_users:
-            try:
-                user = get_user_by_username(username)
-                if not user:
-                    create_user(username, password)
-                    logger.info(f"Created initial user: {username}")
-            except Exception as e:
-                logger.warning(f"Failed to create initial user {username}: {e}")
+    # Note: Initial users are NOT created automatically.
+    # To create users manually, use the create_users.py script:
+    #   python scripts/create_users.py
+    # Or run it inside a Docker container:
+    #   docker-compose exec fabricstudio-api python scripts/create_users.py
+    # 
+    # The script will create users defined in scripts/create_users.py (INITIAL_USERS list)
+    # if they don't already exist. Edit scripts/create_users.py to customize initial users.
 
 # Encryption/Decryption functions for NHI credentials
 def derive_key_from_password(password: str, salt: bytes = None) -> bytes:
@@ -1580,7 +1562,6 @@ def get_user_by_username(username: str) -> Optional[dict]:
         }
     finally:
         conn.close()
-
 def create_user(username: str, password: str) -> int:
     """Create a new user"""
     conn = db_connect_with_retry()
@@ -2368,7 +2349,6 @@ def root():
         "Pragma": "no-cache",
         "Expires": "0",
     })
-
 # Global no-cache for HTML/JSON/JS/CSS responses to avoid stale frontend
 @app.middleware("http")
 async def add_no_cache_headers(request, call_next):
@@ -3158,7 +3138,6 @@ def cache_repositories(fabric_host: str, repositories: list):
         conn.rollback()
     finally:
         conn.close()
-
 def log_repository_refresh(fabric_host: str, status: str, error_message: str = None, repositories_count: int = None):
     """Log repository refresh operation"""
     conn = db_connect_with_retry()
@@ -3787,8 +3766,6 @@ class EventListItem(BaseModel):
     configuration_name: str
     created_at: str
     updated_at: str
-
-
 @app.post("/event/save")
 def save_event(req: CreateEventReq, request: Request):
     """Save an event schedule"""
@@ -6424,20 +6401,22 @@ def save_nhi(req: SaveNhiReq, request: Request):
 
 
 @app.get("/nhi/list")
-def list_nhi():
+def list_nhi(background_tasks: BackgroundTasks):
     """List all NHI credentials (without decrypting secrets). Automatically refreshes expired tokens."""
-    # First, refresh any expired tokens proactively
+    # Schedule token refresh so it runs after the response is sent
     try:
-        refresh_nhi_tokens()
+        background_tasks.add_task(refresh_nhi_tokens)
     except Exception as e:
-        logger.warning(f"Error refreshing NHI tokens in list endpoint: {e}")
-    
-    conn = db_connect_with_retry()
-    if not conn:
-        raise HTTPException(500, "Database connection failed")
-    c = conn.cursor()
-    
+        logger.warning(f"Failed to schedule NHI token refresh in list endpoint: {e}")
+
+    conn = None
     try:
+        conn = db_connect_with_retry()
+        if not conn:
+            logger.error("Failed to connect to database in /nhi/list endpoint")
+            raise HTTPException(status_code=500, detail="Database connection failed")
+        c = conn.cursor()
+        
         c.execute('''
             SELECT id, name, client_id, created_at, updated_at
             FROM nhi_credentials
@@ -6466,7 +6445,6 @@ def list_nhi():
                 token_status = "Expired"
                 if token_expires_at:
                     try:
-                        from datetime import datetime
                         expires_at = datetime.fromisoformat(token_expires_at)
                         now = datetime.now()
                         if expires_at > now:
@@ -6478,7 +6456,8 @@ def list_nhi():
                                 token_status = f"{hours}h {minutes}m"
                             else:
                                 token_status = f"{minutes}m"
-                    except:
+                    except Exception as e:
+                        logger.debug(f"Error parsing token expiration for host {fabric_host}: {e}")
                         pass
                 
                 hosts_with_tokens.append({
@@ -6494,11 +6473,22 @@ def list_nhi():
                 "created_at": row[3],
                 "updated_at": row[4]
             })
-        return {"credentials": credentials}
+        return JSONResponse(content={"credentials": credentials})
+    except HTTPException:
+        raise
     except sqlite3.Error as e:
-        raise HTTPException(500, f"Database error: {str(e)}")
+        logger.error(f"Database error in /nhi/list endpoint: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+    except Exception as e:
+        logger.error(f"Unexpected error in /nhi/list endpoint: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
     finally:
-        conn.close()
+        if conn:
+            try:
+                conn.close()
+            except Exception as e:
+                logger.warning(f"Error closing database connection in /nhi/list: {e}")
+
 @app.get("/nhi/get/{nhi_id}")
 async def get_nhi(nhi_id: int, request: Request):
     """Retrieve an NHI credential by ID - no password required, uses FS_SERVER_SECRET"""

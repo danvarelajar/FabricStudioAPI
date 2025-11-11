@@ -1,4 +1,5 @@
 import base64
+import socket
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -8,6 +9,21 @@ logger = logging.getLogger(__name__)
 
 # Create a session with connection pooling and retry strategy
 _session = None
+
+
+def _is_host_reachable(host: str, port: int = 443, timeout: float = 5.0) -> bool:
+    """Quick reachability check to fail fast when the Fabric host is down."""
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError as exc:
+        logger.error(
+            "Fabric host %s:%s is not reachable (reachability check failed: %s)",
+            host,
+            port,
+            exc,
+        )
+        return False
 
 def get_session():
     """Get or create a requests session with connection pooling"""
@@ -76,6 +92,13 @@ def get_access_token(client_id, client_secret, fabric_host):
     logger.debug(f"OAuth2 URL: {url}")
     logger.debug(f"Request headers: {list(headers.keys())}")
     logger.debug(f"Request data: grant_type=client_credentials")
+
+    if not _is_host_reachable(fabric_host):
+        logger.error(
+            "Skipping access token request for %s because the host is unreachable",
+            fabric_host,
+        )
+        return None
     
     session = get_session()
     try:
