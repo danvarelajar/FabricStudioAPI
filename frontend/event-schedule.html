@@ -1,6 +1,12 @@
 <div id="event-schedule-section" class="content-section">
   <h3>Event Schedule</h3>
-  <div style="border: 1px solid #d2d2d7; padding: 16px; border-radius: 4px; background: #fafafa; margin-bottom: 20px;">
+  <div id="eventCalendarContainer" style="margin-bottom: 30px;"></div>
+  <div class="row" style="margin-bottom: 20px;">
+    <button id="btnShowCreateEventForm">Create Event</button>
+    <button id="btnRefreshEvents" style="margin-left: 8px;">Refresh</button>
+    <button id="btnDeleteEvent" style="display:none; margin-left: 8px;">Delete Selected</button>
+  </div>
+  <div id="eventFormContainer" style="display: none; border: 1px solid #d2d2d7; padding: 16px; border-radius: 4px; background: #fafafa; margin-bottom: 20px;">
     <h4 style="margin-top: 0; margin-bottom: 12px; font-size: 14px; font-weight: 600;">Create New Event</h4>
     <div class="row">
       <label style="width: 120px;">Event Name</label>
@@ -17,9 +23,24 @@
       <span id="eventTimeError" style="font-size: 12px; color: #f87171; margin-left: 8px; display: none;"></span>
     </div>
     <div class="row">
+      <label style="width: 120px;">Type</label>
+      <select id="eventTypeSelect" style="width: 300px;">
+        <option value="">Select type (optional)...</option>
+        <option value="SME">SME</option>
+        <option value="Xperts">Xperts</option>
+        <option value="Partners">Partners</option>
+        <option value="Customers">Customers</option>
+        <option value="Others">Others</option>
+      </select>
+    </div>
+    <div class="row">
+      <label style="width: 120px;">Description</label>
+      <textarea id="eventDescription" rows="4" cols="40" placeholder="Enter description (optional)"></textarea>
+    </div>
+    <div class="row">
       <label style="width: 120px;">Configuration</label>
       <select id="eventConfigSelect" style="width: 300px;">
-        <option value="">Select a configuration...</option>
+        <option value="">Select a configuration (optional)...</option>
       </select>
     </div>
     <div class="row">
@@ -33,10 +54,6 @@
       <button id="btnUpdateEvent" disabled style="display: none;">Update Event</button>
       <button id="btnCancelEvent" style="display: none;">Cancel</button>
     </div>
-  </div>
-  <div class="row">
-    <button id="btnRefreshEvents">Refresh</button>
-    <button id="btnDeleteEvent" style="display:none;">Delete Selected</button>
   </div>
   <div id="eventsList" style="margin-top: 16px;">
     <p>Loading events...</p>

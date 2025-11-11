@@ -3,6 +3,7 @@ let confirmedHosts = []; // Array of {host, port}
 let templates = []; // Array of template objects
 let editingConfigId = null; // Track if we're editing an existing configuration
 let editingEventId = null; // Track if we're editing an existing event
+let currentRunningConfigName = null; // Track the name of the configuration currently being run
 // Session-based: credentials are managed server-side, no need to store client_id/client_secret
 let currentNhiId = null; // Track which NHI credential is currently loaded
 let sessionExpiresAt = null; // Track session expiration time
@@ -1632,114 +1633,6 @@ async function apiJson(path, options = {}) {
 
 // Logging disabled for minimal output
 
-// Reset Preparation UI/state so it can be reused for a new run
-function resetPreparationForNewRun() {
-  try {
-    // Reset Authentication section
-    const nhiSelect = el('nhiCredentialSelect');
-    if (nhiSelect) nhiSelect.value = '';
-    // Password field removed - no longer needed
-    const nhiStatus = el('nhiLoadStatus');
-    if (nhiStatus) nhiStatus.textContent = '';
-    const hostSourceManual = el('hostSourceManual');
-    if (hostSourceManual) hostSourceManual.checked = true;
-    const hostSourceNhi = el('hostSourceNhi');
-    if (hostSourceNhi) hostSourceNhi.checked = false;
-
-    // Clear any stored credentials and tokens
-    if (typeof currentNhiId !== 'undefined') currentNhiId = null;
-    if (typeof showStatus === 'function') showStatus('Preparation reset');
-    // Session-based: tokens are managed server-side, no need to clear local tokens
-
-    // Clear templates array/state
-    if (Array.isArray(templates)) templates.length = 0;
-
-    // Clear rows
-    const tplFormList = el('tplFormList');
-    if (tplFormList) tplFormList.innerHTML = '';
-
-    // Clear install dropdown and disable Run button
-    const installSelect = el('installSelect');
-    if (installSelect) {
-      installSelect.innerHTML = '';
-      installSelect.disabled = true;
-    }
-    const runBtn = el('btnInstallSelected');
-    if (runBtn) runBtn.disabled = true;
-    
-    // Disable Add Row button
-    const btnAddRow = el('btnAddRow');
-    if (btnAddRow) btnAddRow.disabled = true;
-
-    // Clear host inputs and chips/status
-    const fabricHost = el('fabricHost');
-    if (fabricHost) fabricHost.value = '';
-    const fabricHostChips = el('fabricHostChips');
-    if (fabricHostChips) fabricHostChips.innerHTML = '';
-    const fabricHostStatus = el('fabricHostStatus');
-    if (fabricHostStatus) fabricHostStatus.textContent = '';
-
-    // Clear NHI derived hosts and status
-    const fabricHostFromNhi = el('fabricHostFromNhi');
-    if (fabricHostFromNhi) fabricHostFromNhi.value = '';
-    const fabricHostFromNhiChips = el('fabricHostFromNhiChips');
-    if (fabricHostFromNhiChips) fabricHostFromNhiChips.innerHTML = '';
-    const fabricHostFromNhiStatus = el('fabricHostFromNhiStatus');
-    if (fabricHostFromNhiStatus) fabricHostFromNhiStatus.textContent = '';
-
-    // Reset confirmed hosts map
-    if (Array.isArray(confirmedHosts)) confirmedHosts.length = 0;
-
-    // Hide progress UI
-    const runProgressContainer = el('runProgressContainer');
-    if (runProgressContainer) runProgressContainer.style.display = 'none';
-    const runProgressBar = el('runProgressBar');
-    if (runProgressBar) runProgressBar.style.width = '0%';
-    const runProgressText = el('runProgressText');
-    if (runProgressText) runProgressText.textContent = '0%';
-    const runProgressStatus = el('runProgressStatus');
-    if (runProgressStatus) runProgressStatus.textContent = 'Initializing...';
-    const runProgressTimer = el('runProgressTimer');
-    if (runProgressTimer) runProgressTimer.textContent = '00:00';
-
-    // Clear running tasks list
-    const runningTasksContainer = el('runningTasksContainer');
-    if (runningTasksContainer) runningTasksContainer.style.display = 'none';
-    const tplList = el('tplList');
-    if (tplList) tplList.innerHTML = '';
-
-    // Re-enable inputs/buttons as initial state
-    const addRowBtn = el('btnAddRow');
-    if (addRowBtn) addRowBtn.disabled = false;
-
-    // Clear status/notice area
-    const actionStatus = el('actionStatus');
-    if (actionStatus) actionStatus.style.display = 'none';
-  } catch (e) {
-    // Non-fatal; log only
-  }
-}
-
-// Wire Reset button in Preparation UI
-document.addEventListener('DOMContentLoaded', () => {
-  const resetBtn = el('btnResetPreparation');
-  if (resetBtn) {
-    resetBtn.onclick = (e) => {
-      e.preventDefault();
-      resetPreparationForNewRun();
-      if (typeof showStatus === 'function') showStatus('Preparation reset');
-    };
-  }
-});
-// Delegate reset click in case the button is injected after DOMContentLoaded
-document.addEventListener('click', (e) => {
-  const target = e.target;
-  if (target && target.id === 'btnResetPreparation') {
-    e.preventDefault();
-    resetPreparationForNewRun();
-    if (typeof showStatus === 'function') showStatus('Preparation reset');
-  }
-});
 // Token acquisition function (now called from Install Workspace)
 async function acquireTokens() {
   // Auto-confirm hosts if not already confirmed
@@ -2833,17 +2726,6 @@ function initializePreparationSection() {
     attachSaveButtonHandler();
   }
   
-  // Attach cancel button handler
-  const cancelBtn = el('btnCancelConfig');
-  if (cancelBtn) {
-    cancelBtn.onclick = (e) => {
-      e.preventDefault();
-      clearConfigName();
-      resetPreparationSection();
-      showStatus('Configuration cancelled. Form reset.');
-    };
-  }
-  
   updateCreateEnabled();
   updateInstallSelect();
   renderTemplates(false);
@@ -3018,6 +2900,8 @@ function displayConfigName(name) {
 // Clear configuration name display
 function clearConfigName() {
   displayConfigName(null);
+  // Clear the stored running config name
+  currentRunningConfigName = null;
 }
 
 // Reset all inputs in FabricStudio Runs section
@@ -3111,6 +2995,8 @@ function resetPreparationSection() {
   if (window.validatedNhiHosts) window.validatedNhiHosts = [];
   // Session-based: tokens are managed server-side, no need to clear local tokens
   currentNhiId = null;
+  // Clear the stored running config name when resetting
+  currentRunningConfigName = null;
   
   // Clear fabric host list
   const fabricHostList = el('fabricHostList');
@@ -3269,8 +3155,285 @@ function utcToLocal(dateStr, timeStr) {
     return { date: dateStr, time: timeStr || null };
   }
 }
+// Calendar state
+let currentCalendarMonth = null;
+let currentCalendarYear = null;
+let allEvents = []; // Store events for calendar
+
+// Initialize calendar month/year to current month
+function initCalendarDate() {
+  const now = typeof dayjs !== 'undefined' ? dayjs() : new Date();
+  if (typeof dayjs !== 'undefined') {
+    currentCalendarMonth = now.month();
+    currentCalendarYear = now.year();
+  } else {
+    currentCalendarMonth = now.getMonth();
+    currentCalendarYear = now.getFullYear();
+  }
+}
+
+// Get event type icon
+function getEventTypeIcon(eventType) {
+  if (!eventType) return '⚪';
+  const type = eventType.toLowerCase();
+  if (type === 'sme') return '👤';
+  if (type === 'xperts') return '🎓';
+  if (type === 'partners') return '🤝';
+  if (type === 'customers') return '👥';
+  if (type === 'others') return '📅';
+  return '⚪';
+}
+
+// Get event type CSS class
+function getEventTypeClass(eventType) {
+  if (!eventType) return 'type-none';
+  const type = eventType.toLowerCase();
+  if (type === 'sme') return 'type-sme';
+  if (type === 'xperts') return 'type-xperts';
+  if (type === 'partners') return 'type-partners';
+  if (type === 'customers') return 'type-customers';
+  if (type === 'others') return 'type-others';
+  return 'type-none';
+}
+
+// Render a single month calendar
+function renderSingleMonth(month, year, eventsByDate, todayDate) {
+  // Get first day of month and number of days
+  let firstDay, daysInMonth, monthName;
+  if (typeof dayjs !== 'undefined') {
+    const monthDate = dayjs().year(year).month(month);
+    firstDay = monthDate.startOf('month').day(); // 0 = Sunday
+    daysInMonth = monthDate.daysInMonth();
+    monthName = monthDate.format('MMMM');
+  } else {
+    const monthDate = new Date(year, month, 1);
+    firstDay = monthDate.getDay(); // 0 = Sunday
+    daysInMonth = new Date(year, month + 1, 0).getDate();
+    monthName = monthDate.toLocaleDateString('en-US', { month: 'long' });
+  }
+  
+  let html = '<div class="event-calendar">';
+  
+  // Header with month name
+  html += '<div class="event-calendar-header">';
+  html += `<h4 class="event-calendar-title">${monthName} ${year}</h4>`;
+  html += '</div>';
+  
+  // Weekday headers
+  html += '<div class="event-calendar-weekdays">';
+  const weekdays = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+  weekdays.forEach(day => {
+    html += `<div class="event-calendar-weekday">${day}</div>`;
+  });
+  html += '</div>';
+  
+  // Calendar days
+  html += '<div class="event-calendar-days">';
+  
+  // Previous month's trailing days
+  let prevMonthDays;
+  if (typeof dayjs !== 'undefined') {
+    const prevMonth = dayjs().year(year).month(month).subtract(1, 'month');
+    prevMonthDays = prevMonth.daysInMonth();
+  } else {
+    prevMonthDays = new Date(year, month, 0).getDate();
+  }
+  
+  for (let i = firstDay - 1; i >= 0; i--) {
+    const dayNum = prevMonthDays - i;
+    let dateStr;
+    if (typeof dayjs !== 'undefined') {
+      const date = dayjs().year(year).month(month - 1).date(dayNum);
+      dateStr = date.format('YYYY-MM-DD');
+    } else {
+      const date = new Date(year, month - 1, dayNum);
+      dateStr = date.toISOString().split('T')[0];
+    }
+    
+    html += `<div class="event-calendar-day other-month" data-date="${dateStr}">`;
+    html += `<div class="event-calendar-day-number">${dayNum}</div>`;
+    html += '</div>';
+  }
+  
+  // Current month's days
+  for (let day = 1; day <= daysInMonth; day++) {
+    let dateStr;
+    if (typeof dayjs !== 'undefined') {
+      const date = dayjs().year(year).month(month).date(day);
+      dateStr = date.format('YYYY-MM-DD');
+    } else {
+      const date = new Date(year, month, day);
+      dateStr = date.toISOString().split('T')[0];
+    }
+    
+    const isToday = dateStr === todayDate;
+    const dayEvents = eventsByDate[dateStr] || [];
+    
+    html += `<div class="event-calendar-day ${isToday ? 'today' : ''}" data-date="${dateStr}">`;
+    html += `<div class="event-calendar-day-number">${day}</div>`;
+    
+    if (dayEvents.length > 0) {
+      html += '<div class="event-calendar-events">';
+      dayEvents.forEach(event => {
+        const typeClass = getEventTypeClass(event.event_type);
+        const eventIcon = getEventTypeIcon(event.event_type);
+        const eventTitle = event.name || 'Untitled Event';
+        html += `<div class="event-calendar-event ${typeClass}" data-event-name="${eventTitle.replace(/"/g, '&quot;')}" onclick="editEvent(${event.id})">${eventIcon}</div>`;
+      });
+      html += '</div>';
+    }
+    
+    html += '</div>';
+  }
+  
+  // Next month's leading days
+  const totalCells = firstDay + daysInMonth;
+  const remainingCells = 42 - totalCells; // 6 rows * 7 days = 42
+  for (let day = 1; day <= remainingCells && day <= 14; day++) {
+    let dateStr;
+    if (typeof dayjs !== 'undefined') {
+      const date = dayjs().year(year).month(month + 1).date(day);
+      dateStr = date.format('YYYY-MM-DD');
+    } else {
+      const date = new Date(year, month + 1, day);
+      dateStr = date.toISOString().split('T')[0];
+    }
+    
+    html += `<div class="event-calendar-day other-month" data-date="${dateStr}">`;
+    html += `<div class="event-calendar-day-number">${day}</div>`;
+    html += '</div>';
+  }
+  
+  html += '</div>'; // event-calendar-days
+  html += '</div>'; // event-calendar
+  
+  return html;
+}
+
+// Render calendar with multiple months
+function renderEventCalendar(events) {
+  const container = document.getElementById('eventCalendarContainer');
+  if (!container) return;
+  
+  // Initialize date if needed
+  if (currentCalendarMonth === null || currentCalendarYear === null) {
+    initCalendarDate();
+  }
+  
+  // Store events for calendar
+  allEvents = events || [];
+  
+  // Convert events to local dates and group by date
+  const eventsByDate = {};
+  allEvents.forEach(event => {
+    if (event.event_date) {
+      try {
+        let localDate;
+        if (typeof dayjs !== 'undefined' && dayjs.utc) {
+          const timePart = (event.event_time && event.event_time.trim()) ? event.event_time.trim() + ':00' : '00:00';
+          const utcDateTime = dayjs.utc(`${event.event_date}T${timePart}`);
+          if (utcDateTime.isValid()) {
+            localDate = utcDateTime.local().format('YYYY-MM-DD');
+          } else {
+            localDate = event.event_date;
+          }
+        } else {
+          // Fallback to native Date
+          const timePart = (event.event_time && event.event_time.trim()) ? event.event_time.trim() + ':00' : '00:00';
+          const utcDate = new Date(`${event.event_date}T${timePart}Z`);
+          localDate = utcDate.toISOString().split('T')[0];
+        }
+        
+        if (!eventsByDate[localDate]) {
+          eventsByDate[localDate] = [];
+        }
+        eventsByDate[localDate].push(event);
+      } catch (e) {
+        // Skip invalid dates
+      }
+    }
+  });
+  
+  // Get today's date for highlighting
+  let todayDate;
+  if (typeof dayjs !== 'undefined') {
+    todayDate = dayjs().format('YYYY-MM-DD');
+  } else {
+    const now = new Date();
+    todayDate = now.toISOString().split('T')[0];
+  }
+  
+  // Build calendar HTML with navigation
+  let html = '<div style="margin-bottom: 12px; display: flex; justify-content: space-between; align-items: center;">';
+  html += '<h4 style="margin: 0; font-size: 16px; font-weight: 600;">Events Calendar</h4>';
+  html += '<div style="display: flex; gap: 8px; align-items: center;">';
+  html += `<button onclick="navigateCalendar(-3)" style="padding: 6px 14px; font-size: 13px; background: #da291c; border: 1px solid #da291c; border-radius: 0; cursor: pointer; color: white; font-weight: 600; box-shadow: 0 2px 4px rgba(218, 41, 28, 0.3); min-width: auto;">‹‹</button>`;
+  html += `<button onclick="goToToday()" style="padding: 6px 14px; font-size: 13px; background: #da291c; border: 1px solid #da291c; border-radius: 0; cursor: pointer; color: white; font-weight: 600; box-shadow: 0 2px 4px rgba(218, 41, 28, 0.3); min-width: auto;">Today</button>`;
+  html += `<button onclick="navigateCalendar(3)" style="padding: 6px 14px; font-size: 13px; background: #da291c; border: 1px solid #da291c; border-radius: 0; cursor: pointer; color: white; font-weight: 600; box-shadow: 0 2px 4px rgba(218, 41, 28, 0.3); min-width: auto;">››</button>`;
+  html += '</div>';
+  html += '</div>';
+  
+  html += '<div class="event-calendars-container">';
+  
+  // Render current month + next 2 months (3 months total)
+  for (let offset = 0; offset < 3; offset++) {
+    let month, year;
+    if (typeof dayjs !== 'undefined') {
+      const date = dayjs().year(currentCalendarYear).month(currentCalendarMonth).add(offset, 'month');
+      month = date.month();
+      year = date.year();
+    } else {
+      const date = new Date(currentCalendarYear, currentCalendarMonth + offset, 1);
+      month = date.getMonth();
+      year = date.getFullYear();
+    }
+    
+    html += renderSingleMonth(month, year, eventsByDate, todayDate);
+  }
+  
+  html += '</div>'; // event-calendars-container
+  
+  container.innerHTML = html;
+}
+
+// Navigate calendar month (moves by 3 months since we show 3 at a time)
+function navigateCalendar(direction) {
+  if (currentCalendarMonth === null || currentCalendarYear === null) {
+    initCalendarDate();
+  }
+  
+  if (typeof dayjs !== 'undefined') {
+    const newDate = dayjs().year(currentCalendarYear).month(currentCalendarMonth).add(direction, 'month');
+    currentCalendarMonth = newDate.month();
+    currentCalendarYear = newDate.year();
+  } else {
+    currentCalendarMonth += direction;
+    while (currentCalendarMonth < 0) {
+      currentCalendarMonth += 12;
+      currentCalendarYear--;
+    }
+    while (currentCalendarMonth > 11) {
+      currentCalendarMonth -= 12;
+      currentCalendarYear++;
+    }
+  }
+  
+  renderEventCalendar(allEvents);
+}
+
+// Go to today
+function goToToday() {
+  initCalendarDate();
+  renderEventCalendar(allEvents);
+}
+
+// Make functions globally available
+window.navigateCalendar = navigateCalendar;
+window.goToToday = goToToday;
+
 // Load and display events
 async function loadEvents() {
+  const eventsList = document.getElementById('eventsList');
   if (!eventsList) return;
   
   eventsList.innerHTML = '<p>Loading events...</p>';
@@ -3284,6 +3447,10 @@ async function loadEvents() {
     
     const data = await res.json();
     const events = data.events || [];
+    
+    // Render calendar with events
+    renderEventCalendar(events);
+    
     
     // Fallback: if has_executions is undefined, fetch executions to determine it
     const enrichedEvents = await Promise.all(events.map(async (ev) => {
@@ -3384,12 +3551,15 @@ async function loadEvents() {
         autoRunBadge = `<span style="font-size: 12px; color: ${badgeColor}; margin-left: 12px; font-weight: 600;">[Auto Run]</span>`;
       }
       
+      const eventTypeBadge = event.event_type ? `<span style="font-size: 12px; color: #3b82f6; margin-left: 12px; font-weight: 600;">[${event.event_type}]</span>` : '';
+      
       html += `
         <div class="event-item" data-event-id="${event.id}" style="padding: 12px; border: 1px solid #d2d2d7; border-radius: 4px; background: #f5f5f7;">
           <div style="display: flex; align-items: center; gap: 8px; margin-bottom: 8px;">
             <input type="checkbox" class="event-checkbox" value="${event.id}" id="event-${event.id}" style="margin: 0;">
             <label for="event-${event.id}" style="margin: 0; font-weight: 600; cursor: pointer; flex: 1;">
               <span style="font-size: 16px;">${event.name}</span>
+              ${eventTypeBadge}
               <span style="font-size: 14px; color: #86868b; margin-left: 12px;">- ${dateTimeDisplay}</span>
               ${autoRunBadge}
             </label>
@@ -3398,7 +3568,8 @@ async function loadEvents() {
             <button class="btn-event-delete" data-event-id="${event.id}" style="padding: 4px 12px; font-size: 12px; background: #f87171; border-color: #f87171;">Delete</button>
           </div>
           <div style="font-size: 12px; color: #86868b; margin-left: 24px;">
-            <div>Configuration: ${event.configuration_name}</div>
+            ${event.description ? `<div style="margin-bottom: 4px;"><strong>Description:</strong> ${event.description}</div>` : ''}
+            ${event.configuration_name ? `<div>Configuration: ${event.configuration_name}</div>` : '<div>Configuration: None</div>'}
             <div>Created: ${createdDate}</div>
             <div>Updated: ${updatedDate}</div>
           </div>
@@ -3957,6 +4128,9 @@ async function runConfigurationById(configId) {
     
     // Get the configuration name first
     const configName = configData.name || 'Unknown Configuration';
+    
+    // Store the configuration name for use when creating run records
+    currentRunningConfigName = configName;
     
     // Display configuration name at top
     displayConfigName(configName);
@@ -7769,6 +7943,12 @@ function initializeRunView() {
     attachRunButtonHandler();
   }
   
+  // Clear the stored running config name when initializing run view (unless we're loading a saved config)
+  // This ensures that runs without a saved config will show "Manual Run"
+  if (!window.isLoadingConfiguration) {
+    currentRunningConfigName = null;
+  }
+  
   // The Run button is btnInstallSelected (same as preparation section)
   // It's already set up by initializePreparationSection and attachRunButtonHandler
   // We just need to ensure the configuration is restored
@@ -7914,6 +8094,8 @@ async function editEvent(eventId) {
     el('eventName').value = eventData.name || '';
     el('eventDate').value = localEvent.date || '';
     el('eventTime').value = localEvent.time || '';
+    el('eventTypeSelect').value = eventData.event_type || '';
+    el('eventDescription').value = eventData.description || '';
     el('eventAutoRun').checked = eventData.auto_run || false;
     
     // Load configurations and set selected one
@@ -7929,8 +8111,18 @@ async function editEvent(eventId) {
     el('btnCancelEvent').style.display = 'inline-block';
     el('btnUpdateEvent').disabled = false;
     
+    // Show the form container
+    const formContainer = document.getElementById('eventFormContainer');
+    if (formContainer) {
+      formContainer.style.display = 'block';
+    }
+    
     // Scroll to form
-    document.querySelector('#event-schedule-section h3').scrollIntoView({ behavior: 'smooth', block: 'start' });
+    if (formContainer) {
+      formContainer.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    } else {
+      document.querySelector('#event-schedule-section h3').scrollIntoView({ behavior: 'smooth', block: 'start' });
+    }
     
     showStatus(`Event '${eventData.name}' loaded for editing. Click Update to save changes.`);
     logMsg(`Event loaded for editing: ${eventData.name} (ID: ${eventId})`);
@@ -7945,6 +8137,8 @@ function cancelEventEdit() {
   el('eventName').value = '';
   el('eventDate').value = '';
   el('eventTime').value = '';
+  el('eventTypeSelect').value = '';
+  el('eventDescription').value = '';
   el('eventConfigSelect').value = '';
   el('eventAutoRun').checked = false;
   
@@ -7952,7 +8146,46 @@ function cancelEventEdit() {
   el('btnUpdateEvent').style.display = 'none';
   el('btnCancelEvent').style.display = 'none';
   
+  // Hide the form container
+  const formContainer = document.getElementById('eventFormContainer');
+  if (formContainer) {
+    formContainer.style.display = 'none';
+  }
+  
   updateCreateEventButton();
+}
+
+function showEventForm() {
+  const formContainer = document.getElementById('eventFormContainer');
+  if (formContainer) {
+    // Clear form fields without hiding the form
+    editingEventId = null;
+    el('eventName').value = '';
+    el('eventDate').value = '';
+    el('eventTime').value = '';
+    el('eventTypeSelect').value = '';
+    el('eventDescription').value = '';
+    el('eventConfigSelect').value = '';
+    el('eventAutoRun').checked = false;
+    
+    el('btnCreateEvent').style.display = 'inline-block';
+    el('btnUpdateEvent').style.display = 'none';
+    el('btnCancelEvent').style.display = 'inline-block';
+    
+    // Show the form container
+    formContainer.style.display = 'block';
+    
+    // Load configurations for the dropdown
+    loadEventConfigs();
+    
+    // Update button state
+    updateCreateEventButton();
+    
+    // Scroll to form
+    formContainer.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  } else {
+    console.error('eventFormContainer not found');
+  }
 }
 // Set up event schedule button handlers
 function setupEventButtons() {
@@ -7962,8 +8195,10 @@ function setupEventButtons() {
       const name = el('eventName').value.trim();
   const date = el('eventDate').value;
   const time = el('eventTime').value;
+  const eventType = el('eventTypeSelect').value || null;
+  const description = el('eventDescription').value.trim() || null;
   const configSelectValue = el('eventConfigSelect').value;
-  const configId = configSelectValue ? parseInt(configSelectValue, 10) : 0;
+  const configId = configSelectValue ? parseInt(configSelectValue, 10) : null;
   const autoRun = el('eventAutoRun').checked;
   
   if (!name) {
@@ -7976,10 +8211,7 @@ function setupEventButtons() {
     return;
   }
   
-  if (!configId || isNaN(configId)) {
-    showStatus('Please select a configuration');
-    return;
-  }
+  // Configuration is now optional - no validation needed
   
   // Validate that date/time is not in the past (using local time)
   const timePart = time ? time + ':00' : '00:00';
@@ -8014,6 +8246,8 @@ function setupEventButtons() {
         name: name,
         event_date: utcEvent.date,
         event_time: utcEvent.time || null,
+        event_type: eventType,
+        description: description,
         configuration_id: configId,
         auto_run: autoRun,
         nhi_password: null  // No longer needed - using FS_SERVER_SECRET
@@ -8031,7 +8265,7 @@ function setupEventButtons() {
     showStatus(data.message || 'Event created successfully');
     logMsg(`Event created: ${name}${autoRun ? ' (Auto Run enabled)' : ''}`);
     
-    // Clear form
+    // Clear form and hide it
     cancelEventEdit();
     
     // Reload events list
@@ -8049,8 +8283,10 @@ function setupEventButtons() {
       const name = el('eventName').value.trim();
       const date = el('eventDate').value;
       const time = el('eventTime').value;
+      const eventType = el('eventTypeSelect').value || null;
+      const description = el('eventDescription').value.trim() || null;
       const configSelectValue = el('eventConfigSelect').value;
-      const configId = configSelectValue ? parseInt(configSelectValue, 10) : 0;
+      const configId = configSelectValue ? parseInt(configSelectValue, 10) : null;
       const autoRun = el('eventAutoRun').checked;
       
       if (!editingEventId) {
@@ -8068,10 +8304,7 @@ function setupEventButtons() {
         return;
       }
       
-      if (!configId || isNaN(configId)) {
-        showStatus('Please select a configuration');
-        return;
-      }
+      // Configuration is now optional - no validation needed
       
       // Validate that date/time is not in the past (using local time)
       const timePart = time ? time + ':00' : '00:00';
@@ -8107,6 +8340,8 @@ function setupEventButtons() {
             name: name,
             event_date: utcEvent.date,
             event_time: utcEvent.time || null,
+            event_type: eventType,
+            description: description,
             configuration_id: configId,
             auto_run: autoRun,
             nhi_password: null  // No longer needed - using FS_SERVER_SECRET
@@ -8124,7 +8359,7 @@ function setupEventButtons() {
         showStatus(data.message || 'Event updated successfully');
         logMsg(`Event updated: ${name}${autoRun ? ' (Auto Run enabled)' : ''}`);
         
-        // Clear form and exit edit mode
+        // Clear form and hide it
         cancelEventEdit();
         
         // Reload events list
@@ -8151,6 +8386,32 @@ function setupEventButtons() {
       loadEvents();
     };
   }
+  
+  // Set up "Create Event" button to show the form using event delegation
+  const eventSection = document.getElementById('event-schedule-section');
+  if (eventSection) {
+    eventSection.addEventListener('click', function(e) {
+      if (e.target && e.target.id === 'btnShowCreateEventForm') {
+        e.preventDefault();
+        e.stopPropagation();
+        showEventForm();
+        return false;
+      }
+    });
+  }
+  
+  // Also try direct attachment as backup
+  setTimeout(() => {
+    const showFormBtn = document.getElementById('btnShowCreateEventForm');
+    if (showFormBtn) {
+      showFormBtn.addEventListener('click', function(e) {
+        e.preventDefault();
+        e.stopPropagation();
+        showEventForm();
+        return false;
+      });
+    }
+  }, 200);
   
   const deleteBtn = el('btnDeleteEvent');
   if (deleteBtn && !deleteBtn.onclick) {
@@ -8271,7 +8532,8 @@ function updateCreateEventButton() {
   }
   
   // Buttons are enabled only when all required fields are filled AND date/time is valid
-  const isValid = !!(name && date && configId && dateTimeValid);
+  // Configuration is now optional, so we don't require it
+  const isValid = !!(name && date && dateTimeValid);
   
   if (createBtn) {
     createBtn.disabled = !isValid;
@@ -8425,7 +8687,9 @@ async function handleTrackedRunButton() {
     
     // Create manual run record
     const configPayload = collectConfiguration();
-    const configurationName = configPayload.configName || 'Manual Run';
+    // Use the stored configuration name if available (when running from a saved config),
+    // otherwise use configName from payload, or default to 'Manual Run'
+    const configurationName = currentRunningConfigName || configPayload.configName || 'Manual Run';
     try {
       const createRes = await api('/run/create', {
         method: 'POST',

@@ -21,7 +21,7 @@ class Config:
     RATE_LIMITS = {
         "/auth/token": {"requests": 10, "window": 60},
         "/nhi/save": {"requests": 5, "window": 60},
-        "/event/save": {"requests": 5, "window": 60},
+        "/event/save": {"requests": 50, "window": 60},
         "/ssh-keys/save": {"requests": 5, "window": 60},
         "/ssh-command-profiles/save": {"requests": 5, "window": 60},
     }

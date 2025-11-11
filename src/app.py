@@ -931,7 +931,9 @@ def init_db():
             name TEXT NOT NULL,
             event_date DATE NOT NULL,
             event_time TIME,
-            configuration_id INTEGER NOT NULL,
+            event_type TEXT,
+            description TEXT,
+            configuration_id INTEGER,
             auto_run INTEGER DEFAULT 0,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -957,6 +959,98 @@ def init_db():
             conn.commit()
         except sqlite3.OperationalError as e:
             print(f"Warning: Could not add auto_run column: {e}")
+    
+    # Migrate existing event_schedules table to add event_type column if it doesn't exist
+    if 'event_type' not in columns:
+        try:
+            c.execute('ALTER TABLE event_schedules ADD COLUMN event_type TEXT')
+            conn.commit()
+        except sqlite3.OperationalError as e:
+            print(f"Warning: Could not add event_type column: {e}")
+    
+    # Migrate existing event_schedules table to add description column if it doesn't exist
+    if 'description' not in columns:
+        try:
+            c.execute('ALTER TABLE event_schedules ADD COLUMN description TEXT')
+            conn.commit()
+        except sqlite3.OperationalError as e:
+            print(f"Warning: Could not add description column: {e}")
+    
+    # Migrate existing event_schedules table to make configuration_id nullable
+    # SQLite doesn't support ALTER COLUMN, so we need to recreate the table
+    # Check if configuration_id is NOT NULL and migrate if needed
+    c.execute("PRAGMA table_info(event_schedules)")
+    columns_info = c.fetchall()
+    # Check if configuration_id has NOT NULL constraint
+    config_id_not_null = False
+    for col_info in columns_info:
+        if col_info[1] == 'configuration_id' and col_info[3] == 1:  # col_info[3] is notnull flag
+            config_id_not_null = True
+            break
+    
+    if config_id_not_null:
+        try:
+            logger.info("Migrating event_schedules table to make configuration_id nullable...")
+            # Disable foreign key checks temporarily
+            c.execute('PRAGMA foreign_keys=OFF')
+            
+            # Get current column list to handle missing columns
+            current_columns = [col[1] for col in columns_info]
+            
+            # Build SELECT statement with only existing columns
+            select_cols = []
+            insert_cols = []
+            for col in ['id', 'name', 'event_date', 'event_time', 'event_type', 'description', 'configuration_id', 'auto_run', 'created_at', 'updated_at']:
+                if col in current_columns:
+                    select_cols.append(col)
+                    insert_cols.append(col)
+            
+            # Create new table with nullable configuration_id
+            c.execute('''
+                CREATE TABLE event_schedules_new (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL,
+                    event_date DATE NOT NULL,
+                    event_time TIME,
+                    event_type TEXT,
+                    description TEXT,
+                    configuration_id INTEGER,
+                    auto_run INTEGER DEFAULT 0,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (configuration_id) REFERENCES configurations(id)
+                )
+            ''')
+            
+            # Copy all data from old table to new table
+            if select_cols:
+                select_str = ', '.join(select_cols)
+                insert_str = ', '.join(insert_cols)
+                c.execute(f'''
+                    INSERT INTO event_schedules_new ({insert_str})
+                    SELECT {select_str}
+                    FROM event_schedules
+                ''')
+            
+            # Drop old table
+            c.execute('DROP TABLE event_schedules')
+            
+            # Rename new table
+            c.execute('ALTER TABLE event_schedules_new RENAME TO event_schedules')
+            
+            # Recreate indexes if they exist
+            c.execute('CREATE INDEX IF NOT EXISTS idx_event_schedules_auto_run_date ON event_schedules(auto_run, event_date)')
+            
+            # Re-enable foreign key checks
+            c.execute('PRAGMA foreign_keys=ON')
+            
+            conn.commit()
+            logger.info("Successfully migrated event_schedules table to make configuration_id nullable")
+        except sqlite3.Error as e:
+            conn.rollback()
+            c.execute('PRAGMA foreign_keys=ON')  # Make sure to re-enable even on error
+            logger.error(f"Error migrating event_schedules table: {e}")
+            # Don't raise - allow the app to continue, but configuration_id will still be required
     
     # Create NHI credentials table
     c.execute('''
@@ -3752,18 +3846,22 @@ def delete_config(config_id: int, request: Request):
 class CreateEventReq(BaseModel):
     name: str
     event_date: str
-    event_time: str = None
-    configuration_id: int
+    event_time: Optional[str] = None
+    event_type: Optional[str] = None  # Optional: SME, Xperts, Partners, Customers, Others
+    description: Optional[str] = None  # Optional free text description
+    configuration_id: Optional[int] = None  # Optional - events can be created without configuration
     auto_run: bool = False
-    id: int = None  # Optional ID for updating existing event
+    id: Optional[int] = None  # Optional ID for updating existing event
 
 
 class EventListItem(BaseModel):
     id: int
     name: str
     event_date: str
-    configuration_id: int
-    configuration_name: str
+    event_type: Optional[str] = None
+    description: Optional[str] = None
+    configuration_id: Optional[int] = None
+    configuration_name: Optional[str] = None
     created_at: str
     updated_at: str
 @app.post("/event/save")
@@ -3773,8 +3871,7 @@ def save_event(req: CreateEventReq, request: Request):
         raise HTTPException(400, "Event name is required")
     if not req.event_date:
         raise HTTPException(400, "Event date is required")
-    if not req.configuration_id:
-        raise HTTPException(400, "Configuration is required")
+    # Configuration is now optional - events can be created without a configuration
     
     # Validate that event date/time is not in the past
     # Frontend sends date/time in UTC (converted from user's local timezone)
@@ -3807,12 +3904,16 @@ def save_event(req: CreateEventReq, request: Request):
     # Flag to track if migration already committed
     migration_committed = False
     
+    # Initialize config to None (will be set if configuration_id is provided)
+    config = None
+    
     try:
-        # Verify configuration exists
-        c.execute('SELECT id, name FROM configurations WHERE id = ?', (req.configuration_id,))
-        config = c.fetchone()
-        if not config:
-            raise HTTPException(404, f"Configuration with id {req.configuration_id} not found")
+        # Verify configuration exists if provided (configuration is now optional)
+        if req.configuration_id is not None:
+            c.execute('SELECT id, name FROM configurations WHERE id = ?', (req.configuration_id,))
+            config = c.fetchone()
+            if not config:
+                raise HTTPException(404, f"Configuration with id {req.configuration_id} not found")
         
         if req.id is not None:
             # Update existing event
@@ -3825,9 +3926,9 @@ def save_event(req: CreateEventReq, request: Request):
             # Store UTC date and time
             c.execute('''
                 UPDATE event_schedules 
-                SET name = ?, event_date = ?, event_time = ?, configuration_id = ?, auto_run = ?, updated_at = CURRENT_TIMESTAMP
+                SET name = ?, event_date = ?, event_time = ?, event_type = ?, description = ?, configuration_id = ?, auto_run = ?, updated_at = CURRENT_TIMESTAMP
                 WHERE id = ?
-            ''', (req.name.strip(), utc_date.strftime('%Y-%m-%d'), utc_time.strftime('%H:%M'), req.configuration_id, 1 if req.auto_run else 0, req.id))
+            ''', (req.name.strip(), utc_date.strftime('%Y-%m-%d'), utc_time.strftime('%H:%M'), req.event_type if req.event_type else None, req.description if req.description else None, req.configuration_id, 1 if req.auto_run else 0, req.id))
             
             # Clear execution records when event is updated so badge returns to green
             c.execute('DELETE FROM event_executions WHERE event_id = ?', (req.id,))
@@ -3837,134 +3938,136 @@ def save_event(req: CreateEventReq, request: Request):
         else:
             # Insert new event - store UTC date and time
             c.execute('''
-                INSERT INTO event_schedules (name, event_date, event_time, configuration_id, auto_run, updated_at)
-                VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-            ''', (req.name.strip(), utc_date.strftime('%Y-%m-%d'), utc_time.strftime('%H:%M'), req.configuration_id, 1 if req.auto_run else 0))
+                INSERT INTO event_schedules (name, event_date, event_time, event_type, description, configuration_id, auto_run, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            ''', (req.name.strip(), utc_date.strftime('%Y-%m-%d'), utc_time.strftime('%H:%M'), req.event_type if req.event_type else None, req.description if req.description else None, req.configuration_id, 1 if req.auto_run else 0))
             action = "saved"
             event_id = c.lastrowid
         
         # Store NHI credential ID for event (no password needed - using FS_SERVER_SECRET)
-        try:
-            # Load configuration to extract nhiCredentialId
-            c.execute('SELECT config_data FROM configurations WHERE id = ?', (req.configuration_id,))
-            cfg_row = c.fetchone()
-            if cfg_row:
-                cfg = json.loads(cfg_row[0])
-                nhi_cred_id = cfg.get('nhiCredentialId')
-                if nhi_cred_id:
-                    # Store NHI credential ID
-                    try:
-                        c.execute('''
-                            INSERT INTO event_nhi_passwords (event_id, nhi_credential_id, updated_at)
-                            VALUES (?, ?, CURRENT_TIMESTAMP)
-                            ON CONFLICT(event_id) DO UPDATE SET
-                                nhi_credential_id=excluded.nhi_credential_id,
-                                updated_at=CURRENT_TIMESTAMP
-                        ''', (event_id, int(nhi_cred_id)))
-                    except sqlite3.IntegrityError as integrity_err:
-                        if "password_encrypted" in str(integrity_err):
-                            # Migration hasn't run yet - need to rollback current transaction first
-                            logger.warning(f"Database migration needed - password_encrypted column still exists. Attempting migration...")
-                            try:
-                                # Rollback current transaction to allow migration
-                                conn.rollback()
-                                
-                                # Check if password_encrypted column exists
-                                c.execute("PRAGMA table_info(event_nhi_passwords)")
-                                columns_info = c.fetchall()
-                                columns = [row[1] for row in columns_info]
-                                if 'password_encrypted' in columns:
-                                    # Run migration in a new transaction
-                                    c.execute('PRAGMA foreign_keys=OFF')
-                                    c.execute('BEGIN TRANSACTION')
+        # Only if configuration is provided
+        if req.configuration_id is not None:
+            try:
+                # Load configuration to extract nhiCredentialId
+                c.execute('SELECT config_data FROM configurations WHERE id = ?', (req.configuration_id,))
+                cfg_row = c.fetchone()
+                if cfg_row:
+                    cfg = json.loads(cfg_row[0])
+                    nhi_cred_id = cfg.get('nhiCredentialId')
+                    if nhi_cred_id:
+                        # Store NHI credential ID
+                        try:
+                            c.execute('''
+                                INSERT INTO event_nhi_passwords (event_id, nhi_credential_id, updated_at)
+                                VALUES (?, ?, CURRENT_TIMESTAMP)
+                                ON CONFLICT(event_id) DO UPDATE SET
+                                    nhi_credential_id=excluded.nhi_credential_id,
+                                    updated_at=CURRENT_TIMESTAMP
+                            ''', (event_id, int(nhi_cred_id)))
+                        except sqlite3.IntegrityError as integrity_err:
+                            if "password_encrypted" in str(integrity_err):
+                                # Migration hasn't run yet - need to rollback current transaction first
+                                logger.warning(f"Database migration needed - password_encrypted column still exists. Attempting migration...")
+                                try:
+                                    # Rollback current transaction to allow migration
+                                    conn.rollback()
                                     
-                                    # Clean up any leftover table from previous failed migration
-                                    c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='event_nhi_passwords_new'")
-                                    if c.fetchone():
-                                        logger.info("Cleaning up leftover event_nhi_passwords_new table from previous migration")
-                                        c.execute('DROP TABLE event_nhi_passwords_new')
-                                    
-                                    c.execute('''
-                                        CREATE TABLE event_nhi_passwords_new (
-                                            event_id INTEGER PRIMARY KEY,
-                                            nhi_credential_id INTEGER NOT NULL,
-                                            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                                            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                                            FOREIGN KEY (event_id) REFERENCES event_schedules(id) ON DELETE CASCADE,
-                                            FOREIGN KEY (nhi_credential_id) REFERENCES nhi_credentials(id) ON DELETE CASCADE
-                                        )
-                                    ''')
-                                    c.execute('''
-                                        INSERT INTO event_nhi_passwords_new 
-                                        (event_id, nhi_credential_id, created_at, updated_at)
-                                        SELECT event_id, nhi_credential_id, created_at, updated_at
-                                        FROM event_nhi_passwords
-                                    ''')
-                                    c.execute('DROP TABLE event_nhi_passwords')
-                                    c.execute('ALTER TABLE event_nhi_passwords_new RENAME TO event_nhi_passwords')
-                                    c.execute('COMMIT')
-                                    c.execute('PRAGMA foreign_keys=ON')
-                                    conn.commit()
-                                    logger.info("Successfully migrated event_nhi_passwords table during event save")
-                                    
-                                    # Now restart the event save transaction
-                                    # Re-insert/update the event (need to redo everything since we rolled back)
-                                    if req.id:
-                                        # Update existing event
+                                    # Check if password_encrypted column exists
+                                    c.execute("PRAGMA table_info(event_nhi_passwords)")
+                                    columns_info = c.fetchall()
+                                    columns = [row[1] for row in columns_info]
+                                    if 'password_encrypted' in columns:
+                                        # Run migration in a new transaction
+                                        c.execute('PRAGMA foreign_keys=OFF')
+                                        c.execute('BEGIN TRANSACTION')
+                                        
+                                        # Clean up any leftover table from previous failed migration
+                                        c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='event_nhi_passwords_new'")
+                                        if c.fetchone():
+                                            logger.info("Cleaning up leftover event_nhi_passwords_new table from previous migration")
+                                            c.execute('DROP TABLE event_nhi_passwords_new')
+                                        
                                         c.execute('''
-                                            UPDATE event_schedules 
-                                            SET name = ?, event_date = ?, event_time = ?, configuration_id = ?, auto_run = ?, updated_at = CURRENT_TIMESTAMP
-                                            WHERE id = ?
-                                        ''', (req.name.strip(), utc_date.strftime('%Y-%m-%d'), utc_time.strftime('%H:%M'), req.configuration_id, 1 if req.auto_run else 0, req.id))
+                                            CREATE TABLE event_nhi_passwords_new (
+                                                event_id INTEGER PRIMARY KEY,
+                                                nhi_credential_id INTEGER NOT NULL,
+                                                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                                                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                                                FOREIGN KEY (event_id) REFERENCES event_schedules(id) ON DELETE CASCADE,
+                                                FOREIGN KEY (nhi_credential_id) REFERENCES nhi_credentials(id) ON DELETE CASCADE
+                                            )
+                                        ''')
+                                        c.execute('''
+                                            INSERT INTO event_nhi_passwords_new 
+                                            (event_id, nhi_credential_id, created_at, updated_at)
+                                            SELECT event_id, nhi_credential_id, created_at, updated_at
+                                            FROM event_nhi_passwords
+                                        ''')
+                                        c.execute('DROP TABLE event_nhi_passwords')
+                                        c.execute('ALTER TABLE event_nhi_passwords_new RENAME TO event_nhi_passwords')
+                                        c.execute('COMMIT')
+                                        c.execute('PRAGMA foreign_keys=ON')
+                                        conn.commit()
+                                        logger.info("Successfully migrated event_nhi_passwords table during event save")
                                         
-                                        # Clear execution records when event is updated so badge returns to green
-                                        c.execute('DELETE FROM event_executions WHERE event_id = ?', (req.id,))
+                                        # Now restart the event save transaction
+                                        # Re-insert/update the event (need to redo everything since we rolled back)
+                                        if req.id:
+                                            # Update existing event
+                                            c.execute('''
+                                                UPDATE event_schedules 
+                                                SET name = ?, event_date = ?, event_time = ?, event_type = ?, description = ?, configuration_id = ?, auto_run = ?, updated_at = CURRENT_TIMESTAMP
+                                                WHERE id = ?
+                                            ''', (req.name.strip(), utc_date.strftime('%Y-%m-%d'), utc_time.strftime('%H:%M'), req.event_type if req.event_type else None, req.description if req.description else None, req.configuration_id, 1 if req.auto_run else 0, req.id))
+                                            
+                                            # Clear execution records when event is updated so badge returns to green
+                                            c.execute('DELETE FROM event_executions WHERE event_id = ?', (req.id,))
+                                            
+                                            action = "updated"
+                                            event_id = req.id
+                                        else:
+                                            # Insert new event
+                                            c.execute('''
+                                                INSERT INTO event_schedules (name, event_date, event_time, event_type, description, configuration_id, auto_run, updated_at)
+                                                VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                                            ''', (req.name.strip(), utc_date.strftime('%Y-%m-%d'), utc_time.strftime('%H:%M'), req.event_type if req.event_type else None, req.description if req.description else None, req.configuration_id, 1 if req.auto_run else 0))
+                                            action = "saved"
+                                            event_id = c.lastrowid
                                         
-                                        action = "updated"
-                                        event_id = req.id
+                                        # Now retry the NHI credential insert
+                                        c.execute('''
+                                            INSERT INTO event_nhi_passwords (event_id, nhi_credential_id, updated_at)
+                                            VALUES (?, ?, CURRENT_TIMESTAMP)
+                                            ON CONFLICT(event_id) DO UPDATE SET
+                                                nhi_credential_id=excluded.nhi_credential_id,
+                                                updated_at=CURRENT_TIMESTAMP
+                                        ''', (event_id, int(nhi_cred_id)))
+                                        
+                                        # Commit the entire operation
+                                        conn.commit()
+                                        migration_committed = True
                                     else:
-                                        # Insert new event
-                                        c.execute('''
-                                            INSERT INTO event_schedules (name, event_date, event_time, configuration_id, auto_run, created_at)
-                                            VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-                                        ''', (req.name.strip(), utc_date.strftime('%Y-%m-%d'), utc_time.strftime('%H:%M'), req.configuration_id, 1 if req.auto_run else 0))
-                                        action = "saved"
-                                        event_id = c.lastrowid
-                                    
-                                    # Now retry the NHI credential insert
-                                    c.execute('''
-                                        INSERT INTO event_nhi_passwords (event_id, nhi_credential_id, updated_at)
-                                        VALUES (?, ?, CURRENT_TIMESTAMP)
-                                        ON CONFLICT(event_id) DO UPDATE SET
-                                            nhi_credential_id=excluded.nhi_credential_id,
-                                            updated_at=CURRENT_TIMESTAMP
-                                    ''', (event_id, int(nhi_cred_id)))
-                                    
-                                    # Commit the entire operation
-                                    conn.commit()
-                                    migration_committed = True
-                                else:
-                                    raise integrity_err
-                            except Exception as migration_err:
-                                try:
-                                    c.execute('ROLLBACK')
-                                except:
-                                    pass
-                                try:
-                                    c.execute('PRAGMA foreign_keys=ON')
-                                except:
-                                    pass
-                                conn.rollback()
-                                logger.error(f"Failed to migrate during event save: {migration_err}", exc_info=True)
+                                        raise integrity_err
+                                except Exception as migration_err:
+                                    try:
+                                        c.execute('ROLLBACK')
+                                    except:
+                                        pass
+                                    try:
+                                        c.execute('PRAGMA foreign_keys=ON')
+                                    except:
+                                        pass
+                                    conn.rollback()
+                                    logger.error(f"Failed to migrate during event save: {migration_err}", exc_info=True)
                                 raise HTTPException(500, "Database migration failed. Please restart the application.")
                         else:
                             raise
                 else:
                     logger.warning(f"Configuration {req.configuration_id} has no nhiCredentialId; skipping NHI credential store")
-        except HTTPException:
-            raise
-        except Exception as e:
-            logger.error(f"Error storing NHI credential for event {event_id}: {e}", exc_info=True)
+            except HTTPException:
+                raise
+            except Exception as e:
+                logger.error(f"Error storing NHI credential for event {event_id}: {e}", exc_info=True)
         
         # Only commit if migration didn't already commit
         if not migration_committed:
@@ -3972,13 +4075,26 @@ def save_event(req: CreateEventReq, request: Request):
         
         # Log audit event
         log_action = "event_created" if action == "saved" else "event_updated"
-        config_name = config[1] if config else f"ID {req.configuration_id}"
+        if config:
+            config_name = config[1]
+        elif req.configuration_id is not None:
+            config_name = f"ID {req.configuration_id}"
+        else:
+            config_name = "No configuration"
         log_audit(log_action, details=f"Event '{req.name}' (ID: {event_id}) - Configuration: {config_name}", request=request)
         
         return {"status": "ok", "message": f"Event '{req.name}' {action} successfully", "id": event_id}
+    except HTTPException:
+        # Re-raise HTTP exceptions (they're handled by FastAPI)
+        raise
     except sqlite3.Error as e:
         conn.rollback()
+        logger.error(f"Database error saving event: {e}", exc_info=True)
         raise HTTPException(500, f"Database error: {str(e)}")
+    except Exception as e:
+        conn.rollback()
+        logger.error(f"Unexpected error saving event: {e}", exc_info=True)
+        raise HTTPException(500, f"Internal server error: {str(e)}")
     finally:
         conn.close()
 @app.get("/event/list")
@@ -3996,6 +4112,8 @@ def list_events():
                 e.name, 
                 e.event_date, 
                 e.event_time,
+                e.event_type,
+                e.description,
                 e.configuration_id,
                 e.auto_run,
                 c.name as configuration_name,
@@ -4009,17 +4127,19 @@ def list_events():
         rows = c.fetchall()
         events_list = []
         for row in rows:
-            execution_count = row[9] if row[9] is not None else 0
+            execution_count = row[11] if row[11] is not None else 0
             events_list.append({
                 "id": row[0],
                 "name": row[1],
                 "event_date": row[2],
                 "event_time": row[3] if row[3] else None,
-                "configuration_id": row[4],
-                "auto_run": bool(row[5]),
-                "configuration_name": row[6] if row[6] else "Unknown",
-                "created_at": row[7],
-                "updated_at": row[8],
+                "event_type": row[4] if row[4] else None,
+                "description": row[5] if row[5] else None,
+                "configuration_id": row[6] if row[6] else None,
+                "auto_run": bool(row[7]),
+                "configuration_name": row[8] if row[8] else None,
+                "created_at": row[9],
+                "updated_at": row[10],
                 "has_executions": execution_count > 0
             })
         return {"events": events_list}
@@ -4046,6 +4166,8 @@ def get_event(event_id: int):
                 e.name, 
                 e.event_date, 
                 e.event_time,
+                e.event_type,
+                e.description,
                 e.configuration_id,
                 e.auto_run,
                 c.name as configuration_name,
@@ -4065,11 +4187,13 @@ def get_event(event_id: int):
             "name": row[0],
             "event_date": row[1],
             "event_time": row[2] if row[2] else None,
-            "configuration_id": row[3],
-            "auto_run": bool(row[4]),
-            "configuration_name": row[5] if row[5] else "Unknown",
-            "created_at": row[6],
-            "updated_at": row[7]
+            "event_type": row[3] if row[3] else None,
+            "description": row[4] if row[4] else None,
+            "configuration_id": row[5] if row[5] else None,
+            "auto_run": bool(row[6]),
+            "configuration_name": row[7] if row[7] else None,
+            "created_at": row[8],
+            "updated_at": row[9]
         }
     except sqlite3.Error as e:
         raise HTTPException(500, f"Database error: {str(e)}")
@@ -4380,6 +4504,7 @@ def run_configuration(config_data: dict, event_name: str, event_id: Optional[int
         
         # Create execution record in database
         is_manual_run = (event_id is None)
+        manual_run_id = None  # Track manual_runs ID for auto-run events
         if event_id is not None:
             conn = db_connect_with_retry()
             if not conn:
@@ -4387,11 +4512,20 @@ def run_configuration(config_data: dict, event_name: str, event_id: Optional[int
             else:
                 c = conn.cursor()
                 try:
+                    # Create event_executions record
                     c.execute('''
                         INSERT INTO event_executions (event_id, status, started_at)
                         VALUES (?, ?, ?)
                     ''', (event_id, 'running', started_at.isoformat()))
                     execution_record_id = c.lastrowid
+                    
+                    # Also create manual_runs record for reports (use event name as configuration name)
+                    c.execute('''
+                        INSERT INTO manual_runs (configuration_name, status, started_at)
+                        VALUES (?, ?, ?)
+                    ''', (event_name, 'running', started_at.isoformat()))
+                    manual_run_id = c.lastrowid
+                    
                     conn.commit()
                     # Audit: event run started
                     try:
@@ -4430,22 +4564,36 @@ def run_configuration(config_data: dict, event_name: str, event_id: Optional[int
         if not hosts:
             logger.warning(f"No hosts configured for event {event_name}")
             completed_at = datetime.now(timezone.utc)
-            if execution_record_id is not None:
+            if execution_record_id is not None or manual_run_id is not None:
                 conn = db_connect_with_retry()
                 if conn:
                     c = conn.cursor()
                     try:
-                        c.execute('''
-                            UPDATE event_executions
-                            SET status = ?, message = ?, errors = ?, completed_at = ?
-                            WHERE id = ?
-                        ''', (
-                            'error',
-                            "No hosts configured",
-                            json.dumps(["No hosts configured"]),
-                            completed_at.isoformat(),
-                            execution_record_id
-                        ))
+                        if execution_record_id is not None:
+                            c.execute('''
+                                UPDATE event_executions
+                                SET status = ?, message = ?, errors = ?, completed_at = ?
+                                WHERE id = ?
+                            ''', (
+                                'error',
+                                "No hosts configured",
+                                json.dumps(["No hosts configured"]),
+                                completed_at.isoformat(),
+                                execution_record_id
+                            ))
+                        # Also update manual_runs if it exists (for auto-run events)
+                        if manual_run_id is not None:
+                            c.execute('''
+                                UPDATE manual_runs
+                                SET status = ?, message = ?, errors = ?, completed_at = ?
+                                WHERE id = ?
+                            ''', (
+                                'error',
+                                "No hosts configured",
+                                json.dumps(["No hosts configured"]),
+                                completed_at.isoformat(),
+                                manual_run_id
+                            ))
                         conn.commit()
                     except sqlite3.Error as e:
                         logger.error(f"Failed to update execution record: {e}")
@@ -5435,6 +5583,22 @@ def run_configuration(config_data: dict, event_name: str, event_id: Optional[int
                             execution_details_json,
                             execution_record_id
                         ))
+                        
+                        # Also update manual_runs table for reports (if manual_run_id was created)
+                        if manual_run_id is not None:
+                            c.execute('''
+                                UPDATE manual_runs
+                                SET status = ?, message = ?, errors = ?, completed_at = ?, execution_details = ?
+                                WHERE id = ?
+                            ''', (
+                                status,
+                                message,
+                                json.dumps(errors) if errors else None,
+                                completed_at.isoformat(),
+                                execution_details_json,
+                                manual_run_id
+                            ))
+                        
                         # Audit: event run finished
                         try:
                             duration = int((completed_at - started_at).total_seconds())
@@ -5468,39 +5632,58 @@ def run_configuration(config_data: dict, event_name: str, event_id: Optional[int
         
         # Update execution record with error
         completed_at = datetime.now(timezone.utc)
-        if execution_record_id is not None:
+        if execution_record_id is not None or manual_run_id is not None:
             conn = db_connect_with_retry()
             if not conn:
                 logger.error(f"Event '{event_name}': Failed to connect to database for error record update")
             else:
                 c = conn.cursor()
                 try:
-                    c.execute('''
-                        UPDATE event_executions
-                        SET status = ?, message = ?, errors = ?, completed_at = ?, execution_details = ?
-                        WHERE id = ?
-                    ''', (
-                        'error',
-                        str(e),
-                        json.dumps([str(e)]),
-                        completed_at.isoformat(),
-                        json.dumps({
-                            "hosts": [h.get('host') for h in hosts] if 'hosts' in locals() and isinstance(hosts, list) else [],
-                            "templates": [
-                                {
-                                    "repo_name": t.get('repo_name'),
-                                    "template_name": t.get('template_name'),
-                                    "version": t.get('version')
-                                } for t in (templates_list or []) if isinstance(t, dict)
-                            ] if 'templates_list' in locals() else [],
-                            "install_select": install_select if 'install_select' in locals() else '',
-                            "install_executed": len(installation_details) > 0 if 'installation_details' in locals() else False,
-                            "installations_count": len(installation_details) if 'installation_details' in locals() else 0,
-                            "ssh_profile": ssh_execution_details if 'ssh_execution_details' in locals() and ssh_execution_details else None,
-                            "duration_seconds": (completed_at - started_at).total_seconds()
-                        }),
-                        execution_record_id
-                    ))
+                    error_details = {
+                        "hosts": [h.get('host') for h in hosts] if 'hosts' in locals() and isinstance(hosts, list) else [],
+                        "templates": [
+                            {
+                                "repo_name": t.get('repo_name'),
+                                "template_name": t.get('template_name'),
+                                "version": t.get('version')
+                            } for t in (templates_list or []) if isinstance(t, dict)
+                        ] if 'templates_list' in locals() else [],
+                        "install_select": install_select if 'install_select' in locals() else '',
+                        "install_executed": len(installation_details) > 0 if 'installation_details' in locals() else False,
+                        "installations_count": len(installation_details) if 'installation_details' in locals() else 0,
+                        "ssh_profile": ssh_execution_details if 'ssh_execution_details' in locals() and ssh_execution_details else None,
+                        "duration_seconds": (completed_at - started_at).total_seconds()
+                    }
+                    
+                    if execution_record_id is not None:
+                        c.execute('''
+                            UPDATE event_executions
+                            SET status = ?, message = ?, errors = ?, completed_at = ?, execution_details = ?
+                            WHERE id = ?
+                        ''', (
+                            'error',
+                            str(e),
+                            json.dumps([str(e)]),
+                            completed_at.isoformat(),
+                            json.dumps(error_details),
+                            execution_record_id
+                        ))
+                    
+                    # Also update manual_runs if it exists (for auto-run events)
+                    if manual_run_id is not None:
+                        c.execute('''
+                            UPDATE manual_runs
+                            SET status = ?, message = ?, errors = ?, completed_at = ?, execution_details = ?
+                            WHERE id = ?
+                        ''', (
+                            'error',
+                            str(e),
+                            json.dumps([str(e)]),
+                            completed_at.isoformat(),
+                            json.dumps(error_details),
+                            manual_run_id
+                        ))
+                    
                     conn.commit()
                     # Audit: event run failed (exception path)
                     try:
