@@ -724,10 +724,8 @@ async function checkRunningTasks(host, timeoutMs = 60000) {
 async function waitForNoRunningTasks(hosts, actionName) {
   const checks = hosts.map(async ({host}) => {
     // User is already authenticated via login - proceed with check
-    logMsg(`Checking for running tasks on ${host} before ${actionName}...`);
     const checkResult = await checkRunningTasks(host, 1000); // Quick check first
     if (!checkResult.running) {
-      logMsg(`No running tasks on ${host}`);
       return {host, success: true};
     } else {
       logMsg(`Waiting for running tasks to complete on ${host}...`);
@@ -1022,7 +1020,6 @@ async function loadSelectedNhiCredential() {
       if (hostSourceNhi) {
         hostSourceNhi.disabled = false;
       }
-      showStatus(`NHI credential loaded. Compare hosts from credential with Host List.`);
     } else {
       // Clear NHI hosts if credential has none
       if (fabricHostFromNhiInput) {
@@ -1113,6 +1110,85 @@ async function loadSelectedNhiCredential() {
     // Disable Run button when credentials are cleared
     const runBtnCleared = el('btnInstallSelected');
     if (runBtnCleared) runBtnCleared.disabled = true;
+  }
+}
+
+// Load selected NHI credential for edit view - no password required
+async function loadSelectedNhiCredentialForEdit() {
+  const select = el('editNhiCredentialSelect');
+  
+  if (!select) return;
+  
+  const nhiId = select.value;
+  
+  if (!nhiId) {
+    return;
+  }
+  
+  try {
+    // No password required - uses FS_SERVER_SECRET
+    const res = await api(`/nhi/get/${nhiId}`);
+    
+    if (!res.ok) {
+      showStatus('Failed to load NHI credential');
+      return;
+    }
+    
+    const nhiData = await res.json();
+    
+    if (!nhiData || typeof nhiData !== 'object') {
+      showStatus('Invalid response format from server');
+      return;
+    }
+    
+    const nhiHosts = [];
+    // Session-based: tokens are stored server-side, backend returns hosts_with_tokens array
+    if (nhiData.hosts_with_tokens && Array.isArray(nhiData.hosts_with_tokens) && nhiData.hosts_with_tokens.length > 0) {
+      // Collect host list from hosts_with_tokens array (each item is a string host)
+      nhiHosts.push(...nhiData.hosts_with_tokens);
+    }
+    
+    // Populate editFabricHost with hosts from NHI credential
+    const editFabricHostInput = el('editFabricHost');
+    
+    if (nhiHosts.length > 0) {
+      // Populate the edit fabric host input
+      // nhiHosts is an array of host strings
+      const nhiHostsStr = nhiHosts.join(' ');
+      if (editFabricHostInput) {
+        editFabricHostInput.value = nhiHostsStr;
+        
+        // Parse and validate hosts
+        const hosts = nhiHostsStr.split(/\s+/).filter(h => h.trim()).map(hostStr => {
+          const parts = hostStr.split(':');
+          return {
+            host: parts[0],
+            port: parts.length > 1 ? parts[1] : undefined,
+            isValid: true
+          };
+        });
+        
+        // Store validated hosts
+        window.editValidatedHosts = hosts;
+        
+        // Render host chips
+        renderHostChipsForTarget('editFabricHost', 'editFabricHostChips', 'editFabricHostStatus', hosts);
+      }
+    } else {
+      // Clear hosts if credential has none
+      if (editFabricHostInput) {
+        editFabricHostInput.value = '';
+      }
+      const editFabricHostChips = el('editFabricHostChips');
+      if (editFabricHostChips) {
+        editFabricHostChips.innerHTML = '';
+      }
+      window.editValidatedHosts = [];
+      showStatus(`NHI credential '${nhiData.name}' loaded (no hosts in credential)`);
+    }
+  } catch (error) {
+    logMsg(`Error loading NHI credential for edit: ${error.message || error}`);
+    showStatus(`Error loading NHI credential: ${error.message || error}`);
   }
 }
 
@@ -1310,7 +1386,8 @@ async function api(path, options = {}) {
   
   // For GET requests, check cache and pending requests to avoid duplicates
   const method = (options.method || 'GET').toUpperCase();
-  if (method === 'GET') {
+  const noCache = options.noCache === true; // Option to bypass cache
+  if (method === 'GET' && !noCache) {
     const cacheKey = `${path}?${new URLSearchParams(params).toString()}`;
     const now = Date.now();
     
@@ -1331,8 +1408,11 @@ async function api(path, options = {}) {
     
     // Check if there's already a pending request for this path
     if (_pendingRequests.has(cacheKey)) {
-      // Wait for the pending request to complete
-      return await _pendingRequests.get(cacheKey);
+      // Wait for the pending request to complete and clone the response
+      // since Response body can only be read once
+      const pendingResponse = await _pendingRequests.get(cacheKey);
+      // Clone the response so each caller gets their own readable stream
+      return pendingResponse.clone();
     }
   }
   
@@ -2199,12 +2279,9 @@ function addTplRow(prefill) {
     // Load cache asynchronously, then populate
     (async () => {
       try {
-        const cacheRes = await api('/cache/templates');
-        if (cacheRes.ok) {
-          const cacheData = await cacheRes.json();
-          window.cachedTemplates = cacheData.templates || [];
-          populateReposFromCache();
-        }
+        const cacheData = await apiJson('/cache/templates');
+        window.cachedTemplates = cacheData.templates || [];
+        populateReposFromCache();
       } catch (error) {
         console.error('Error loading cached templates:', error);
       }
@@ -2422,6 +2499,20 @@ async function loadSection(sectionName) {
 function initializeSection(sectionName) {
   // Section-specific initialization
   if (sectionName === 'configurations') {
+    // Unified configurations section - show list view by default
+    const listView = el('configsListView');
+    const editView = el('configEditView');
+    const runView = el('configRunView');
+    if (listView) listView.style.display = 'block';
+    if (editView) editView.style.display = 'none';
+    if (runView) runView.style.display = 'none';
+    
+    // Clear configuration name banner when navigating to configurations section
+    // (unless we're in the middle of loading a configuration)
+    if (!window.isLoadingConfiguration) {
+      clearConfigName();
+    }
+    
     loadConfigurations();
     setupConfigButtons();
   } else if (sectionName === 'event-schedule') {
@@ -2445,14 +2536,6 @@ function initializeSection(sectionName) {
     initSshCommandProfileFormValidation();
     setupSshCommandProfileButtons();
     loadSshCommandProfiles();
-  } else if (sectionName === 'preparation') {
-    // Clear configuration name banner when navigating to preparation section
-    // (unless we're in the middle of loading a configuration)
-    if (!window.isLoadingConfiguration) {
-      clearConfigName();
-    }
-    // Initialize preparation section
-    initializePreparationSection();
   } else if (sectionName === 'audit-logs') {
     // Audit Logs section initialization
     setupAuditLogsButtons();
@@ -2494,11 +2577,8 @@ function initializePreparationSection() {
   if (!window.cachedTemplates || window.cachedTemplates.length === 0) {
     (async () => {
       try {
-        const cacheRes = await api('/cache/templates');
-        if (cacheRes.ok) {
-          const cacheData = await cacheRes.json();
-          window.cachedTemplates = cacheData.templates || [];
-        }
+        const cacheData = await apiJson('/cache/templates');
+        window.cachedTemplates = cacheData.templates || [];
       } catch (error) {
         console.error('Error loading cached templates:', error);
       }
@@ -3641,10 +3721,20 @@ async function loadConfigurations() {
   const configsList = el('configsList');
   if (!configsList) return;
   
-  configsList.innerHTML = '<p>Loading configurations...</p>';
+  configsList.innerHTML = '<p>Loading...</p>';
   
   try {
-    const res = await api('/config/list');
+    // Clear cache and pending requests before fetching to ensure fresh data
+    const cacheKey = '/config/list?';
+    if (_requestCache.has(cacheKey)) {
+      _requestCache.delete(cacheKey);
+    }
+    if (_pendingRequests.has(cacheKey)) {
+      _pendingRequests.delete(cacheKey);
+    }
+    
+    // Force a fresh request by bypassing cache
+    const res = await api('/config/list', { noCache: true });
     if (!res.ok) {
       configsList.innerHTML = '<p style="color: #f87171;">Failed to load configurations</p>';
       return;
@@ -3654,7 +3744,7 @@ async function loadConfigurations() {
     const configs = data.configurations || [];
     
     if (configs.length === 0) {
-      configsList.innerHTML = '<p>No saved configurations found. Save configurations in FabricStudio Runs</p>';
+      configsList.innerHTML = '<p>No saved configurations found. Click "New Configuration" to create one.</p>';
       return;
     }
     
@@ -3668,8 +3758,8 @@ async function loadConfigurations() {
           <div style="display: flex; align-items: center; gap: 8px; margin-bottom: 8px;">
             <input type="checkbox" class="config-checkbox" value="${config.id}" id="config-${config.id}" style="margin: 0;">
             <label for="config-${config.id}" style="margin: 0; font-weight: 600; cursor: pointer; flex: 1;">${config.name}</label>
-            <button type="button" class="btn-config-load" data-config-id="${config.id}" style="padding: 4px 12px; font-size: 12px; cursor: pointer; background: #da291c; border-color: #da291c; color: white; border: 1px solid #da291c; border-radius: 0; box-shadow: 0 2px 4px rgba(218, 41, 28, 0.3);">Load</button>
-            <button type="button" class="btn-config-edit" data-config-id="${config.id}" style="padding: 4px 12px; font-size: 12px; background: #da291c; border-color: #da291c; color: white; cursor: pointer; border: 1px solid #da291c; border-radius: 0; box-shadow: 0 2px 4px rgba(218, 41, 28, 0.3);">Edit/View</button>
+            <button type="button" class="btn-config-run" data-config-id="${config.id}" style="padding: 4px 12px; font-size: 12px; cursor: pointer; background: #10b981; border-color: #10b981; color: white; border: 1px solid #10b981; border-radius: 0; box-shadow: 0 2px 4px rgba(16, 185, 129, 0.3); font-weight: 600;">Run</button>
+            <button type="button" class="btn-config-edit" data-config-id="${config.id}" style="padding: 4px 12px; font-size: 12px; background: #da291c; border-color: #da291c; color: white; cursor: pointer; border: 1px solid #da291c; border-radius: 0; box-shadow: 0 2px 4px rgba(218, 41, 28, 0.3);">Edit</button>
             <button type="button" class="btn-config-delete" data-config-id="${config.id}" style="padding: 4px 12px; font-size: 12px; background: #da291c; border-color: #da291c; color: white; cursor: pointer; border: 1px solid #da291c; border-radius: 0; box-shadow: 0 2px 4px rgba(218, 41, 28, 0.3);">Delete</button>
           </div>
           <div style="font-size: 12px; color: #86868b; margin-left: 24px;">
@@ -3682,8 +3772,8 @@ async function loadConfigurations() {
     html += '</div>';
     configsList.innerHTML = html;
     
-    // Add event listeners for load and edit buttons
-    document.querySelectorAll('.btn-config-load').forEach(btn => {
+    // Add event listeners for run, edit, and delete buttons
+    document.querySelectorAll('.btn-config-run').forEach(btn => {
       btn.addEventListener('click', async (e) => {
         e.preventDefault();
         e.stopPropagation();
@@ -3693,7 +3783,7 @@ async function loadConfigurations() {
           showStatus('Error: Invalid configuration ID');
           return;
         }
-        await loadConfigurationById(configId);
+        await runConfigurationById(configId);
       });
     });
     
@@ -3831,14 +3921,22 @@ function hideLoadingScreen() {
   }
 }
 
-async function loadConfigurationById(configId) {
+async function runConfigurationById(configId) {
   // Set flag to prevent clearing config name during section load
   window.isLoadingConfiguration = true;
   
   showLoadingScreen('Loading configuration...');
   try {
-    showStatus(`Loading configuration...`);
-    const getRes = await api(`/config/get/${configId}`);
+    // Clear cache for this specific config to ensure fresh data
+    const cacheKey = `/config/get/${configId}?`;
+    if (_requestCache.has(cacheKey)) {
+      _requestCache.delete(cacheKey);
+    }
+    if (_pendingRequests.has(cacheKey)) {
+      _pendingRequests.delete(cacheKey);
+    }
+    
+    const getRes = await api(`/config/get/${configId}`, { noCache: true });
     if (!getRes.ok) {
       showStatus('Failed to retrieve configuration');
       hideLoadingScreen();
@@ -3860,64 +3958,64 @@ async function loadConfigurationById(configId) {
     // Get the configuration name first
     const configName = configData.name || 'Unknown Configuration';
     
-    // Display configuration name at top (before switching sections)
+    // Display configuration name at top
     displayConfigName(configName);
     
-    // Switch to preparation section
-    // Find the submenu item for "Run Configuration" (preparation section)
-    const prepItem = document.querySelector('.submenu-item[data-section="preparation"]') || 
-                     document.querySelector('.menu-item[data-section="preparation"]');
-    if (prepItem) {
-      // Check if we're already on the preparation section
-      const currentSection = document.querySelector('.menu-item.active');
-      const isAlreadyOnPrep = currentSection && currentSection.getAttribute('data-section') === 'preparation';
-      
-      if (!isAlreadyOnPrep) {
-        // Expand the parent menu group if it's a submenu item
-        const menuGroup = prepItem.closest('.menu-group');
-        if (menuGroup && prepItem.classList.contains('submenu-item')) {
-          menuGroup.classList.add('expanded');
-        }
-        
-        // Click to switch to preparation section
-        prepItem.click();
-        
-        // Wait for section to load (reduced from 300ms)
-        await new Promise(resolve => setTimeout(resolve, 100));
-      }
-      
-      // Wait for preparation section elements to be available (reduced timeout)
-      let attempts = 0;
-      const maxAttempts = 20; // Reduced from 50 (2 seconds max instead of 5)
-      while (attempts < maxAttempts && !el('fabricHost')) {
-        await new Promise(resolve => setTimeout(resolve, 100));
-        attempts++;
-      }
-      
-      if (!el('fabricHost')) {
-        showStatus('Error: Preparation section not loaded. Please try clicking on FabricStudio Runs manually.');
-        hideLoadingScreen();
-        return;
-      }
-      
-      // Ensure preparation section is initialized (removed unnecessary wait)
-      if (typeof initializePreparationSection === 'function') {
-        // Re-initialize to ensure all handlers are set up
-        initializePreparationSection();
-        // Removed 200ms wait - initialization is synchronous
-      }
-    } else {
-      showStatus('Error: Could not find preparation section menu item');
+    // Show run view and hide other views
+    const listView = el('configsListView');
+    const editView = el('configEditView');
+    const runView = el('configRunView');
+    if (listView) listView.style.display = 'none';
+    if (editView) editView.style.display = 'none';
+    if (runView) runView.style.display = 'block';
+    
+    // Update run view title
+    const runTitle = el('configRunTitle');
+    if (runTitle) runTitle.textContent = `Running: ${configName}`;
+    
+    // Wait for run view elements to be available (uses same IDs as preparation section)
+    let attempts = 0;
+    const maxAttempts = 20;
+    while (attempts < maxAttempts && !el('fabricHost')) {
+      await new Promise(resolve => setTimeout(resolve, 100));
+      attempts++;
+    }
+    
+    if (!el('fabricHost')) {
+      showStatus('Error: Run view not loaded properly');
       hideLoadingScreen();
+      window.isLoadingConfiguration = false;
       return;
     }
     
-    // Restore configuration
+    // Initialize run view handlers (sets up preparation section logic)
+    initializeRunView();
+    
+    // Restore configuration to run view (uses same element IDs as preparation section)
     await restoreConfiguration(configData.config_data);
     
-    // No need for additional wait - restoreConfiguration already handles all async operations
-    showStatus(`Configuration '${configName}' loaded successfully`);
-    logMsg(`Configuration loaded: ${configName}`);
+    // Wait a bit to ensure everything is set up, then ensure button is enabled
+    await new Promise(resolve => setTimeout(resolve, 500));
+    
+    // Verify the Run button handler is set up
+    const runBtn = el('btnInstallSelected');
+    if (runBtn) {
+      // Ensure handler is attached
+      if (!runBtn.onclick) {
+        runBtn.onclick = handleTrackedRunButton;
+      }
+      
+      // Force enable the button if configuration was loaded successfully
+      // The button should be enabled since hosts are confirmed and tokens are acquired
+      // Update button state
+      updateCreateEnabled();
+      
+      // If button is still disabled after updateCreateEnabled, force enable it
+      // since we know the configuration was loaded successfully
+      if (runBtn.disabled) {
+        runBtn.disabled = false;
+      }
+    }
     hideLoadingScreen();
   } catch (error) {
     showStatus(`Error loading configuration: ${error.message || error}`);
@@ -3932,8 +4030,16 @@ async function loadConfigurationById(configId) {
 async function editConfiguration(configId) {
   showLoadingScreen('Loading configuration for editing...');
   try {
-    showStatus(`Loading configuration for editing...`);
-    const getRes = await api(`/config/get/${configId}`);
+    // Clear cache for this specific config to ensure fresh data
+    const cacheKey = `/config/get/${configId}?`;
+    if (_requestCache.has(cacheKey)) {
+      _requestCache.delete(cacheKey);
+    }
+    if (_pendingRequests.has(cacheKey)) {
+      _pendingRequests.delete(cacheKey);
+    }
+    
+    const getRes = await api(`/config/get/${configId}`, { noCache: true });
     if (!getRes.ok) {
       showStatus('Failed to retrieve configuration');
       hideLoadingScreen();
@@ -3958,8 +4064,14 @@ async function editConfiguration(configId) {
     // Show edit view and hide list view
     const listView = el('configsListView');
     const editView = el('configEditView');
+    const runView = el('configRunView');
     if (listView) listView.style.display = 'none';
     if (editView) editView.style.display = 'block';
+    if (runView) runView.style.display = 'none';
+    
+    // Update title
+    const title = el('configEditTitle');
+    if (title) title.textContent = `Edit: ${configName}`;
     
     // Populate edit form (async function)
     await populateConfigEditForm(configName, config);
@@ -3976,7 +4088,6 @@ async function editConfiguration(configId) {
     }
     
     showStatus(`Configuration '${configName}' loaded for editing`);
-    logMsg(`Configuration loaded for editing: ${configName} (ID: ${configId})`);
     hideLoadingScreen();
   } catch (error) {
     showStatus(`Error loading configuration for editing: ${error.message || error}`);
@@ -4088,10 +4199,25 @@ async function populateConfigEditForm(name, config) {
       nhiCredentialSelect.innerHTML = '<option value="">Error loading credentials</option>';
     }
     
-    // Update stored ID when dropdown changes (only add listener once)
+    // Update stored ID and load hosts when dropdown changes (only add listener once)
     if (!nhiCredentialSelect.hasAttribute('data-listener-added')) {
-      nhiCredentialSelect.addEventListener('change', () => {
+      nhiCredentialSelect.addEventListener('change', async () => {
         window.editNhiCredentialId = nhiCredentialSelect.value || '';
+        // Load the NHI credential and populate hosts
+        if (nhiCredentialSelect.value) {
+          await loadSelectedNhiCredentialForEdit();
+        } else {
+          // Clear hosts if no credential selected
+          const editFabricHostInput = el('editFabricHost');
+          if (editFabricHostInput) {
+            editFabricHostInput.value = '';
+          }
+          const editFabricHostChips = el('editFabricHostChips');
+          if (editFabricHostChips) {
+            editFabricHostChips.innerHTML = '';
+          }
+          window.editValidatedHosts = [];
+        }
       });
       nhiCredentialSelect.setAttribute('data-listener-added', 'true');
     }
@@ -4170,11 +4296,8 @@ async function populateConfigEditForm(name, config) {
   if (!window.cachedTemplates || window.cachedTemplates.length === 0) {
     (async () => {
       try {
-        const cacheRes = await api('/cache/templates');
-        if (cacheRes.ok) {
-          const cacheData = await cacheRes.json();
-          window.cachedTemplates = cacheData.templates || [];
-        }
+        const cacheData = await apiJson('/cache/templates');
+        window.cachedTemplates = cacheData.templates || [];
       } catch (error) {
         console.error('Error loading cached templates for edit form:', error);
       }
@@ -4455,12 +4578,9 @@ function addEditTplRow(prefill) {
     // Load cache asynchronously, then populate
     (async () => {
       try {
-        const cacheRes = await api('/cache/templates');
-        if (cacheRes.ok) {
-          const cacheData = await cacheRes.json();
-          window.cachedTemplates = cacheData.templates || [];
-          populateReposFromCache();
-        }
+        const cacheData = await apiJson('/cache/templates');
+        window.cachedTemplates = cacheData.templates || [];
+        populateReposFromCache();
       } catch (error) {
         console.error('Error loading cached templates:', error);
       }
@@ -4984,16 +5104,179 @@ async function handleSaveEditConfig() {
     logMsg(`Configuration updated: ${name} (ID: ${editingConfigId})`);
     
     // Clear edit mode
+    const savedConfigId = editingConfigId;
     editingConfigId = null;
     
-    // Return to list view
+    // Clear API cache and pending requests for configurations list
+    const cacheKey = '/config/list?';
+    if (_requestCache.has(cacheKey)) {
+      _requestCache.delete(cacheKey);
+    }
+    if (_pendingRequests.has(cacheKey)) {
+      _pendingRequests.delete(cacheKey);
+    }
+    
+    // Clear cache for the saved configuration to ensure fresh data on next load
+    if (savedConfigId) {
+      const configCacheKey = `/config/get/${savedConfigId}?`;
+      if (_requestCache.has(configCacheKey)) {
+        _requestCache.delete(configCacheKey);
+      }
+      if (_pendingRequests.has(configCacheKey)) {
+        _pendingRequests.delete(configCacheKey);
+      }
+    }
+    
+    // Return to list view (this will call showConfigsListView which calls loadConfigurations)
     cancelEditConfig();
     
-    // Refresh configurations list
-    loadConfigurations();
+    // Note: cancelEditConfig() already calls showConfigsListView() which calls loadConfigurations()
+    // No need to click menu item or call loadConfigurations() again
   } catch (error) {
     showStatus(`Error saving configuration: ${error.message || error}`);
     logMsg(`Error saving configuration: ${error.message || error}`);
+  }
+}
+
+function showConfigsListView() {
+  const listView = el('configsListView');
+  const editView = el('configEditView');
+  const runView = el('configRunView');
+  if (listView) listView.style.display = 'block';
+  if (editView) editView.style.display = 'none';
+  if (runView) runView.style.display = 'none';
+  clearConfigName();
+  loadConfigurations();
+}
+
+function showNewConfigView() {
+  // Clear edit mode
+  editingConfigId = null;
+  
+  // Show edit view and hide list view
+  const listView = el('configsListView');
+  const editView = el('configEditView');
+  const runView = el('configRunView');
+  if (listView) listView.style.display = 'none';
+  if (editView) editView.style.display = 'block';
+  if (runView) runView.style.display = 'none';
+  
+  // Update title
+  const title = el('configEditTitle');
+  if (title) title.textContent = 'New Configuration';
+  
+  // Clear form
+  const inputs = ['editConfigName', 'editFabricHost', 'editNewHostname', 'editChgPass', 'editSshWaitTime'];
+  inputs.forEach(id => {
+    const input = el(id);
+    if (input) input.value = '';
+  });
+  
+  // Clear NHI credential dropdown
+  const nhiCredentialSelect = el('editNhiCredentialSelect');
+  if (nhiCredentialSelect) nhiCredentialSelect.value = '';
+  
+  // Clear SSH profile dropdown
+  const editSshProfileSelect = el('editSshProfileSelect');
+  if (editSshProfileSelect) editSshProfileSelect.value = '';
+  
+  const expertModeInput = el('editExpertMode');
+  if (expertModeInput) expertModeInput.checked = false;
+  
+  const runWorkspaceEnabled = el('editRunWorkspaceEnabled');
+  if (runWorkspaceEnabled) runWorkspaceEnabled.checked = true;
+  
+  const fabricHostChips = el('editFabricHostChips');
+  if (fabricHostChips) fabricHostChips.innerHTML = '';
+  
+  const fabricHostStatus = el('editFabricHostStatus');
+  if (fabricHostStatus) fabricHostStatus.textContent = '';
+  
+  const tplFormList = el('editTplFormList');
+  if (tplFormList) tplFormList.innerHTML = '';
+  
+  // Clear install select dropdown
+  const editInstallSelect = el('editInstallSelect');
+  if (editInstallSelect) editInstallSelect.innerHTML = '';
+  
+  window.editNhiCredentialId = '';
+  window.editValidatedHosts = [];
+  
+  // Load NHI credentials and SSH profiles for the edit form
+  loadNhiCredentialsForEdit();
+  loadSshProfilesForEdit();
+  
+  // Ensure NHI credential change handler is set up (in case it wasn't set up yet)
+  if (nhiCredentialSelect && !nhiCredentialSelect.hasAttribute('data-listener-added')) {
+    nhiCredentialSelect.addEventListener('change', async () => {
+      window.editNhiCredentialId = nhiCredentialSelect.value || '';
+      // Load the NHI credential and populate hosts
+      if (nhiCredentialSelect.value) {
+        await loadSelectedNhiCredentialForEdit();
+      } else {
+        // Clear hosts if no credential selected
+        const editFabricHostInput = el('editFabricHost');
+        if (editFabricHostInput) {
+          editFabricHostInput.value = '';
+        }
+        const editFabricHostChips = el('editFabricHostChips');
+        if (editFabricHostChips) {
+          editFabricHostChips.innerHTML = '';
+        }
+        window.editValidatedHosts = [];
+      }
+    });
+    nhiCredentialSelect.setAttribute('data-listener-added', 'true');
+  }
+  
+  showStatus('Creating new configuration');
+}
+
+// Load NHI credentials for edit form
+async function loadNhiCredentialsForEdit() {
+  const nhiSelect = el('editNhiCredentialSelect');
+  if (!nhiSelect) return;
+  
+  try {
+    const res = await api('/nhi/list');
+    if (res.ok) {
+      const data = await res.json();
+      const credentials = data.credentials || [];
+      
+      nhiSelect.innerHTML = '<option value="">Select NHI credential...</option>';
+      credentials.forEach(cred => {
+        const option = document.createElement('option');
+        option.value = cred.id.toString();
+        option.textContent = `${cred.name} (${cred.client_id})`;
+        nhiSelect.appendChild(option);
+      });
+    }
+  } catch (error) {
+    logMsg(`Error loading NHI credentials for edit: ${error.message || error}`);
+  }
+}
+
+// Load SSH profiles for edit form
+async function loadSshProfilesForEdit() {
+  const sshSelect = el('editSshProfileSelect');
+  if (!sshSelect) return;
+  
+  try {
+    const res = await api('/ssh-command-profiles/list');
+    if (res.ok) {
+      const data = await res.json();
+      const profiles = data.profiles || [];
+      
+      sshSelect.innerHTML = '<option value="">None (select SSH profile)</option>';
+      profiles.forEach(profile => {
+        const option = document.createElement('option');
+        option.value = profile.id.toString();
+        option.textContent = profile.name || `Profile ${profile.id}`;
+        sshSelect.appendChild(option);
+      });
+    }
+  } catch (error) {
+    logMsg(`Error loading SSH profiles for edit: ${error.message || error}`);
   }
 }
 
@@ -5002,10 +5285,7 @@ function cancelEditConfig() {
   editingConfigId = null;
   
   // Show list view and hide edit view
-  const listView = el('configsListView');
-  const editView = el('configEditView');
-  if (listView) listView.style.display = 'block';
-  if (editView) editView.style.display = 'none';
+  showConfigsListView();
   
   // Clear form
   const inputs = ['editConfigName', 'editFabricHost', 'editNewHostname', 'editChgPass', 'editSshWaitTime'];
@@ -5064,6 +5344,12 @@ async function deleteConfiguration(configId) {
     
     showStatus('Configuration deleted successfully');
     logMsg(`Configuration ${configId} deleted`);
+    
+    // Clear API cache for config list to ensure fresh data
+    const cacheKey = '/config/list?';
+    if (_requestCache.has(cacheKey)) {
+      _requestCache.delete(cacheKey);
+    }
     
     // Reload configurations list
     loadConfigurations();
@@ -5841,11 +6127,9 @@ async function handleRunButton() {
   
   runBtn = runBtn || el('btnInstallSelected');
   if (runBtn) runBtn.disabled = true;
-  if (saveBtn) saveBtn.disabled = true;
   
   isRunInProgress = true;
   showRunInProgressWarning();
-  showStatus('Installation started.');
   
   updateRunProgress(0, 'Starting...');
   startRunTimer();
@@ -5861,9 +6145,10 @@ async function handleRunButton() {
     // User is already authenticated via login - proceed
     const hosts = parseFabricHosts();
     
-    // Build templates list from ALL rows
-    updateRunProgress(5, 'Collecting workspace templates from rows...');
+    // Build templates list from ALL rows (with deduplication)
+    updateRunProgress(5, 'Collecting templates...');
     const allRowTemplates = [];
+    const seenTemplates = new Set(); // Track seen templates to avoid duplicates
     document.querySelectorAll('.tpl-row').forEach(row => {
       const selects = row.querySelectorAll('select');
       const repoSelect = selects[0]; // Repo is the first select
@@ -5874,7 +6159,13 @@ async function handleRunButton() {
       const template_name = templateFiltered ? templateFiltered.getValue() : '';
       const version = versionSelect?.value || '';
       if (template_name && repo_name && version) {
-        allRowTemplates.push({ template_name, repo_name, version });
+        // Create a unique key for this template
+        const templateKey = `${repo_name}|||${template_name}|||${version}`;
+        // Only add if we haven't seen this exact template before
+        if (!seenTemplates.has(templateKey)) {
+          seenTemplates.add(templateKey);
+          allRowTemplates.push({ template_name, repo_name, version });
+        }
       }
     });
     
@@ -5915,7 +6206,6 @@ async function handleRunButton() {
     if (templatesToCreate.length > 0) {
       // Execute preparation steps (5-20%)
       updateRunProgress(7, 'Executing preparation steps...');
-      logMsg('Executing preparation steps...');
       
       // Refresh repositories
       updateRunProgress(9, 'Refreshing repositories...');
@@ -5945,7 +6235,6 @@ async function handleRunButton() {
       const hostnameBase = el('newHostname').value.trim();
       if (hostnameBase) {
         updateRunProgress(15, 'Changing hostnames...');
-        logMsg('Changing hostnames...');
         // Check for running tasks before changing hostname
         await waitForNoRunningTasks(hosts, 'Change Hostname');
         const hostnamePromises = hosts.map(async ({host}, index) => {
@@ -6337,7 +6626,6 @@ async function handleRunButton() {
     if (sshProfileId) {
       updateRunProgress(61, 'Executing SSH profiles...');
       showStatus('Executing SSH profiles on all hosts...');
-      logMsg('Starting SSH profile execution');
       
       // No encryption password required - uses FS_SERVER_SECRET
       try {
@@ -6722,18 +7010,21 @@ function collectConfiguration() {
     templates: []
   };
   
-  // Collect all template rows (even if empty)
+  // Collect all template rows (only include rows with all values filled)
   document.querySelectorAll('.tpl-row').forEach(row => {
     const selects = row.querySelectorAll('select');
     const repoSelect = selects[0]; // Repo is the first select
     const templateFiltered = row._templateFiltered;
     // Version is the last select (hidden template select is at index 1)
     const versionSelect = selects.length > 2 ? selects[selects.length - 1] : (selects[1] || null);
-    if (versionSelect) {
-      const repo_name = repoSelect?.value || '';
+    if (repoSelect && templateFiltered && versionSelect) {
+      const repo_name = repoSelect.value || '';
       const template_name = templateFiltered ? templateFiltered.getValue() : '';
-      const version = versionSelect?.value || '';
-      config.templates.push({ repo_name, template_name, version });
+      const version = versionSelect.value || '';
+      // Only add template if all three values are filled
+      if (repo_name && template_name && version) {
+        config.templates.push({ repo_name, template_name, version });
+      }
     }
   });
   
@@ -6808,7 +7099,6 @@ async function restoreConfiguration(config) {
         
         // Automatically load the credential (no password required)
         try {
-          showStatus('Loading NHI credential...');
           await loadSelectedNhiCredential();
           
           // Wait for credential to load and hosts to be populated (reduced from 300ms)
@@ -6864,7 +7154,6 @@ async function restoreConfiguration(config) {
               }
             } else {
               await renderFabricHostList();
-              showStatus('Configuration loaded. No hosts available.');
             }
           } else if (config.confirmedHosts && config.confirmedHosts.length > 0) {
             // Fallback: Use confirmed hosts from configuration if NHI credential doesn't have hosts
@@ -6894,7 +7183,6 @@ async function restoreConfiguration(config) {
                 showStatus('Configuration loaded but token acquisition failed. Please check credentials.');
               }
             } else {
-              showStatus('Configuration loaded. No hosts available.');
             }
           } else {
             showStatus('NHI credential loaded. No hosts in credential.');
@@ -7440,18 +7728,10 @@ async function restoreConfiguration(config) {
     }
     // Clear the restoring flag - restore is complete
     isRestoringConfiguration = false;
-    // Run button will be enabled when hosts are confirmed and tokens are acquired
-    const runBtnFinal = el('btnInstallSelected');
-    if (runBtnFinal) {
-      runBtnFinal.disabled = true;
-    }
     
     // Call updateCreateEnabled to ensure button state is correct
-    // This will keep the run button disabled until both NHI credentials are loaded and hosts are confirmed
+    // This will enable the run button if hosts are confirmed and tokens are acquired
     updateCreateEnabled();
-    
-    showStatus('Configuration restored successfully. Credentials loaded automatically.');
-    logMsg('Configuration restored - credentials loaded automatically');
   } catch (error) {
     // Clear the restoring flag even on error
     isRestoringConfiguration = false;
@@ -7476,8 +7756,57 @@ async function restoreConfiguration(config) {
   }
 }
 
+
+// Initialize run view handlers
+function initializeRunView() {
+  // Initialize preparation section logic for run view (uses same element IDs)
+  if (typeof initializePreparationSection === 'function') {
+    initializePreparationSection();
+  }
+  
+  // Ensure the Run button handler is attached (initializePreparationSection should do this, but ensure it)
+  if (typeof attachRunButtonHandler === 'function') {
+    attachRunButtonHandler();
+  }
+  
+  // The Run button is btnInstallSelected (same as preparation section)
+  // It's already set up by initializePreparationSection and attachRunButtonHandler
+  // We just need to ensure the configuration is restored
+  
+  // Set up Cancel button
+  const cancelBtn = el('btnCancelConfig');
+  if (cancelBtn) {
+    cancelBtn.onclick = () => {
+      showConfigsListView();
+    };
+  }
+}
+
 // Refresh configurations button - set up when section loads
 function setupConfigButtons() {
+  // New Configuration button
+  const newConfigBtn = el('btnNewConfig');
+  if (newConfigBtn) {
+    newConfigBtn.onclick = () => {
+      showNewConfigView();
+    };
+  }
+  
+  // Back to List buttons
+  const backToListBtn = el('btnBackToList');
+  if (backToListBtn) {
+    backToListBtn.onclick = () => {
+      showConfigsListView();
+    };
+  }
+  
+  const backFromRunBtn = el('btnBackFromRun');
+  if (backFromRunBtn) {
+    backFromRunBtn.onclick = () => {
+      showConfigsListView();
+    };
+  }
+  
   const refreshBtn = el('btnRefreshConfigs');
   if (refreshBtn) {
     refreshBtn.onclick = () => {
@@ -7543,6 +7872,14 @@ function setupConfigButtons() {
         if (successCount > 0) {
           showStatus(`Deleted ${successCount} configuration(s)${failCount > 0 ? `, ${failCount} failed` : ''}`);
           logMsg(`Deleted ${successCount} configuration(s)`);
+          
+          // Clear API cache for config list to ensure fresh data
+          const cacheKey = '/config/list?';
+          if (_requestCache.has(cacheKey)) {
+            _requestCache.delete(cacheKey);
+          }
+          
+          // Reload configurations list
           loadConfigurations();
         } else {
           showStatus(`Failed to delete ${failCount} configuration(s)`);
@@ -8030,11 +8367,15 @@ function initEventFormValidation() {
 function attachRunButtonHandler() {
   const runBtn = el('btnInstallSelected');
   if (runBtn) {
+    // Remove any existing handlers first
+    runBtn.onclick = null;
+    // Attach the handler
     runBtn.onclick = handleTrackedRunButton;
   }
 }
 // Tracked Run: execute step-by-step with detailed logging and track in Reports
 async function handleTrackedRunButton() {
+  
   let runId = null;
   const errors = [];
   const executionDetails = {
@@ -8047,12 +8388,10 @@ async function handleTrackedRunButton() {
   let hosts = []; // Declare hosts at function scope so it's accessible in catch block
   
   let runBtn = el('btnInstallSelected');
-  const saveBtn = el('btnSaveConfig');
 
   // Helper function to clean up run state (but keep Run button disabled)
   const cleanupRunState = () => {
     hideRunInProgressWarning();
-    if (saveBtn) saveBtn.disabled = false;
     hideRunProgress();
     stopRunTimer();
   };
@@ -8065,7 +8404,6 @@ async function handleTrackedRunButton() {
   };
 
   if (runBtn) runBtn.disabled = true;
-  if (saveBtn) saveBtn.disabled = true;
 
   isRunInProgress = true;
   showRunInProgressWarning();
@@ -8097,16 +8435,14 @@ async function handleTrackedRunButton() {
       if (createRes.ok) {
         const createData = await createRes.json();
         runId = createData.run_id;
-        logMsg(`Run tracking started (ID: ${runId})`);
       }
     } catch (err) {
       logMsg(`Warning: Could not create run record: ${err.message || err}`);
     }
     
     // Show progress bar and start timer
-    updateRunProgress(0, 'Starting tracked run...');
+    updateRunProgress(0, 'Starting...');
     startRunTimer();
-    logMsg('Starting tracked run...');
     
     hosts = getAllConfirmedHosts();
     if (hosts.length === 0) {
@@ -8143,10 +8479,10 @@ async function handleTrackedRunButton() {
     }
     
     // User is already authenticated via login - proceed
-    // Build templates list from ALL rows
-    updateRunProgress(5, 'Collecting workspace templates from rows...');
-    logMsg('Collecting workspace templates from rows...');
+    // Build templates list from ALL rows (with deduplication)
+    updateRunProgress(5, 'Collecting templates...');
     const allRowTemplates = [];
+    const seenTemplates = new Set(); // Track seen templates to avoid duplicates
     document.querySelectorAll('.tpl-row').forEach(row => {
       const selects = row.querySelectorAll('select');
       const repoSelect = selects[0];
@@ -8156,7 +8492,13 @@ async function handleTrackedRunButton() {
       const template_name = templateFiltered ? templateFiltered.getValue() : '';
       const version = versionSelect?.value || '';
       if (template_name && repo_name && version) {
-        allRowTemplates.push({ template_name, repo_name, version });
+        // Create a unique key for this template
+        const templateKey = `${repo_name}|||${template_name}|||${version}`;
+        // Only add if we haven't seen this exact template before
+        if (!seenTemplates.has(templateKey)) {
+          seenTemplates.add(templateKey);
+          allRowTemplates.push({ template_name, repo_name, version });
+        }
       }
     });
     
@@ -8208,7 +8550,6 @@ async function handleTrackedRunButton() {
     if (templatesToCreate.length > 0) {
       // Execute preparation steps (5-20%)
       updateRunProgress(7, 'Executing preparation steps...');
-      logMsg('Executing preparation steps...');
       
       // Refresh repositories
       updateRunProgress(9, 'Refreshing repositories...');
@@ -8238,7 +8579,6 @@ async function handleTrackedRunButton() {
       const hostnameBase = el('newHostname').value.trim();
       if (hostnameBase) {
         updateRunProgress(15, 'Changing hostnames...');
-        logMsg('Changing hostnames...');
         await waitForNoRunningTasks(hosts, 'Change Hostname');
         const hostnamePromises = hosts.map(async ({host}, index) => {
           try {
@@ -8726,7 +9066,6 @@ async function handleTrackedRunButton() {
     if (sshProfileId) {
       updateRunProgress(61, 'Executing SSH profiles...');
       showStatus('Executing SSH profiles on all hosts...');
-      logMsg('Starting SSH profile execution');
       
       // No encryption password required - uses FS_SERVER_SECRET
       try {
@@ -8785,7 +9124,6 @@ async function handleTrackedRunButton() {
           if (sshSuccessCount === availableHostsForSsh.length) {
             updateRunProgress(63, 'SSH profiles executed successfully!');
             showStatus(`SSH profiles executed successfully on all ${availableHostsForSsh.length} host(s)`);
-            logMsg(`SSH profiles executed successfully on all ${availableHostsForSsh.length} host(s)`);
           } else {
             updateRunProgress(63, `SSH profiles executed on ${sshSuccessCount}/${availableHostsForSsh.length} host(s)`);
             showStatus(`SSH profiles executed on ${sshSuccessCount}/${availableHostsForSsh.length} host(s)`);
@@ -9430,20 +9768,41 @@ async function handleSaveConfigButton() {
     logMsg(`Configuration ${action}: ${name}${editingConfigId ? ` (ID: ${editingConfigId})` : ''}`);
     
     // Clear edit mode and config name display
+    const savedConfigId = editingConfigId;
     editingConfigId = null;
     clearConfigName();
+    
+    // Clear API cache and pending requests for configurations list
+    const cacheKey = '/config/list?';
+    if (_requestCache.has(cacheKey)) {
+      _requestCache.delete(cacheKey);
+    }
+    if (_pendingRequests.has(cacheKey)) {
+      _pendingRequests.delete(cacheKey);
+    }
+    
+    // Clear cache for the saved configuration to ensure fresh data on next load
+    if (savedConfigId) {
+      const configCacheKey = `/config/get/${savedConfigId}?`;
+      if (_requestCache.has(configCacheKey)) {
+        _requestCache.delete(configCacheKey);
+      }
+      if (_pendingRequests.has(configCacheKey)) {
+        _pendingRequests.delete(configCacheKey);
+      }
+    }
     
     // Reset all inputs in FabricStudio Runs section
     resetPreparationSection();
     
-    // Navigate to configurations section
+    // Navigate to configurations section (this will trigger loadConfigurations via initializeSection)
     const configMenuItem = document.querySelector('.menu-item[data-section="configurations"]');
     if (configMenuItem) {
       configMenuItem.click(); // This will trigger the menu click handler
+    } else {
+      // If menu item not found, just refresh the list
+      loadConfigurations();
     }
-    
-    // Refresh configurations list
-    loadConfigurations();
   } catch (error) {
     showStatus(`Error saving configuration: ${error.message || error}`);
     logMsg(`Error saving configuration: ${error.message || error}`);
@@ -9465,7 +9824,7 @@ async function loadNhiCredentials() {
   if (!nhiList) return;
   
   try {
-    nhiList.innerHTML = '<p>Loading NHI credentials...</p>';
+    nhiList.innerHTML = '<p>Loading...</p>';
     
     const res = await api('/nhi/list');
     if (!res.ok) {
@@ -9592,8 +9951,6 @@ async function loadNhiCredentials() {
 }
 async function editNhi(nhiId) {
   try {
-    showStatus(`Loading NHI credential for editing...`);
-    
     // No password required - uses FS_SERVER_SECRET
     const getRes = await api(`/nhi/get/${nhiId}`);
     if (!getRes.ok) {
@@ -9641,7 +9998,6 @@ async function editNhi(nhiId) {
     document.querySelector('#nhi-management-section h3').scrollIntoView({ behavior: 'smooth', block: 'start' });
     
     showStatus(`NHI credential '${nhiData.name}' loaded for editing. Click Update to save changes.`);
-    logMsg(`NHI credential loaded for editing: ${nhiData.name} (ID: ${nhiId})`);
     
     // Update button state
     updateNhiButtons();
@@ -11372,8 +11728,6 @@ async function executeSshProfiles(hosts, sshProfileId, waitTimeSeconds = 60) {
   
   for (const {host, port} of hosts) {
     try {
-      logMsg(`Executing SSH profile on ${host}`);
-      
       const res = await api('/ssh-profiles/execute', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -11395,16 +11749,8 @@ async function executeSshProfiles(hosts, sshProfileId, waitTimeSeconds = 60) {
       
       const data = await res.json();
       if (data.success) {
-        logMsg(`SSH profile executed successfully on ${host}`);
-        if (data.output) {
-          logMsg(`SSH output for ${host}:\n${data.output}`);
-        }
         results.push({ host, success: true, output: data.output });
       } else {
-        logMsg(`SSH profile execution failed on ${host}: ${data.error || 'Unknown error'}`);
-        if (data.output) {
-          logMsg(`SSH output for ${host}:\n${data.output}`);
-        }
         results.push({ host, success: false, error: data.error || 'Unknown error', output: data.output });
       }
     } catch (error) {
@@ -11842,48 +12188,6 @@ async function showRunReport(runId) {
 
     const hosts = details.hosts || [];
 
-    // SSH Profile Section (standalone, before Host Summary)
-    // Show if sshProfile exists and has any meaningful data (hosts, profile info, or commands)
-    if (sshProfile && ((sshProfile.profile_id || sshProfile.profile_name) || (sshProfile.hosts && sshProfile.hosts.length > 0) || (sshProfile.commands && sshProfile.commands.length > 0))) {
-      html += '<h4 style="margin-top: 24px; margin-bottom: 12px;">SSH Profile Execution</h4>';
-      html += '<div style="border: 1px solid #d2d2d7; border-radius: 6px; padding: 16px; background: #fafafa; margin-bottom: 24px;">';
-      html += '<div style="margin-bottom: 12px;">';
-      html += `<div style="font-size: 13px; margin-bottom: 4px;"><strong>Profile:</strong> ${sshProfile.profile_name || 'N/A'} (ID: ${sshProfile.profile_id || 'N/A'})</div>`;
-      html += `<div style="font-size: 13px; margin-bottom: 4px;"><strong>Wait Time:</strong> ${sshProfile.wait_time_seconds || 0} seconds</div>`;
-      html += `<div style="font-size: 13px; margin-bottom: 4px;"><strong>Commands:</strong> ${sshProfile.commands ? sshProfile.commands.length : 0} command(s)</div>`;
-      if (sshProfile.commands && sshProfile.commands.length > 0) {
-        html += '<div style="margin-top: 8px; padding: 8px; background: #f9fafb; border-radius: 4px; font-family: monospace; font-size: 11px;">';
-        html += '<div style="font-weight: 600; margin-bottom: 4px;">Command List:</div>';
-        html += '<ul style="margin: 0; padding-left: 20px;">';
-        sshProfile.commands.forEach(cmd => {
-          html += `<li style="margin-bottom: 2px;">${cmd}</li>`;
-        });
-        html += '</ul></div>';
-      }
-      html += '</div>';
-      
-      if (sshProfile.hosts && sshProfile.hosts.length > 0) {
-        html += '<div style="margin-top: 12px; padding-top: 12px; border-top: 1px solid #d2d2d7;">';
-        html += '<div style="font-weight: 600; margin-bottom: 8px; font-size: 13px;">Host Results:</div>';
-        html += '<ul style="margin: 0; padding-left: 20px; font-size: 12px;">';
-        sshProfile.hosts.forEach(h => {
-          const statusIcon = h.success ? '✓' : '✗';
-          const statusColor = h.success ? '#10b981' : '#ef4444';
-          html += `<li style="margin-bottom: 8px;">
-            <div>
-              <span style="color: ${statusColor}; font-weight: bold;">${statusIcon}</span>
-              <code>${h.host}</code>: ${h.commands_executed || 0} executed, ${h.commands_failed || 0} failed${h.error ? ` - ${h.error}` : ''}
-            </div>`;
-          if (h.output) {
-            html += `<div style="margin-top: 4px; padding: 8px; background: #f9fafb; border-radius: 4px; font-family: monospace; font-size: 11px; color: #374151; white-space: pre-wrap; max-height: 200px; overflow-y: auto;">${h.output}</div>`;
-          }
-          html += `</li>`;
-        });
-        html += '</ul></div>';
-      }
-      html += '</div>';
-    }
-    
     if (hosts.length > 0) {
       html += '<h4 style="margin-top: 24px; margin-bottom: 12px;">Host Summary</h4>';
       html += '<div style="display: flex; flex-direction: column; gap: 16px;">';
@@ -11984,6 +12288,48 @@ async function showRunReport(runId) {
         html += '</div>';
       }
       
+      html += '</div>';
+    }
+    
+    // SSH Profile Section (standalone, after Host Summary)
+    // Show if sshProfile exists and has any meaningful data (hosts, profile info, or commands)
+    if (sshProfile && ((sshProfile.profile_id || sshProfile.profile_name) || (sshProfile.hosts && sshProfile.hosts.length > 0) || (sshProfile.commands && sshProfile.commands.length > 0))) {
+      html += '<h4 style="margin-top: 24px; margin-bottom: 12px;">SSH Profile Execution</h4>';
+      html += '<div style="border: 1px solid #d2d2d7; border-radius: 6px; padding: 16px; background: #fafafa; margin-bottom: 24px;">';
+      html += '<div style="margin-bottom: 12px;">';
+      html += `<div style="font-size: 13px; margin-bottom: 4px;"><strong>Profile:</strong> ${sshProfile.profile_name || 'N/A'} (ID: ${sshProfile.profile_id || 'N/A'})</div>`;
+      html += `<div style="font-size: 13px; margin-bottom: 4px;"><strong>Wait Time:</strong> ${sshProfile.wait_time_seconds || 0} seconds</div>`;
+      html += `<div style="font-size: 13px; margin-bottom: 4px;"><strong>Commands:</strong> ${sshProfile.commands ? sshProfile.commands.length : 0} command(s)</div>`;
+      if (sshProfile.commands && sshProfile.commands.length > 0) {
+        html += '<div style="margin-top: 8px; padding: 8px; background: #f9fafb; border-radius: 4px; font-family: monospace; font-size: 11px;">';
+        html += '<div style="font-weight: 600; margin-bottom: 4px;">Command List:</div>';
+        html += '<ul style="margin: 0; padding-left: 20px;">';
+        sshProfile.commands.forEach(cmd => {
+          html += `<li style="margin-bottom: 2px;">${cmd}</li>`;
+        });
+        html += '</ul></div>';
+      }
+      html += '</div>';
+      
+      if (sshProfile.hosts && sshProfile.hosts.length > 0) {
+        html += '<div style="margin-top: 12px; padding-top: 12px; border-top: 1px solid #d2d2d7;">';
+        html += '<div style="font-weight: 600; margin-bottom: 8px; font-size: 13px;">Host Results:</div>';
+        html += '<ul style="margin: 0; padding-left: 20px; font-size: 12px;">';
+        sshProfile.hosts.forEach(h => {
+          const statusIcon = h.success ? '✓' : '✗';
+          const statusColor = h.success ? '#10b981' : '#ef4444';
+          html += `<li style="margin-bottom: 8px;">
+            <div>
+              <span style="color: ${statusColor}; font-weight: bold;">${statusIcon}</span>
+              <code>${h.host}</code>: ${h.commands_executed || 0} executed, ${h.commands_failed || 0} failed${h.error ? ` - ${h.error}` : ''}
+            </div>`;
+          if (h.output) {
+            html += `<div style="margin-top: 4px; padding: 8px; background: #f9fafb; border-radius: 4px; font-family: monospace; font-size: 11px; color: #374151; white-space: pre-wrap; max-height: 200px; overflow-y: auto;">${h.output}</div>`;
+          }
+          html += `</li>`;
+        });
+        html += '</ul></div>';
+      }
       html += '</div>';
     }
     

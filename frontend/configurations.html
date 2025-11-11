@@ -1,20 +1,29 @@
 <div id="configurations-section" class="content-section">
+  <!-- List View -->
   <div id="configsListView">
-    <h3>Configurations</h3>
-    <div class="row">
-      <button id="btnRefreshConfigs">Refresh</button>
-      <button id="btnDeleteConfig" style="display:none;">Delete Selected</button>
+    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px;">
+      <h3 style="margin: 0;">Configurations</h3>
+      <div>
+        <button id="btnNewConfig" style="margin-right: 8px;">New Configuration</button>
+        <button id="btnRefreshConfigs">Refresh</button>
+        <button id="btnDeleteConfig" style="display:none; margin-left: 8px;">Delete Selected</button>
+      </div>
     </div>
     <div id="configsList" style="margin-top: 16px;">
       <p>Loading configurations...</p>
     </div>
   </div>
   
+  <!-- Editor View (for creating/editing configurations) -->
   <div id="configEditView" style="display:none;">
-    <h3>Edit Configuration</h3>
+    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px;">
+      <h3 style="margin: 0;" id="configEditTitle">New Configuration</h3>
+      <button id="btnBackToList">← Back to List</button>
+    </div>
+    
     <div class="row">
       <label>Configuration Name</label>
-      <input id="editConfigName" value="" size="40" type="text" />
+      <input id="editConfigName" value="" size="40" type="text" placeholder="Enter configuration name" />
     </div>
 
     <hr />
@@ -22,16 +31,18 @@
     <h3>Authentication</h3>
     <div class="row">
       <label>NHI Credential</label>
-      <select id="editNhiCredentialSelect" style="width: 287px;">
+      <select id="editNhiCredentialSelect" style="width: 292px;">
         <option value="">Select NHI credential...</option>
       </select>
+      <span style="font-size: 12px; color: #86868b; margin-left: 8px;">Optional - select to auto-populate hosts</span>
     </div>
     <div class="row">
-      <label>Fabric Host</label>
+      <label>Fabric Hosts</label>
       <div style="display: flex; flex-direction: column; gap: 8px; width: 600px;">
-        <input id="editFabricHost" value="" style="width: 100%; box-sizing: border-box;" type="text" placeholder="Enter hosts separated by spaces" />
+        <input id="editFabricHost" value="" style="width: 100%; box-sizing: border-box;" type="text" placeholder="Enter hosts separated by spaces (optional)" />
         <div id="editFabricHostChips" style="display: flex; flex-wrap: wrap; gap: 6px; min-height: 24px;"></div>
         <span id="editFabricHostStatus" class="status"></span>
+        <div style="font-size: 12px; color: #86868b;">Hosts can be configured later when running the configuration</div>
       </div>
     </div>
     <div class="row">
@@ -55,13 +66,12 @@
       </div>
     </div>
 
-    <hr />
-
-    <h3>Create Workspace</h3>
+    <h3>Install Workspace</h3>
     <div id="editTplFormList"></div>
     <div class="row">
       <button id="btnAddEditRow">Add Row</button>
     </div>
+    
     <h3>SSH Profiles</h3>
     <div class="row">
       <label>SSH Commands Profile</label>
@@ -75,7 +85,7 @@
       <input id="editSshWaitTime" type="number" min="0" value="60" placeholder="60" size="40" />
       <span style="font-size: 12px; color: #86868b; margin-left: 8px;">Seconds to wait between each SSH command execution (default: 60)</span>
     </div>
-
+    
     <h3>Run Workspace</h3>
     <div class="row">
       <label>Enable Run Workspace</label>
@@ -83,7 +93,7 @@
       <span style="font-size: 12px; color: #86868b; margin-left: 8px;">Optional - install workspace after template creation</span>
     </div>
     <div class="row">
-      <label>Select Workspace</label>
+      <label>Select Template</label>
       <select id="editInstallSelect"></select>
     </div>
 
@@ -91,9 +101,118 @@
 
     <div class="row">
       <label></label>
-      <button id="btnSaveEditConfig">Save</button>
+      <button id="btnSaveEditConfig">Save Configuration</button>
       <button id="btnCancelEditConfig">Cancel</button>
     </div>
   </div>
-</div>
+  
+  <!-- Run View (shown when running a configuration) - uses same element IDs as preparation section -->
+  <div id="configRunView" style="display:none;">
+    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px;">
+      <h3 style="margin: 0;" id="configRunTitle">Running Configuration</h3>
+      <button id="btnBackFromRun">← Back to List</button>
+    </div>
+    
+    <!-- Use same structure and element IDs as preparation section so run logic works -->
+    <h3>Authentication</h3>
+    <div class="row">
+      <label>NHI Credential</label>
+      <select id="nhiCredentialSelect" style="width: 292px;">
+        <option value="">Select NHI credential...</option>
+      </select>
+      <span id="nhiLoadStatus" style="font-size: 12px; color: #86868b; margin-left: 8px;"></span>
+    </div>
+    <div class="row">
+      <label>Fabric Hosts</label>
+      <div style="display: flex; flex-direction: column; gap: 8px; width: 600px;">
+        <input id="fabricHost" value="" style="width: 100%; box-sizing: border-box;" type="text" placeholder="Enter hosts separated by spaces" />
+        <div id="fabricHostChips" style="display: flex; flex-wrap: wrap; gap: 6px; min-height: 24px;"></div>
+        <span id="fabricHostStatus" class="status"></span>
+      </div>
+    </div>
+    <div class="row">
+      <label>Expert Mode</label>
+      <input id="expertMode" type="checkbox" />
+    </div>
 
+    <hr />
+
+    <h3>FabricStudio Base Configuration</h3>
+    <div class="row">
+      <label>New Hostname Base</label>
+      <input id="newHostname" placeholder="e.g. fabric.local" size="40" type="text" />
+    </div>
+    <div class="row">
+      <label>Guest user password</label>
+      <input id="chgPass" placeholder="" size="40" type="password" />
+      <span id="chgPassError" style="font-size: 12px; color: #f87171; margin-left: 8px; display: none;"></span>
+      <div style="font-size: 11px; color: #86868b; margin-left: 148px; margin-top: 4px;">
+        Password must be at least 7 characters with: 1 uppercase, 1 number, 1 special character
+      </div>
+    </div>
+
+    <h3>Install Workspace</h3>
+    <div id="tplFormList"></div>
+    <div class="row">
+      <button id="btnAddRow" disabled>Add Row</button>
+    </div>
+    
+    <h3>SSH Profiles</h3>
+    <div class="row">
+      <label>SSH Commands Profile</label>
+      <select id="sshProfileSelect" style="width: 287px;">
+        <option value="">None (select SSH profile)</option>
+      </select>
+      <span style="font-size: 12px; color: #86868b; margin-left: 8px;">Optional - execute SSH commands before Install Workspace</span>
+    </div>
+    <div class="row">
+      <label>Wait Time</label>
+      <input id="sshWaitTime" type="number" min="0" value="60" placeholder="60" size="40" />
+      <span style="font-size: 12px; color: #86868b; margin-left: 8px;">Seconds to wait between each SSH command execution (default: 60)</span>
+    </div>
+    
+    <h3>Run Workspace</h3>
+    <div class="row">
+      <label>Enable Run Workspace</label>
+      <input id="runWorkspaceEnabled" type="checkbox" checked />
+      <span style="font-size: 12px; color: #86868b; margin-left: 8px;">Optional - install workspace after template creation</span>
+    </div>
+    <div class="row">
+      <label>Select Template</label>
+      <select id="installSelect"></select>
+      <button id="btnInstallSelected" disabled>Run</button>
+      <button id="btnCancelConfig">Cancel</button>
+    </div>
+    <div id="runProgressContainer" style="display:none; margin: 10px 0;">
+      <div class="row" style="margin-bottom: 4px;">
+        <label style="width: auto; margin-right: 8px;">Overall Progress:</label>
+        <div class="progress" style="width: 400px; height: 20px; margin: 0;">
+          <span id="runProgressBar" class="ind determinate"></span>
+        </div>
+        <span id="runProgressText" style="margin-left: 8px; font-weight: 600;">0%</span>
+        <span id="runProgressTimer" style="margin-left: 12px; font-size: 12px; color: #424245; font-weight: 500;">00:00</span>
+      </div>
+      <div class="row" style="margin-top: 4px;">
+        <span id="runProgressStatus" style="font-size: 12px; color: #424245; margin-left: 148px;">Initializing...</span>
+      </div>
+    </div>
+    <div id="runningTasksContainer" class="row" style="display:none;">
+      <label>Running Tasks</label>
+      <ul id="tplList"></ul>
+    </div>
+
+    <div id="actionStatus" class="notice" role="status" style="display:none;">
+      <div id="actionStatusMessage" style="margin-bottom: 8px;"></div>
+      <div id="actionStatusProgress" style="display: none; margin-top: 8px;">
+        <div style="display: flex; align-items: center; gap: 12px; margin-bottom: 4px;">
+          <div class="progress" style="width: 400px; height: 20px; margin: 0;">
+            <span id="actionStatusProgressBar" class="ind determinate" style="width: 0%;"></span>
+          </div>
+          <span id="actionStatusProgressText" style="font-weight: 600; min-width: 45px;">0%</span>
+          <span id="actionStatusTimer" style="font-size: 12px; color: #424245; font-weight: 500; min-width: 60px;">00:00</span>
+        </div>
+      </div>
+    </div>
+    <pre id="out" style="display:none;"></pre>
+  </div>
+</div>
