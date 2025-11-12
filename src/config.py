@@ -85,4 +85,7 @@ class Config:
     HOSTNAME = os.environ.get("HOSTNAME", "0.0.0.0").strip()
     PORT = os.environ.get("PORT", "8000").strip()
     HTTPS_ENABLED = os.environ.get("HTTPS_ENABLED", "false").strip().lower() in ("true", "1", "yes")
+    
+    # Teams Webhook Configuration
+    TEAMS_WEBHOOK_URL = os.environ.get("TEAMS_WEBHOOK_URL", "").strip()
 

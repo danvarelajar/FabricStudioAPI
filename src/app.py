@@ -33,6 +33,7 @@ from .utils import sanitize_for_logging
 from .csrf import CSRFProtectionMiddleware
 from .db_utils import get_db_connection, backup_database, backup_database_periodically
 from .response_models import HealthResponse
+from .teams_webhook import send_teams_notification
 
 # Configure logging
 logging.basicConfig(
@@ -4419,6 +4420,44 @@ def update_manual_run(run_id: int, req: dict):
         c = conn.cursor()
         try:
             completed_at = datetime.now(timezone.utc).isoformat() if status in ['success', 'error'] else None
+            
+            # Get existing report data for Teams notification
+            report_data = None
+            if status in ['success', 'error']:  # Only send notification when run completes
+                c.execute('''
+                    SELECT id, configuration_name, status, message, errors, started_at, completed_at, execution_details
+                    FROM manual_runs
+                    WHERE id = ?
+                ''', (run_id,))
+                row = c.fetchone()
+                if row:
+                    run_id_db, config_name, old_status, old_message, old_errors_json, started_at, old_completed_at, old_details_json = row
+                    old_errors = json.loads(old_errors_json) if old_errors_json else []
+                    old_details = json.loads(old_details_json) if old_details_json else {}
+                    
+                    # Calculate duration
+                    duration_seconds = None
+                    if started_at and completed_at:
+                        try:
+                            start_dt = datetime.fromisoformat(started_at.replace('Z', '+00:00'))
+                            end_dt = datetime.fromisoformat(completed_at.replace('Z', '+00:00'))
+                            duration_seconds = (end_dt - start_dt).total_seconds()
+                        except:
+                            pass
+                    
+                    # Prepare report data for Teams notification (use execution_details from request, not old one)
+                    report_data = {
+                        "id": run_id_db,
+                        "configuration_name": config_name or "Manual Run",
+                        "status": status,
+                        "message": message,
+                        "started_at": started_at,
+                        "completed_at": completed_at,
+                        "duration_seconds": duration_seconds,
+                        "errors": errors,
+                        "execution_details": execution_details  # Use the updated execution_details from request
+                    }
+            
             c.execute('''
                 UPDATE manual_runs
                 SET status = ?, message = ?, errors = ?, completed_at = ?, execution_details = ?
@@ -4432,6 +4471,23 @@ def update_manual_run(run_id: int, req: dict):
                 run_id
             ))
             conn.commit()
+            
+            # Send Teams notification if report is completed
+            if report_data:
+                try:
+                    # Log execution_details for debugging
+                    logger.info(f"Sending Teams notification for run {run_id_db}")
+                    logger.info(f"  execution_details type: {type(execution_details)}")
+                    logger.info(f"  execution_details keys: {list(execution_details.keys()) if isinstance(execution_details, dict) else 'Not a dict'}")
+                    if isinstance(execution_details, dict):
+                        logger.info(f"  templates_count: {execution_details.get('templates_count', 'N/A')}")
+                        logger.info(f"  hosts_count: {execution_details.get('hosts_count', 'N/A')}")
+                        logger.info(f"  install_select: {execution_details.get('install_select', 'N/A')}")
+                    send_teams_notification(report_data)
+                except Exception as e:
+                    # Don't fail the request if Teams notification fails
+                    logger.warning(f"Failed to send Teams notification: {e}", exc_info=True)
+            
             return {"status": "ok", "run_id": run_id}
         except sqlite3.Error as e:
             raise HTTPException(500, f"Database error: {str(e)}")
@@ -5569,6 +5625,41 @@ def run_configuration(config_data: dict, event_name: str, event_id: Optional[int
                             execution_details_json,
                             execution_record_id
                         ))
+                        conn.commit()
+                        
+                        # Send Teams notification for manual runs
+                        try:
+                            # Get configuration name and started_at from the report
+                            c.execute('SELECT configuration_name, started_at FROM manual_runs WHERE id = ?', (execution_record_id,))
+                            row = c.fetchone()
+                            config_name = (row[0] if row and row[0] else event_name) if row else event_name
+                            started_at_str = row[1] if row and row[1] else started_at.isoformat()
+                            
+                            # Calculate duration from database timestamps if available
+                            duration_seconds = None
+                            if row and row[1]:
+                                try:
+                                    start_dt = datetime.fromisoformat(started_at_str.replace('Z', '+00:00'))
+                                    duration_seconds = (completed_at - start_dt).total_seconds()
+                                except:
+                                    duration_seconds = (completed_at - started_at).total_seconds()
+                            else:
+                                duration_seconds = (completed_at - started_at).total_seconds()
+                            
+                            report_data = {
+                                "id": execution_record_id,
+                                "configuration_name": config_name,
+                                "status": status,
+                                "message": message,
+                                "started_at": started_at_str,
+                                "completed_at": completed_at.isoformat(),
+                                "duration_seconds": duration_seconds,
+                                "errors": errors,
+                                "execution_details": json.loads(execution_details_json) if execution_details_json else {}
+                            }
+                            send_teams_notification(report_data)
+                        except Exception as e:
+                            logger.warning(f"Failed to send Teams notification: {e}")
                     else:
                         # Update event_executions table
                         c.execute('''
@@ -5598,6 +5689,43 @@ def run_configuration(config_data: dict, event_name: str, event_id: Optional[int
                                 execution_details_json,
                                 manual_run_id
                             ))
+                            conn.commit()
+                            
+                            # Send Teams notification for event runs (via manual_runs record)
+                            try:
+                                # Get configuration name and started_at from the report
+                                c.execute('SELECT configuration_name, started_at FROM manual_runs WHERE id = ?', (manual_run_id,))
+                                row = c.fetchone()
+                                config_name = (row[0] if row and row[0] else event_name) if row else event_name
+                                started_at_str = row[1] if row and row[1] else started_at.isoformat()
+                                
+                                # Calculate duration from database timestamps if available
+                                duration_seconds = None
+                                if row and row[1]:
+                                    try:
+                                        start_dt = datetime.fromisoformat(started_at_str.replace('Z', '+00:00'))
+                                        duration_seconds = (completed_at - start_dt).total_seconds()
+                                    except:
+                                        duration_seconds = (completed_at - started_at).total_seconds()
+                                else:
+                                    duration_seconds = (completed_at - started_at).total_seconds()
+                                
+                                report_data = {
+                                    "id": manual_run_id,
+                                    "configuration_name": config_name,
+                                    "status": status,
+                                    "message": message,
+                                    "started_at": started_at_str,
+                                    "completed_at": completed_at.isoformat(),
+                                    "duration_seconds": duration_seconds,
+                                    "errors": errors,
+                                    "execution_details": json.loads(execution_details_json) if execution_details_json else {}
+                                }
+                                send_teams_notification(report_data)
+                            except Exception as e:
+                                logger.warning(f"Failed to send Teams notification: {e}")
+                        else:
+                            conn.commit()
                         
                         # Audit: event run finished
                         try:

@@ -16,6 +16,7 @@ A FastAPI-based web application for managing FabricStudio configurations, NHI cr
 - **Event Scheduling**: Schedule automated tasks with date and time support, including validation to prevent past scheduling
 - **Execution History**: Track detailed execution history for scheduled events, including SSH command execution results
 - **Run Reports**: View detailed reports with Host Summary and SSH Profile Execution results
+- **Microsoft Teams Integration**: Send Adaptive Card notifications to Teams channels when reports are created
 - **Template Caching**: Cache templates for faster access
 - **Progress Logging**: Essential progress logging with timestamps for tracking installation progress
 - **Modern UI**: Clean, responsive interface with Inter font family and styled navigation menu
@@ -120,6 +121,22 @@ This installs Colima and sets it up automatically. Colima works seamlessly with 
    
    **CORS (Optional):**
    - `CORS_ALLOW_ORIGINS`: Comma-separated list of allowed origins (auto-generated if not set)
+   
+   **Microsoft Teams Integration (Optional):**
+   - `TEAMS_WEBHOOK_URL`: Microsoft Teams webhook URL for sending Adaptive Card notifications when reports are created
+     - When a report is completed (success or error), an Adaptive Card notification is automatically sent to the configured Teams channel
+     - The notification includes: run status, configuration name, duration, number of hosts, templates created, SSH command profile details (if used), workspace installation details (if enabled), and any errors
+     - To get a webhook URL:
+       1. In Microsoft Teams, go to your channel
+       2. Click the `...` menu next to the channel name
+       3. Select **Connectors**
+       4. Search for **"Incoming Webhook"**
+       5. Click **Configure**
+       6. Give it a name (e.g., "FabricStudio Reports")
+       7. Click **Create**
+       8. Copy the webhook URL and paste it in your `.env` file
+     - If not set or empty, Teams notifications will be silently disabled (no errors or warnings)
+     - Example: `TEAMS_WEBHOOK_URL=https://outlook.office.com/webhook/abc123-def456-ghi789/...`
    
    See `.env.example` for all available options with descriptions.
 
@@ -424,6 +441,7 @@ FabricStudioAPI/
 ├── Dockerfile            # Docker image definition
 ├── docker-compose.yml    # Docker Compose configuration
 ├── .env                  # Environment variables (not in git)
+├── .env.example          # Example environment variables file
 └── requirements.txt      # Python dependencies
 ```
 

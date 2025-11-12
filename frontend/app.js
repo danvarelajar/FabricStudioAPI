@@ -9424,10 +9424,73 @@ async function handleTrackedRunButton() {
         : `Run completed with ${errors.length} error(s) (workspace installation skipped)`;
       
       const runDuration = (Date.now() - runStartTime) / 1000;
+      
+      // Collect templates that were created
+      const createdTemplates = templates.filter(t => t.status === 'created' || t.status === 'installed').map(t => ({
+        repo_name: t.repo_name || '',
+        template_name: t.template_name || '',
+        version: t.version || ''
+      }));
+      
+      // Get install select value
+      const installSelectValue = el('installSelect')?.value || '';
+      let installSelect = false;
+      let installedTemplate = null;
+      if (installSelectValue) {
+        installSelect = true;
+        // Parse installSelect format: "template_name|||version" (repo_name is not in the value)
+        const parts = installSelectValue.split('|||');
+        if (parts.length >= 2) {
+          const template_name = parts[0];
+          const version = parts[1];
+          
+          // Look up repo_name from template rows
+          let repo_name = '';
+          document.querySelectorAll('.tpl-row').forEach(row => {
+            const selects = row.querySelectorAll('select');
+            const repoSelect = selects[0];
+            const templateFiltered = row._templateFiltered;
+            const versionSelect = selects.length > 2 ? selects[selects.length - 1] : (selects[1] || null);
+            const row_template = templateFiltered ? templateFiltered.getValue() : '';
+            const row_version = versionSelect?.value || '';
+            if (row_template === template_name && row_version === version) {
+              repo_name = repoSelect?.value || '';
+            }
+          });
+          
+          // If repo_name not found in rows, try to get it from created templates
+          if (!repo_name) {
+            const createdTemplate = templates.find(t => 
+              t.template_name === template_name && t.version === version && 
+              (t.status === 'created' || t.status === 'installed')
+            );
+            if (createdTemplate) {
+              repo_name = createdTemplate.repo_name || '';
+            }
+          }
+          
+          installedTemplate = {
+            repo_name: repo_name,
+            template_name: template_name,
+            version: version
+          };
+        }
+      }
+      
       const finalExecutionDetails = {
         ...executionDetails,
         hosts: hosts.map(({host}) => host),
+        hosts_count: hosts.length,
         duration_seconds: runDuration,
+        // Templates created
+        templates: createdTemplates,
+        templates_count: createdTemplates.length,
+        // Workspace installation
+        install_select: installSelect,
+        install_executed: false, // Installation was skipped
+        installed: installedTemplate,
+        installations: [],
+        installations_count: 0,
         // Explicitly include hostname and password changes
         hostname_changes: executionDetails.hostname_changes || [],
         hostname_changes_count: executionDetails.hostname_changes ? executionDetails.hostname_changes.length : 0,
@@ -9824,10 +9887,73 @@ async function handleTrackedRunButton() {
     
     // Prepare final execution details with all required fields
     const runDuration = (Date.now() - runStartTime) / 1000;
+    
+    // Collect templates that were created (from global templates array with status 'created')
+    const createdTemplates = templates.filter(t => t.status === 'created' || t.status === 'installed').map(t => ({
+      repo_name: t.repo_name || '',
+      template_name: t.template_name || '',
+      version: t.version || ''
+    }));
+    
+    // Get install select value and parse it
+    const installSelectValue = el('installSelect')?.value || '';
+    let installSelect = false;
+    let installedTemplate = null;
+    if (installSelectValue) {
+      installSelect = true;
+      // Parse installSelect format: "template_name|||version" (repo_name is not in the value)
+      const parts = installSelectValue.split('|||');
+      if (parts.length >= 2) {
+        const template_name = parts[0];
+        const version = parts[1];
+        
+        // Look up repo_name from template rows
+        let repo_name = '';
+        document.querySelectorAll('.tpl-row').forEach(row => {
+          const selects = row.querySelectorAll('select');
+          const repoSelect = selects[0];
+          const templateFiltered = row._templateFiltered;
+          const versionSelect = selects.length > 2 ? selects[selects.length - 1] : (selects[1] || null);
+          const row_template = templateFiltered ? templateFiltered.getValue() : '';
+          const row_version = versionSelect?.value || '';
+          if (row_template === template_name && row_version === version) {
+            repo_name = repoSelect?.value || '';
+          }
+        });
+        
+        // If repo_name not found in rows, try to get it from created templates
+        if (!repo_name) {
+          const createdTemplate = templates.find(t => 
+            t.template_name === template_name && t.version === version && 
+            (t.status === 'created' || t.status === 'installed')
+          );
+          if (createdTemplate) {
+            repo_name = createdTemplate.repo_name || '';
+          }
+        }
+        
+        installedTemplate = {
+          repo_name: repo_name,
+          template_name: template_name,
+          version: version
+        };
+      }
+    }
+    
     const finalExecutionDetails = {
       ...executionDetails,
       hosts: hosts.map(({host}) => host),
+      hosts_count: hosts.length,
       duration_seconds: runDuration,
+      // Templates created
+      templates: createdTemplates,
+      templates_count: createdTemplates.length,
+      // Workspace installation
+      install_select: installSelect,
+      install_executed: executionDetails.installations && executionDetails.installations.length > 0,
+      installed: installedTemplate,
+      installations: executionDetails.installations || [],
+      installations_count: executionDetails.installations ? executionDetails.installations.length : 0,
       // Explicitly include hostname and password changes
       hostname_changes: executionDetails.hostname_changes || [],
       hostname_changes_count: executionDetails.hostname_changes ? executionDetails.hostname_changes.length : 0,
