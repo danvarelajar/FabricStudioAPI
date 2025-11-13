@@ -2553,7 +2553,6 @@ def login(req: LoginReq):
             raise HTTPException(401, "Invalid username or password")
         
         # Debug logging for password verification
-        logger.info(f"Login attempt for user '{req.username}': password length={len(req.password)}")
         password_valid = verify_password(req.password, user['password_encrypted'])
         logger.info(f"Password verification result for user '{req.username}': {password_valid}")
         if not password_valid:
