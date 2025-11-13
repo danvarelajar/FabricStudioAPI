@@ -405,8 +405,6 @@ CORS (Cross-Origin Resource Sharing) is automatically configured based on your s
 - All sensitive data (passwords, tokens) are encrypted before storage
 - SSL certificates are mounted read-only (`:ro` flag) for additional security
 
-For more detailed Docker documentation, see [DOCKER.md](DOCKER.md).
-
 ## Registering a FabricStudio OAuth Application (Client ID/Secret)
 
 To use FabricStudio APIs from this app, you need a Client ID and Client Secret.
