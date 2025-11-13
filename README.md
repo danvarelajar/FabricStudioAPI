@@ -4,22 +4,46 @@ A FastAPI-based web application for managing FabricStudio configurations, NHI cr
 
 ## Features
 
-- **User Authentication**: Secure user authentication with encrypted password storage
-- **FabricStudio Runs**: Unified configuration management - create, edit, save, and run FabricStudio configurations without needing to contact hosts
-- **SSH Profile Execution**: Execute SSH commands on fabric hosts before workspace installation, with configurable wait times between commands
-- **NHI Management**: Store and manage NHI credentials with encrypted client secrets
-- **SSH Key Management**: Securely store and manage SSH key pairs (public and encrypted private keys)
+### FabricStudio Runs
+- **Configurations**: Create, edit, save, and run FabricStudio configurations without needing to contact hosts
+  - Automatic cache management for fresh template and repository data
+  - Template caching for faster access
+  - Progress logging with timestamps for tracking installation progress
 - **SSH Command Profiles**: Create reusable SSH command profiles with optional SSH key association
-- **Session-Based Token Management**: Secure server-side token storage with automatic refresh
-- **Automatic Token Refresh**: Tokens refresh automatically before expiration (proactive and on-demand)
-- **Configuration Management**: Save, load, edit, and run FabricStudio configurations with automatic cache management for fresh data
-- **Event Scheduling**: Schedule automated tasks with date and time support, including validation to prevent past scheduling
-- **Execution History**: Track detailed execution history for scheduled events, including SSH command execution results
-- **Run Reports**: View detailed reports with Host Summary and SSH Profile Execution results
-- **Microsoft Teams Integration**: Send Adaptive Card notifications to Teams channels when reports are created
-- **Template Caching**: Cache templates for faster access
-- **Progress Logging**: Essential progress logging with timestamps for tracking installation progress
+  - Execute SSH commands on fabric hosts before workspace installation
+  - Configurable wait times between commands
+- **Reports**: View detailed execution reports
+  - Host Summary with execution results
+  - SSH Profile Execution details
+  - Microsoft Teams notifications (optional) - Send Adaptive Card notifications to Teams channels when reports are created
+
+### Event Schedule
+- **Automated Scheduling**: Schedule FabricStudio runs with date and time support
+- **Execution History**: Track detailed execution history for scheduled events
+  - SSH command execution results
+  - Execution status and timestamps
+- **Validation**: Prevents scheduling events in the past
+
+### NHI Management
+- **NHI Credentials**: Store and manage NHI credentials with encrypted client secrets
+  - Session-based token management with secure server-side storage
+  - Automatic token refresh (proactive and on-demand)
+  - Tokens refresh automatically before expiration
+- **SSH Keys**: Securely store and manage SSH key pairs
+  - Public keys and encrypted private keys
+  - Never exposed to the frontend
+
+### User Management
+- **User Authentication**: Secure user authentication with encrypted password storage
+- **Password Security**: Passwords hashed using bcrypt before storage
+
+### Logs
+- **Audit Logs**: Track user actions for security auditing
+- **Server Logs**: View application logs with timestamps
+
+### Additional Features
 - **Modern UI**: Clean, responsive interface with Inter font family and styled navigation menu
+- **Security**: HTTP-only cookies, encrypted data storage, and comprehensive security measures
 
 ## Setup
 
@@ -103,42 +127,57 @@ This installs Colima and sets it up automatically. Colima works seamlessly with 
    ```
 
 2. **Edit `.env` and configure:**
-   
-   **Required:**
-   - `FS_SERVER_SECRET`: Generate with `openssl rand -base64 32` (CRITICAL for encryption)
-   
-   **Server Configuration:**
-   - `HOSTNAME`: Hostname to bind to (default: `0.0.0.0`)
-   - `PORT`: Port to listen on (default: `8000`)
-   - `HTTPS_ENABLED`: Set to `true` to enable HTTPS (default: `false`)
-   - `SSL_CERT_PATH`: Path to SSL certificate (default: `/app/certs/cert.pem`)
-   - `SSL_KEY_PATH`: Path to SSL private key (default: `/app/certs/key.pem`)
-   
-   **FabricStudio API:**
-   - `LEAD_FABRIC_HOST`: Primary FabricStudio host
-   - `CLIENT_ID`: OAuth Client ID
-   - `CLIENT_SECRET`: OAuth Client Secret
-   
-   **CORS (Optional):**
-   - `CORS_ALLOW_ORIGINS`: Comma-separated list of allowed origins (auto-generated if not set)
-   
-   **Microsoft Teams Integration (Optional):**
-   - `TEAMS_WEBHOOK_URL`: Microsoft Teams webhook URL for sending Adaptive Card notifications when reports are created
-     - When a report is completed (success or error), an Adaptive Card notification is automatically sent to the configured Teams channel
-     - The notification includes: run status, configuration name, duration, number of hosts, templates created, SSH command profile details (if used), workspace installation details (if enabled), and any errors
-     - To get a webhook URL:
-       1. In Microsoft Teams, go to your channel
-       2. Click the `...` menu next to the channel name
-       3. Select **Connectors**
-       4. Search for **"Incoming Webhook"**
-       5. Click **Configure**
-       6. Give it a name (e.g., "FabricStudio Reports")
-       7. Click **Create**
-       8. Copy the webhook URL and paste it in your `.env` file
-     - If not set or empty, Teams notifications will be silently disabled (no errors or warnings)
-     - Example: `TEAMS_WEBHOOK_URL=https://outlook.office.com/webhook/abc123-def456-ghi789/...`
-   
-   See `.env.example` for all available options with descriptions.
+
+#### Required Configuration
+- **`FS_SERVER_SECRET`**: Generate with `openssl rand -base64 32` (CRITICAL for encryption)
+
+#### Server Configuration
+- **`HOSTNAME`**: Hostname to bind to (default: `0.0.0.0`)
+- **`PORT`**: Port to listen on (default: `8000`)
+- **`HTTPS_ENABLED`**: Set to `true` to enable HTTPS (default: `false`)
+- **`SSL_CERT_PATH`**: Path to SSL certificate (default: `/app/certs/cert.pem`)
+- **`SSL_KEY_PATH`**: Path to SSL private key (default: `/app/certs/key.pem`)
+
+#### FabricStudio API Configuration
+- **`LEAD_FABRIC_HOST`**: Primary FabricStudio host
+- **`CLIENT_ID`**: OAuth Client ID
+- **`CLIENT_SECRET`**: OAuth Client Secret
+
+#### Microsoft Teams Notifications (Optional)
+Configure Teams webhook to receive notifications when reports are created:
+
+- **`TEAMS_WEBHOOK_URL`**: Microsoft Teams webhook URL for sending Adaptive Card notifications
+
+**Setup Instructions:**
+1. In Microsoft Teams, go to your channel
+2. Click the `...` menu next to the channel name
+3. Select **Connectors**
+4. Search for **"Incoming Webhook"**
+5. Click **Configure**
+6. Give it a name (e.g., "FabricStudio Reports")
+7. Click **Create**
+8. Copy the webhook URL and paste it in your `.env` file
+
+**What gets notified:**
+- Report completion (success or error)
+- Configuration name and duration
+- Number of hosts processed
+- Templates created
+- SSH command profile details (if used)
+- Workspace installation details (if enabled)
+- Any errors encountered
+
+**Note:** If not set or empty, Teams notifications will be silently disabled (no errors or warnings).
+
+**Example:**
+```bash
+TEAMS_WEBHOOK_URL=https://outlook.office.com/webhook/abc123-def456-ghi789/...
+```
+
+#### CORS Configuration (Optional)
+- **`CORS_ALLOW_ORIGINS`**: Comma-separated list of allowed origins (auto-generated if not set)
+
+See `.env.example` for all available options with descriptions.
 
 ### Starting the Application
 
