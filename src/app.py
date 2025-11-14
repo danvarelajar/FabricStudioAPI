@@ -18,6 +18,7 @@ import socket
 import logging
 import queue
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from cryptography.fernet import Fernet
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
@@ -4979,135 +4980,178 @@ def run_configuration(config_data: dict, event_name: str, event_id: Optional[int
                 return None
             return template_id_cache[host].get(cache_key)
         
-        # Refresh repositories
-        for host in host_tokens.keys():
+        # Per-Host Pipeline: Process each host independently through all stages
+        # Each host stops on first failure, and we track which stage failed
+        
+        # Extract configuration for pipeline
+        hostname_changes = []
+        password_changes = []
+        fabric_creation_details = []
+        installation_details = []
+        ssh_execution_details = None
+        
+        # Load SSH profile data if needed (before processing hosts)
+        ssh_profile_id = config_data.get('sshProfileId', '')
+        if isinstance(ssh_profile_id, str) and not ssh_profile_id.strip():
+            ssh_profile_id = None
+        elif ssh_profile_id:
             try:
-                refresh_repositories(host, host_tokens[host])
+                ssh_profile_id = int(ssh_profile_id)
+            except (ValueError, TypeError):
+                ssh_profile_id = None
+        
+        ssh_wait_time = config_data.get('sshWaitTime', 0)
+        ssh_private_key = None
+        ssh_commands = None
+        ssh_profile_name = None
+        
+        if ssh_profile_id:
+            try:
+                conn = db_connect_with_retry()
+                if conn:
+                    c = conn.cursor()
+                    try:
+                        c.execute('SELECT name, commands, ssh_key_id FROM ssh_command_profiles WHERE id = ?', (ssh_profile_id,))
+                        profile_row = c.fetchone()
+                        if profile_row:
+                            ssh_profile_name = profile_row[0]
+                            ssh_commands = profile_row[1]
+                            ssh_key_id = profile_row[2]
+                            if ssh_key_id:
+                                c.execute('SELECT private_key_encrypted FROM ssh_keys WHERE id = ?', (ssh_key_id,))
+                                key_row = c.fetchone()
+                                if key_row:
+                                    ssh_private_key = decrypt_with_server_secret(key_row[0])
+                                else:
+                                    logger.error(f"Event '{event_name}': SSH key {ssh_key_id} not found")
+                                    errors.append(f"SSH key {ssh_key_id} not found")
+                    finally:
+                        conn.close()
+            except Exception as e:
+                logger.error(f"Event '{event_name}': Error loading SSH profile: {e}")
+                errors.append(f"Error loading SSH profile: {e}")
+        
+        # Determine host index for hostname changes based on original input order
+        # IMPORTANT: Use the original hosts list order, not host_tokens.keys() order
+        # This ensures hostname numbering matches the input order (first host = 1, second = 2, etc.)
+        host_index_map = {}
+        for idx, host_info in enumerate(hosts):
+            host = host_info.get('host', '')
+            if host in host_tokens:  # Only include hosts that have valid tokens
+                host_index_map[host] = idx
+        
+        def process_host_pipeline(host):
+            """Process a single host through all stages, stopping on first failure"""
+            host_result = {
+                "host": host,
+                "failed_at_stage": None,
+                "error": None,
+                "stages_completed": [],
+                "hostname_change": None,
+                "password_change": None,
+                "fabric_creations": [],
+                "ssh_result": None,
+                "installation": None
+            }
+            
+            token = host_tokens[host]
+            
+            # Stage 1: Refresh repositories
+            try:
+                refresh_repositories(host, token)
+                host_result["stages_completed"].append("refresh")
             except Exception as e:
                 msg = f"Error refreshing repositories on host {host}: {e}"
                 logger.error(f"Event '{event_name}': {msg}")
-                errors.append(msg)
-        
-        # Uninstall workspaces (reset)
-        for host in host_tokens.keys():
+                host_result["failed_at_stage"] = "refresh"
+                host_result["error"] = str(e)
+                return host_result
+            
+            # Stage 2: Reset fabric
             try:
-                reset_fabric(host, host_tokens[host])
+                reset_fabric(host, token)
+                host_result["stages_completed"].append("reset")
             except Exception as e:
                 msg = f"Error uninstalling workspaces on host {host}: {e}"
                 logger.error(f"Event '{event_name}': {msg}")
-                errors.append(msg)
-        
-        # Remove workspaces (batch delete)
-        for host in host_tokens.keys():
+                host_result["failed_at_stage"] = "reset"
+                host_result["error"] = str(e)
+                return host_result
+            
+            # Stage 3: Batch delete
             try:
-                batch_delete(host, host_tokens[host])
+                batch_delete(host, token)
+                host_result["stages_completed"].append("delete")
             except Exception as e:
                 msg = f"Error removing workspaces on host {host}: {e}"
                 logger.error(f"Event '{event_name}': {msg}")
-                errors.append(msg)
-        
-        # Track hostname and password changes for execution report
-        hostname_changes = []
-        password_changes = []
-        
-        # Change hostname if provided
-        if new_hostname:
-            for i, host in enumerate(host_tokens.keys()):
+                host_result["failed_at_stage"] = "delete"
+                host_result["error"] = str(e)
+                return host_result
+            
+            # Stage 4: Change hostname (if provided)
+            if new_hostname:
                 try:
-                    hostname = f"{new_hostname}{i + 1}"
-                    change_hostname(host, host_tokens[host], hostname)
-                    hostname_changes.append({
-                        "host": host,
-                        "new_hostname": hostname,
-                        "success": True
-                    })
+                    host_index = host_index_map[host]
+                    hostname = f"{new_hostname}{host_index + 1}"
+                    change_hostname(host, token, hostname)
+                    host_result["hostname_change"] = {"new_hostname": hostname, "success": True}
+                    host_result["stages_completed"].append("hostname_change")
                 except Exception as e:
                     msg = f"Error changing hostname on host {host}: {e}"
                     logger.error(f"Event '{event_name}': {msg}")
-                    errors.append(msg)
-                    hostname_changes.append({
-                        "host": host,
-                        "new_hostname": f"{new_hostname}{i + 1}",
-                        "success": False,
-                        "error": str(e)
-                    })
-        
-        # Change password if provided
-        if new_password:
-            for host in host_tokens.keys():
+                    host_result["failed_at_stage"] = "hostname_change"
+                    host_result["error"] = str(e)
+                    return host_result
+            
+            # Stage 5: Change password (if provided)
+            if new_password:
                 try:
-                    # Resolve user id for 'guest' first
-                    user_id = get_userId(host, host_tokens[host], 'guest')
+                    user_id = get_userId(host, token, 'guest')
                     if not user_id:
                         msg = f"Guest user not found on host {host}"
                         logger.error(f"Event '{event_name}': {msg}")
-                        errors.append(msg)
-                        password_changes.append({
-                            "host": host,
-                            "username": "guest",
-                            "success": False,
-                            "error": msg
-                        })
-                        continue
-                    change_fabricstudio_password(host, host_tokens[host], user_id, new_password)
-                    password_changes.append({
-                        "host": host,
-                        "username": "guest",
-                        "success": True
-                    })
+                        host_result["failed_at_stage"] = "password_change"
+                        host_result["error"] = msg
+                        return host_result
+                    change_fabricstudio_password(host, token, user_id, new_password)
+                    host_result["password_change"] = {"username": "guest", "success": True}
+                    host_result["stages_completed"].append("password_change")
                 except Exception as e:
                     msg = f"Error changing password on host {host}: {e}"
                     logger.error(f"Event '{event_name}': {msg}")
-                    errors.append(msg)
-                    password_changes.append({
-                        "host": host,
-                        "username": "guest",
-                        "success": False,
-                        "error": str(e)
-                    })
-        
-        # Step 3: Create all workspace templates
-        fabric_creation_details = []  # Track fabric creation details
-        failed_hosts = set()  # Track hosts that failed during creation
-        if templates_list:
-            logger.info(f"Event '{event_name}': Processing {len(templates_list)} template(s) for creation")
-            for idx, template_info in enumerate(templates_list, 1):
-                template_name = template_info.get('template_name', '')
-                repo_name = template_info.get('repo_name', '')
-                version = template_info.get('version', '')
-                
-                if not (template_name and repo_name and version):
-                    logger.warning(f"Event '{event_name}': Skipping template {idx}/{len(templates_list)} - missing required fields (name={template_name}, repo={repo_name}, version={version})")
-                    continue
-                
-                logger.info(f"Event '{event_name}': Processing template {idx}/{len(templates_list)}: '{template_name}' v{version} from repo '{repo_name}'")
-                
-                # Check for running tasks before creating (only if there are actually running tasks)
-                for host in host_tokens.keys():
-                    if host in failed_hosts:
+                    host_result["failed_at_stage"] = "password_change"
+                    host_result["error"] = str(e)
+                    return host_result
+            
+            # Stage 6: Create templates (sequential per host)
+            if templates_list:
+                for idx, template_info in enumerate(templates_list, 1):
+                    template_name = template_info.get('template_name', '')
+                    repo_name = template_info.get('repo_name', '')
+                    version = template_info.get('version', '')
+                    
+                    if not (template_name and repo_name and version):
                         continue
+                    
+                    # Check for running tasks before creating
                     try:
-                        running_count = get_running_task_count(host, host_tokens[host])
+                        running_count = get_running_task_count(host, token)
                         if running_count > 0:
-                            check_tasks(host, host_tokens[host], display_progress=False)
+                            check_tasks(host, token, display_progress=False)
                     except Exception as e:
                         msg = f"Error checking tasks on host {host}: {e}"
                         logger.error(f"Event '{event_name}': {msg}")
-                        errors.append(msg)
-                
-                # Create template on all hosts
-                for host in host_tokens.keys():
-                    # Skip hosts that have already failed
-                    if host in failed_hosts:
-                        continue
+                        host_result["failed_at_stage"] = f"template_check_tasks_{idx}"
+                        host_result["error"] = str(e)
+                        return host_result
                     
+                    # Create template
                     try:
-                        # Get template ID using cache
                         template_id = get_cached_template_id(host, template_name, repo_name, version)
                         if template_id:
-                            # Create fabric (pass template name and version per API signature)
                             fabric_create_start = datetime.now(timezone.utc)
-                            result = create_fabric(host, host_tokens[host], template_id, template_name, version)
+                            result = create_fabric(host, token, template_id, template_name, version)
                             fabric_create_end = datetime.now(timezone.utc)
                             fabric_duration = (fabric_create_end - fabric_create_start).total_seconds()
                             
@@ -5117,8 +5161,7 @@ def run_configuration(config_data: dict, event_name: str, event_id: Optional[int
                                 success = result
                                 task_errors = []
                             
-                            # Track fabric creation details
-                            fabric_creation_details.append({
+                            detail = {
                                 "host": host,
                                 "template_name": template_name,
                                 "repo_name": repo_name,
@@ -5127,437 +5170,273 @@ def run_configuration(config_data: dict, event_name: str, event_id: Optional[int
                                 "duration_seconds": fabric_duration,
                                 "created_at": fabric_create_start.isoformat(),
                                 "errors": task_errors if task_errors else None
-                            })
+                            }
+                            host_result["fabric_creations"].append(detail)
                             
                             if success:
-                                # Log audit event for fabric creation in scheduled event
                                 try:
                                     log_audit("fabric_created", details=f"host={host} template={template_name} version={version} event={event_name} duration_s={fabric_duration:.1f}", ip_address=None)
                                 except Exception:
                                     pass
                             else:
-                                # Mark host as failed - will skip this host for remaining templates and installation
-                                failed_hosts.add(host)
+                                msg = f"Failed to create template '{template_name}' v{version} on host {host}"
                                 if task_errors:
-                                    msg = f"Failed to create template '{template_name}' v{version} on host {host}: " + "; ".join(task_errors)
-                                else:
-                                    msg = f"Failed to create template '{template_name}' v{version} on host {host}: creation timed out or encountered an error"
+                                    msg += ": " + "; ".join(task_errors)
                                 logger.error(f"Event '{event_name}': {msg}")
-                                errors.append(msg)
-                                if task_errors:
-                                    errors.extend(task_errors)
-                                # Continue to next host (this host will be skipped in future templates)
-                                continue
+                                host_result["failed_at_stage"] = f"template_creation_{idx}"
+                                host_result["error"] = msg
+                                return host_result
                         else:
-                            # Template not found - mark host as failed and continue to next host
                             msg = f"Template '{template_name}' v{version} not found on host {host}"
                             logger.error(f"Event '{event_name}': {msg}")
-                            errors.append(msg)
-                            # Don't mark host as failed for template not found - it might be available on other hosts
-                            # Just continue to next host
-                            continue
+                            host_result["failed_at_stage"] = f"template_not_found_{idx}"
+                            host_result["error"] = msg
+                            return host_result
                     except Exception as e:
-                        # Mark host as failed on exception
-                        failed_hosts.add(host)
                         msg = f"Error creating template '{template_name}' v{version} on host {host}: {e}"
                         logger.error(f"Event '{event_name}': {msg}")
-                        errors.append(msg)
-                
-                # Wait for tasks to complete after each template (only check if there are running tasks)
-                for host in host_tokens.keys():
-                    if host in failed_hosts:
-                        continue
+                        host_result["failed_at_stage"] = f"template_creation_{idx}"
+                        host_result["error"] = str(e)
+                        return host_result
+                    
+                    # Wait for tasks to complete after each template
                     try:
-                        running_count = get_running_task_count(host, host_tokens[host])
+                        running_count = get_running_task_count(host, token)
                         if running_count > 0:
-                            result = check_tasks(host, host_tokens[host], display_progress=False)
+                            result = check_tasks(host, token, display_progress=False)
                             if result is not None:
                                 elapsed_time, success = result if isinstance(result, tuple) else (result, True)
                                 if not success:
                                     msg = f"Timed out waiting for tasks on host {host} after template creation"
                                     logger.warning(f"Event '{event_name}': {msg}")
-                                    errors.append(msg)
+                                    host_result["failed_at_stage"] = f"template_wait_tasks_{idx}"
+                                    host_result["error"] = msg
+                                    return host_result
                     except Exception as e:
                         msg = f"Error waiting for tasks on host {host}: {e}"
                         logger.warning(f"Event '{event_name}': {msg}")
-                        errors.append(msg)
-        
-        # Step 4: Execute SSH Profiles (if selected) BEFORE Install Workspace
-        ssh_profile_id = config_data.get('sshProfileId', '')
-        # Convert empty string to None for proper checking
-        if isinstance(ssh_profile_id, str) and not ssh_profile_id.strip():
-            ssh_profile_id = None
-        elif ssh_profile_id:
-            try:
-                ssh_profile_id = int(ssh_profile_id)
-            except (ValueError, TypeError):
-                ssh_profile_id = None
-        ssh_wait_time = config_data.get('sshWaitTime', 0)  # Get wait time from config (default: 0)
-        ssh_execution_details = None  # Track SSH execution details
-        if ssh_profile_id:
-            # Execute SSH profiles before Install Workspace
-            try:
-                conn = db_connect_with_retry()
-                if not conn:
-                    logger.error(f"Event '{event_name}': Failed to connect to database for SSH profile loading")
-                else:
-                    c = conn.cursor()
-                    
-                    try:
-                        # Get SSH profile
-                        logger.info(f"Event '{event_name}': Loading SSH profile with id {ssh_profile_id}")
-                        c.execute('''
-                            SELECT name, commands, ssh_key_id
-                            FROM ssh_command_profiles
-                            WHERE id = ?
-                        ''', (ssh_profile_id,))
-                        profile_row = c.fetchone()
-                        
-                        if profile_row:
-                            profile_name = profile_row[0]
-                            commands = profile_row[1]
-                            ssh_key_id = profile_row[2]
-                            logger.info(f"Event '{event_name}': SSH profile '{profile_name}' loaded, ssh_key_id={ssh_key_id}")
-                            
-                            # Initialize SSH execution tracking
-                            ssh_execution_details = {
-                                "profile_id": ssh_profile_id,
-                                "profile_name": profile_name,
-                                "wait_time_seconds": ssh_wait_time,
-                                "commands": [cmd.strip() for cmd in commands.split('\n') if cmd.strip()],
-                                "hosts": []
-                            }
-                            
-                            if ssh_key_id:
-                                # Get SSH key
-                                c.execute('''
-                                    SELECT private_key_encrypted
-                                    FROM ssh_keys
-                                    WHERE id = ?
-                                ''', (ssh_key_id,))
-                                key_row = c.fetchone()
-                                
-                                if not key_row:
-                                    error_msg = f"SSH key with id {ssh_key_id} not found"
-                                    logger.error(f"Event '{event_name}': {error_msg}")
-                                    errors.append(error_msg)
-                                    ssh_execution_details["error"] = error_msg
-                                    # Mark all hosts as failed and stop SSH execution for this profile
-                                    for host in host_tokens.keys():
-                                        if host not in failed_hosts:
-                                            failed_hosts.add(host)
-                                            host_result = {
-                                                "host": host,
-                                                "success": False,
-                                                "commands_executed": 0,
-                                                "commands_failed": 0,
-                                                "error": error_msg
-                                            }
-                                            ssh_execution_details["hosts"].append(host_result)
-                                    # Skip SSH execution - hosts are already marked as failed
-                                else:
-                                    encrypted_private_key = key_row[0]
-                                    # Decrypt using FS_SERVER_SECRET (no password required)
-                                    logger.info(f"Event '{event_name}': Decrypting SSH key and executing commands")
-                                    try:
-                                        private_key = decrypt_with_server_secret(encrypted_private_key)
-                                        
-                                        # Execute SSH commands on each host (skip failed hosts)
-                                        for host in host_tokens.keys():
-                                            # Skip hosts that failed during template creation
-                                            if host in failed_hosts:
-                                                logger.info(f"Event '{event_name}': Skipping SSH execution on failed host {host}")
-                                                continue
-                                            
-                                            host_result = {
-                                                "host": host,
-                                                "success": False,
-                                                "commands_executed": 0,
-                                                "commands_failed": 0,
-                                                "error": None
-                                            }
-                                            try:
-                                                # Parse commands
-                                                command_list = [cmd.strip() for cmd in commands.split('\n') if cmd.strip()]
-                                                
-                                                if command_list:
-                                                    ssh_client = paramiko.SSHClient()
-                                                    ssh_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-                                                    
-                                                    try:
-                                                        # Try different key formats
-                                                        private_key_obj = None
-                                                        try:
-                                                            private_key_obj = paramiko.RSAKey.from_private_key(io.StringIO(private_key))
-                                                        except:
-                                                            try:
-                                                                private_key_obj = paramiko.Ed25519Key.from_private_key(io.StringIO(private_key))
-                                                            except:
-                                                                try:
-                                                                    private_key_obj = paramiko.DSSKey.from_private_key(io.StringIO(private_key))
-                                                                except:
-                                                                    try:
-                                                                        private_key_obj = paramiko.ECDSAKey.from_private_key(io.StringIO(private_key))
-                                                                    except:
-                                                                        private_key_obj = paramiko.ssh_private_key_from_string(private_key)
-                                                        
-                                                        if private_key_obj:
-                                                            ssh_client.connect(
-                                                                hostname=host,
-                                                                port=22,
-                                                                username='admin',
-                                                                pkey=private_key_obj,
-                                                                timeout=30,
-                                                                look_for_keys=False,
-                                                                allow_agent=False
-                                                            )
-                                                            
-                                                            # Execute commands
-                                                            for cmd in command_list:
-                                                                stdin, stdout, stderr = ssh_client.exec_command(cmd, timeout=300)
-                                                                exit_status = stdout.channel.recv_exit_status()
-                                                                stdout_text = stdout.read().decode('utf-8', errors='replace')
-                                                                stderr_text = stderr.read().decode('utf-8', errors='replace')
-                                                                
-                                                                host_result["commands_executed"] += 1
-                                                                
-                                                                if exit_status != 0:
-                                                                    host_result["commands_failed"] += 1
-                                                                    msg = f"SSH command '{cmd}' on {host} exited with status {exit_status}"
-                                                                    logger.warning(f"Event '{event_name}': {msg}")
-                                                                    errors.append(msg)
-                                                                
-                                                                # Check for error indicators
-                                                                output_lower = (stdout_text + stderr_text).lower()
-                                                                error_indicators = ['error', 'failed', 'failure', 'exception', 'cannot', 'unable', 'denied']
-                                                                if any(indicator in output_lower for indicator in error_indicators):
-                                                                    if exit_status == 0:
-                                                                        msg = f"Warning: Potential error detected in SSH command '{cmd}' output on {host}"
-                                                                        logger.warning(f"Event '{event_name}': {msg}")
-                                                                        errors.append(msg)
-                                                                
-                                                                # Wait after each command (including the last one)
-                                                                if ssh_wait_time > 0:
-                                                                    time.sleep(ssh_wait_time)
-                                                            
-                                                            host_result["success"] = host_result["commands_failed"] == 0
-                                                            if host_result["success"]:
-                                                                logger.info(f"Event '{event_name}': SSH commands executed successfully on {host}")
-                                                            else:
-                                                                logger.warning(f"Event '{event_name}': SSH commands failed on {host}: {host_result['commands_failed']} command(s) failed")
-                                                                # Mark host as failed - stop processing for this host
-                                                                failed_hosts.add(host)
-                                                    except Exception as e:
-                                                        msg = f"Error executing SSH commands on {host}: {e}"
-                                                        host_result["error"] = str(e)
-                                                        logger.error(f"Event '{event_name}': {msg}")
-                                                        errors.append(msg)
-                                                        # Mark host as failed - stop processing for this host
-                                                        failed_hosts.add(host)
-                                                    finally:
-                                                        ssh_client.close()
-                                            except Exception as e:
-                                                msg = f"Error connecting via SSH to {host}: {e}"
-                                                host_result["error"] = str(e)
-                                                logger.error(f"Event '{event_name}': {msg}")
-                                                errors.append(msg)
-                                                # Mark host as failed - stop processing for this host
-                                                failed_hosts.add(host)
-                                            
-                                            ssh_execution_details["hosts"].append(host_result)
-                                    except Exception as e:
-                                        msg = f"Failed to decrypt SSH key: {e}"
-                                        logger.error(f"Event '{event_name}': {msg}")
-                                        errors.append(msg)
-                                        ssh_execution_details["error"] = msg
-                                        # Mark all hosts as failed and stop SSH execution for this profile
-                                        for host in host_tokens.keys():
-                                            if host not in failed_hosts:
-                                                failed_hosts.add(host)
-                                                host_result = {
-                                                    "host": host,
-                                                    "success": False,
-                                                    "commands_executed": 0,
-                                                    "commands_failed": 0,
-                                                    "error": msg
-                                                }
-                                                ssh_execution_details["hosts"].append(host_result)
-                            else:
-                                msg = "SSH key not found in database"
-                                logger.warning(f"Event '{event_name}': {msg}")
-                                errors.append(msg)
-                        else:
-                            msg = f"SSH command profile with id {ssh_profile_id} not found"
-                            logger.warning(f"Event '{event_name}': {msg}")
-                            errors.append(msg)
-                    except sqlite3.Error as e:
-                        logger.error(f"Event '{event_name}': Database error loading SSH profile: {e}")
-                        errors.append(f"Database error loading SSH profile: {e}")
-                    finally:
-                        if conn:
-                            conn.close()
-            except Exception as e:
-                logger.error(f"Event '{event_name}': Error executing SSH profiles: {e}")
-                errors.append(f"Error executing SSH profiles: {e}")
-                # If SSH execution fails completely, stop the run
-                if ssh_profile_id:
-                    logger.error(f"Event '{event_name}': SSH execution failed, stopping run")
-                    raise RuntimeError(f"SSH execution failed: {e}")
-        
-        # Step 5: Install selected workspace
-        # Check if Run Workspace is enabled
-        run_workspace_enabled = config_data.get('runWorkspaceEnabled', True)  # Default to True for backward compatibility
-        
-        if not run_workspace_enabled:
-            logger.info(f"Event '{event_name}': Run Workspace is disabled - skipping workspace installation")
-            installation_details = []
-        else:
-            # Only proceed if SSH execution succeeded (or was not required)
-            # Check if all hosts failed during SSH execution
-            if ssh_profile_id and ssh_execution_details:
-                ssh_failed_hosts = {h["host"] for h in ssh_execution_details["hosts"] if not h.get("success", False)}
-                if ssh_failed_hosts:
-                    # If SSH failed on all hosts, stop the run
-                    if ssh_failed_hosts == set(host_tokens.keys()):
-                        logger.error(f"Event '{event_name}': SSH execution failed on all hosts, stopping run")
-                        raise RuntimeError("SSH execution failed on all hosts")
-                    # Otherwise, mark failed hosts and continue (some hosts succeeded)
-                    failed_hosts.update(ssh_failed_hosts)
-            
-            installation_details = []  # Track installation details
-            if install_select:
-                template_name, version = install_select.split('|||')
-                # Find repo_name from templates list
-                repo_name = ''
-                for t in templates_list:
-                    if t.get('template_name') == template_name and t.get('version') == version:
-                        repo_name = t.get('repo_name', '')
-                        break
+                        host_result["failed_at_stage"] = f"template_wait_tasks_{idx}"
+                        host_result["error"] = str(e)
+                        return host_result
                 
-                if repo_name:
-                    # Filter out failed hosts
-                    available_hosts = [h for h in host_tokens.keys() if h not in failed_hosts]
-                    
-                    if not available_hosts:
-                        msg = f"All hosts failed during template creation. Skipping installation."
-                        logger.warning(f"Event '{event_name}': {msg}")
-                        errors.append(msg)
-                    else:
-                        if failed_hosts:
-                            failed_host_names = ', '.join(failed_hosts)
-                            logger.info(f"Event '{event_name}': Skipping installation on failed hosts: {failed_host_names}. Installing on {len(available_hosts)} remaining host(s).")
+                host_result["stages_completed"].append("template_creation")
+            
+            # Stage 7: Execute SSH commands (if configured)
+            if ssh_profile_id and ssh_private_key and ssh_commands:
+                try:
+                    command_list = [cmd.strip() for cmd in ssh_commands.split('\n') if cmd.strip()]
+                    if command_list:
+                        ssh_client = paramiko.SSHClient()
+                        ssh_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
                         
-                        # Install in parallel on all available hosts
-                        installation_lock = threading.Lock()
-                        
-                        def install_on_host(host):
-                            """Install fabric on a single host"""
+                        try:
+                            # Try different key formats
+                            private_key_obj = None
                             try:
-                                # Use cached template ID instead of fetching again
-                                template_id = get_cached_template_id(host, template_name, repo_name, version)
-                                if template_id:
-                                    # install_fabric expects template name and version, not id
-                                    install_start = datetime.now(timezone.utc)
-                                    result = install_fabric(host, host_tokens[host], template_name, version)
-                                    install_end = datetime.now(timezone.utc)
-                                    install_duration = (install_end - install_start).total_seconds()
-                                    
-                                    if isinstance(result, tuple):
-                                        success, task_errors = result
-                                    else:
-                                        success = result
-                                        task_errors = []
-                                    
-                                    # Track installation details (thread-safe)
-                                    with installation_lock:
-                                        installation_details.append({
-                                            "host": host,
-                                            "template_name": template_name,
-                                            "repo_name": repo_name,
-                                            "version": version,
-                                            "success": success,
-                                            "duration_seconds": install_duration,
-                                            "installed_at": install_start.isoformat(),
-                                            "errors": task_errors if task_errors else None
-                                        })
-                                    
-                                    if success:
-                                        # Log audit with duration
+                                private_key_obj = paramiko.RSAKey.from_private_key(io.StringIO(ssh_private_key))
+                            except:
+                                try:
+                                    private_key_obj = paramiko.Ed25519Key.from_private_key(io.StringIO(ssh_private_key))
+                                except:
+                                    try:
+                                        private_key_obj = paramiko.DSSKey.from_private_key(io.StringIO(ssh_private_key))
+                                    except:
                                         try:
-                                            log_audit("fabric_installed", details=f"host={host} template={template_name} version={version} event={event_name} duration_s={install_duration:.1f}", ip_address=None)
-                                        except Exception:
-                                            pass
-                                        logger.info(f"Event '{event_name}': Installation successful on host {host}: {template_name} v{version}")
-                                    else:
-                                        # Mark host as failed - stop processing for this host
-                                        with installation_lock:
-                                            failed_hosts.add(host)
-                                        
-                                        # Build detailed error message per host
-                                        if task_errors:
-                                            error_details = "; ".join(task_errors)
-                                            msg = f"Host {host}: Installation FAILED - {error_details}"
-                                        else:
-                                            msg = f"Host {host}: Installation FAILED - installation timed out or encountered an error"
-                                        
-                                        logger.error(f"Event '{event_name}': {msg}")
-                                        with installation_lock:
-                                            errors.append(msg)
-                                else:
-                                    # Mark host as failed - template not found
-                                    with installation_lock:
-                                        failed_hosts.add(host)
-                                    
-                                    msg = f"Host {host}: Installation FAILED - Template '{template_name}' v{version} not found"
-                                    logger.error(f"Event '{event_name}': {msg}")
-                                    with installation_lock:
-                                        errors.append(msg)
-                            except Exception as e:
-                                # Mark host as failed on exception
-                                with installation_lock:
-                                    failed_hosts.add(host)
+                                            private_key_obj = paramiko.ECDSAKey.from_private_key(io.StringIO(ssh_private_key))
+                                        except:
+                                            private_key_obj = paramiko.ssh_private_key_from_string(ssh_private_key)
+                            
+                            if private_key_obj:
+                                ssh_client.connect(
+                                    hostname=host,
+                                    port=22,
+                                    username='admin',
+                                    pkey=private_key_obj,
+                                    timeout=30,
+                                    look_for_keys=False,
+                                    allow_agent=False
+                                )
                                 
-                                msg = f"Host {host}: Installation FAILED - Error: {e}"
-                                logger.error(f"Event '{event_name}': {msg}")
-                                with installation_lock:
-                                    errors.append(msg)
-                        
-                        # Start installation threads for all available hosts
-                        install_threads = []
-                        for host in available_hosts:
-                            thread = threading.Thread(target=install_on_host, args=(host,))
-                            thread.daemon = False
-                            thread.start()
-                            install_threads.append(thread)
-                        
-                        # Wait for all installation threads to complete
-                        for thread in install_threads:
-                            thread.join()
-                        
-                        # Generate per-host installation summary
-                        successful_hosts = []
-                        failed_hosts_for_install = []
-                        for detail in installation_details:
-                            if detail["success"]:
-                                successful_hosts.append(detail["host"])
+                                host_ssh_result = {
+                                    "host": host,
+                                    "success": False,
+                                    "commands_executed": 0,
+                                    "commands_failed": 0,
+                                    "error": None
+                                }
+                                
+                                # Execute commands
+                                for cmd in command_list:
+                                    stdin, stdout, stderr = ssh_client.exec_command(cmd, timeout=300)
+                                    exit_status = stdout.channel.recv_exit_status()
+                                    host_ssh_result["commands_executed"] += 1
+                                    
+                                    if exit_status != 0:
+                                        host_ssh_result["commands_failed"] += 1
+                                
+                                host_ssh_result["success"] = host_ssh_result["commands_failed"] == 0
+                                host_result["ssh_result"] = host_ssh_result
+                                
+                                if host_ssh_result["success"]:
+                                    host_result["stages_completed"].append("ssh_execution")
+                                else:
+                                    msg = f"SSH execution failed on host {host}: {host_ssh_result['commands_failed']} command(s) failed"
+                                    logger.error(f"Event '{event_name}': {msg}")
+                                    host_result["failed_at_stage"] = "ssh_execution"
+                                    host_result["error"] = msg
+                                    return host_result
+                                
+                                # Wait after commands if configured
+                                if ssh_wait_time > 0:
+                                    time.sleep(ssh_wait_time)
                             else:
-                                failed_hosts_for_install.append(detail["host"])
-                                # failed_hosts already updated in install_on_host
-                        
-                        # Log summary per host
-                        if successful_hosts:
-                            success_msg = f"Event '{event_name}': Installation completed successfully on {len(successful_hosts)} host(s): {', '.join(successful_hosts)}"
-                            logger.info(success_msg)
-                            # Don't add success messages to errors list - they're informational only
-                            # Success details are already tracked in installation_details
-                        
-                        if failed_hosts_for_install:
-                            logger.warning(f"Event '{event_name}': Installation failed on {len(failed_hosts_for_install)} host(s): {', '.join(failed_hosts_for_install)}")
-                            # Per-host failure messages already added in install_on_host function
-                else:
-                    msg = f"Repository name not found for template '{template_name}' v{version}"
-                    logger.warning(f"Event '{event_name}': {msg}")
-                    errors.append(msg)
+                                msg = f"Failed to parse SSH private key for host {host}"
+                                logger.error(f"Event '{event_name}': {msg}")
+                                host_result["failed_at_stage"] = "ssh_execution"
+                                host_result["error"] = msg
+                                return host_result
+                        finally:
+                            ssh_client.close()
+                except Exception as e:
+                    msg = f"Error executing SSH commands on host {host}: {e}"
+                    logger.error(f"Event '{event_name}': {msg}")
+                    host_result["failed_at_stage"] = "ssh_execution"
+                    host_result["error"] = str(e)
+                    return host_result
+            
+            # Stage 8: Install workspace (if enabled)
+            run_workspace_enabled = config_data.get('runWorkspaceEnabled', True)
+            if run_workspace_enabled and install_select:
+                try:
+                    template_name, version = install_select.split('|||')
+                    repo_name = ''
+                    for t in templates_list:
+                        if t.get('template_name') == template_name and t.get('version') == version:
+                            repo_name = t.get('repo_name', '')
+                            break
+                    
+                    if repo_name:
+                        template_id = get_cached_template_id(host, template_name, repo_name, version)
+                        if template_id:
+                            install_start = datetime.now(timezone.utc)
+                            result = install_fabric(host, token, template_name, version)
+                            install_end = datetime.now(timezone.utc)
+                            install_duration = (install_end - install_start).total_seconds()
+                            
+                            if isinstance(result, tuple):
+                                success, task_errors = result
+                            else:
+                                success = result
+                                task_errors = []
+                            
+                            install_detail = {
+                                "host": host,
+                                "template_name": template_name,
+                                "repo_name": repo_name,
+                                "version": version,
+                                "success": success,
+                                "duration_seconds": install_duration,
+                                "installed_at": install_start.isoformat(),
+                                "errors": task_errors if task_errors else None
+                            }
+                            host_result["installation"] = install_detail
+                            
+                            if success:
+                                try:
+                                    log_audit("fabric_installed", details=f"host={host} template={template_name} version={version} event={event_name} duration_s={install_duration:.1f}", ip_address=None)
+                                except Exception:
+                                    pass
+                                host_result["stages_completed"].append("installation")
+                            else:
+                                msg = f"Installation failed on host {host}"
+                                if task_errors:
+                                    msg += ": " + "; ".join(task_errors)
+                                logger.error(f"Event '{event_name}': {msg}")
+                                host_result["failed_at_stage"] = "installation"
+                                host_result["error"] = msg
+                                return host_result
+                        else:
+                            msg = f"Template '{template_name}' v{version} not found on host {host}"
+                            logger.error(f"Event '{event_name}': {msg}")
+                            host_result["failed_at_stage"] = "installation"
+                            host_result["error"] = msg
+                            return host_result
+                except Exception as e:
+                    msg = f"Error installing workspace on host {host}: {e}"
+                    logger.error(f"Event '{event_name}': {msg}")
+                    host_result["failed_at_stage"] = "installation"
+                    host_result["error"] = str(e)
+                    return host_result
+            
+            return host_result
+        
+        # Execute all hosts in parallel using pipeline
+        logger.info(f"Event '{event_name}': Starting per-host pipeline execution for {len(host_tokens)} host(s)")
+        with ThreadPoolExecutor(max_workers=min(10, len(host_tokens))) as executor:
+            pipeline_results = list(executor.map(process_host_pipeline, host_tokens.keys()))
+        
+        # Aggregate results
+        for result in pipeline_results:
+            host = result["host"]
+            
+            # Collect errors
+            if result["failed_at_stage"]:
+                errors.append(f"Host {host} failed at stage '{result['failed_at_stage']}': {result['error']}")
+            
+            # Collect hostname changes
+            if result["hostname_change"]:
+                hostname_changes.append({
+                    "host": host,
+                    "new_hostname": result["hostname_change"]["new_hostname"],
+                    "success": result["hostname_change"]["success"]
+                })
+            
+            # Collect password changes
+            if result["password_change"]:
+                password_changes.append({
+                    "host": host,
+                    "username": result["password_change"]["username"],
+                    "success": result["password_change"]["success"]
+                })
+            
+            # Collect fabric creation details
+            fabric_creation_details.extend(result["fabric_creations"])
+            
+            # Collect SSH execution details
+            if result["ssh_result"]:
+                if ssh_execution_details is None:
+                    ssh_execution_details = {
+                        "profile_id": ssh_profile_id,
+                        "profile_name": ssh_profile_name,
+                        "wait_time_seconds": ssh_wait_time,
+                        "commands": [cmd.strip() for cmd in ssh_commands.split('\n') if cmd.strip()] if ssh_commands else [],
+                        "hosts": []
+                    }
+                ssh_execution_details["hosts"].append(result["ssh_result"])
+                if not result["ssh_result"].get("success", False):
+                    if result["ssh_result"].get("error"):
+                        errors.append(result["ssh_result"]["error"])
+                    if result["ssh_result"].get("commands_failed", 0) > 0:
+                        errors.append(f"SSH execution failed on {host}: {result['ssh_result']['commands_failed']} command(s) failed")
+            
+            # Collect installation details
+            if result["installation"]:
+                installation_details.append(result["installation"])
+                if not result["installation"].get("success", False):
+                    if result["installation"].get("errors"):
+                        errors.extend(result["installation"]["errors"])
+        
+        # Log summary
+        successful_hosts = [r["host"] for r in pipeline_results if not r["failed_at_stage"]]
+        failed_hosts = [r["host"] for r in pipeline_results if r["failed_at_stage"]]
+        
+        if successful_hosts:
+            logger.info(f"Event '{event_name}': Successfully completed pipeline on {len(successful_hosts)} host(s): {', '.join(successful_hosts)}")
+        if failed_hosts:
+            logger.warning(f"Event '{event_name}': Pipeline failed on {len(failed_hosts)} host(s): {', '.join(failed_hosts)}")
+            for result in pipeline_results:
+                if result["failed_at_stage"]:
+                    logger.warning(f"Event '{event_name}': Host {result['host']} failed at stage '{result['failed_at_stage']}': {result['error']}")
         
         completed_at = datetime.now(timezone.utc)
         
@@ -5576,6 +5455,20 @@ def run_configuration(config_data: dict, event_name: str, event_id: Optional[int
                         status = 'success'
                         message = "Auto-run execution completed successfully"
                     
+                    # Extract install template info for execution details
+                    install_repo_name = ''
+                    install_template_name = ''
+                    install_version = ''
+                    if install_select and templates_list:
+                        try:
+                            install_template_name, install_version = install_select.split('|||')
+                            for t in templates_list:
+                                if t.get('template_name') == install_template_name and t.get('version') == install_version:
+                                    install_repo_name = t.get('repo_name', '')
+                                    break
+                        except Exception:
+                            pass
+                    
                     execution_details_json = json.dumps({
                         "hosts": [h.get('host') for h in hosts if isinstance(h, dict)] if isinstance(hosts, list) else [],
                         "hosts_count": len(hosts),
@@ -5591,9 +5484,9 @@ def run_configuration(config_data: dict, event_name: str, event_id: Optional[int
                         "fabric_creations_count": len(fabric_creation_details),
                         "installed": (
                             {
-                                "repo_name": repo_name if 'repo_name' in locals() else '',
-                                "template_name": template_name if 'template_name' in locals() else '',
-                                "version": version if 'version' in locals() else ''
+                                "repo_name": install_repo_name,
+                                "template_name": install_template_name,
+                                "version": install_version
                             } if (install_select and len(installation_details) > 0) else None
                         ),
                         "installations": installation_details,
@@ -6603,6 +6496,8 @@ def save_nhi(req: SaveNhiReq, request: Request):
             nhi_id = c.lastrowid
         
         # Now store tokens for all hosts
+        # IMPORTANT: Process hosts SEQUENTIALLY in the order they were inputted
+        # This ensures tokens are requested one at a time, respecting the input order
         tokens_stored = 0
         token_errors = []
         if nhi_id and hosts_to_process:
@@ -6623,7 +6518,10 @@ def save_nhi(req: SaveNhiReq, request: Request):
                 except Exception as e:
                     logger.error(f"Failed to decrypt client secret: {str(e)}", exc_info=True)
                     raise HTTPException(400, f"Failed to decrypt client secret: {str(e)}")
-            for fabric_host in hosts_to_process:
+            
+            # Process hosts sequentially in input order (do NOT parallelize this)
+            logger.info(f"Processing {len(hosts_to_process)} host(s) sequentially in input order: {', '.join(hosts_to_process)}")
+            for idx, fabric_host in enumerate(hosts_to_process, 1):
                 try:
                     # Ensure client_id and client_secret are properly trimmed
                     client_id_clean = req.client_id.strip()
@@ -6635,7 +6533,7 @@ def save_nhi(req: SaveNhiReq, request: Request):
                         logger.warning(error_msg)
                         continue
                     
-                    logger.info(f"Attempting token retrieval for host {fabric_host} with client_id: {client_id_clean[:10]}...")
+                    logger.info(f"[{idx}/{len(hosts_to_process)}] Attempting token retrieval for host {fabric_host} with client_id: {client_id_clean[:10]}...")
                     logger.debug(f"Client ID: {client_id_clean[:20]}... (length: {len(client_id_clean)})")
                     logger.debug(f"Client Secret: {client_secret_clean[:3]}... (length: {len(client_secret_clean)})")
                     
@@ -6643,6 +6541,7 @@ def save_nhi(req: SaveNhiReq, request: Request):
                     if len(client_secret_clean) < 10:
                         logger.warning(f"Client secret seems unusually short ({len(client_secret_clean)} chars) - decryption may have failed")
                     
+                    # Request token sequentially (one at a time, respecting input order)
                     token_data = get_access_token(client_id_clean, client_secret_clean, fabric_host)
                     if token_data and isinstance(token_data, dict) and token_data.get("access_token"):
                         # Encrypt the token using FS_SERVER_SECRET
