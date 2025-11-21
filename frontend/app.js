@@ -1635,12 +1635,28 @@ async function apiJson(path, options = {}) {
 
 // Token acquisition function (now called from Install Workspace)
 async function acquireTokens() {
-  // Auto-confirm hosts if not already confirmed
-  if (confirmedHosts.length === 0) {
-    if (!autoConfirmHosts()) {
-      showStatus('Please add at least one valid host');
-      return false;
+  // Check if we have hosts - try multiple sources
+  let hasHosts = confirmedHosts.length > 0;
+  if (!hasHosts) {
+    // Try to auto-confirm hosts if available
+    if (autoConfirmHosts()) {
+      hasHosts = confirmedHosts.length > 0;
     }
+  }
+  if (!hasHosts) {
+    // Try parsing from input field as fallback
+    const parsedHosts = parseFabricHosts();
+    if (parsedHosts.length > 0) {
+      // Populate validatedHosts and confirmedHosts from parsed hosts
+      validatedHosts = parsedHosts.map(({host, port}) => ({host, port, isValid: true}));
+      confirmedHosts = parsedHosts;
+      hasHosts = true;
+    }
+  }
+  
+  if (!hasHosts) {
+    showStatus('Please add at least one valid host');
+    return false;
   }
   
   // Check if NHI credential is loaded - if not, try to load it from the UI
@@ -1654,6 +1670,22 @@ async function acquireTokens() {
       } else {
         showStatus('Please select NHI credential to acquire tokens');
         return false;
+      }
+    } else {
+      // Even if currentNhiId is set, ensure session is updated with it
+      // This is critical when running saved configurations
+      try {
+        await api('/auth/session/nhi-credential', {
+          method: 'PUT',
+          params: { nhi_credential_id: currentNhiId }
+        });
+      } catch (error) {
+        console.warn(`Failed to update session with NHI credential ID: ${error.message || error}`);
+        // Try to reload the credential to ensure session is updated
+        const nhiSelect = el('nhiCredentialSelect');
+        if (nhiSelect && nhiSelect.value === String(currentNhiId)) {
+          await loadSelectedNhiCredential();
+        }
       }
     }
   } catch (e) {
@@ -7251,6 +7283,14 @@ async function restoreConfiguration(config) {
     const fabricHostInput = el('fabricHost');
     if (fabricHostInput && config.fabricHost !== undefined) {
       fabricHostInput.value = config.fabricHost || '';
+      // If hosts are in the input, parse and populate confirmedHosts immediately
+      if (config.fabricHost && config.fabricHost.trim()) {
+        const parsedHosts = parseFabricHosts();
+        if (parsedHosts.length > 0) {
+          validatedHosts = parsedHosts.map(({host, port}) => ({host, port, isValid: true}));
+          confirmedHosts = parsedHosts;
+        }
+      }
     }
     
     const expertModeInput = el('expertMode');
@@ -7260,6 +7300,10 @@ async function restoreConfiguration(config) {
     
     // Restore NHI credential selection if available, and auto-load automatically (no password needed)
     if (config.nhiCredentialId) {
+      // Set currentNhiId immediately from configuration
+      currentNhiId = parseInt(config.nhiCredentialId);
+      logMsg(`Set currentNhiId from configuration: ${currentNhiId}`);
+      
       const nhiSelect = el('nhiCredentialSelect');
       if (nhiSelect) {
         // Load credentials if not already loaded (may have been loaded by initializePreparationSection)
@@ -7274,6 +7318,23 @@ async function restoreConfiguration(config) {
         // Automatically load the credential (no password required)
         try {
           await loadSelectedNhiCredential();
+          
+          // Ensure currentNhiId is still set (loadSelectedNhiCredential should also set it)
+          if (!currentNhiId) {
+            currentNhiId = parseInt(config.nhiCredentialId);
+          }
+          
+          // Ensure session is updated with NHI credential ID
+          // This is critical for saved configurations
+          try {
+            await api('/auth/session/nhi-credential', {
+              method: 'PUT',
+              params: { nhi_credential_id: currentNhiId }
+            });
+            logMsg(`Session updated with NHI credential ID during restore: ${currentNhiId}`);
+          } catch (e) {
+            logMsg(`Warning: Failed to update session with NHI credential ID during restore: ${e.message || e}`);
+          }
           
           // Wait for credential to load and hosts to be populated (reduced from 300ms)
           await new Promise(resolve => setTimeout(resolve, 100));
@@ -8708,12 +8769,26 @@ async function handleTrackedRunButton() {
     updateRunProgress(0, 'Starting...');
     startRunTimer();
     
+    // Get hosts first - this ensures hosts from configuration are loaded
     hosts = getAllConfirmedHosts();
     if (hosts.length === 0) {
-      // Auto-confirm hosts if available
-    if (autoConfirmHosts()) {
-      // Hosts are now confirmed, continue
-    } else {
+      // Try to auto-confirm hosts if available
+      if (autoConfirmHosts()) {
+        hosts = getAllConfirmedHosts();
+      }
+      // If still no hosts, try parsing from input and confirming them
+      if (hosts.length === 0) {
+        const parsedHosts = parseFabricHosts();
+        if (parsedHosts.length > 0) {
+          // Populate validatedHosts and confirmedHosts from parsed hosts
+          validatedHosts = parsedHosts.map(({host, port}) => ({host, port, isValid: true}));
+          confirmedHosts = parsedHosts;
+          hosts = getAllConfirmedHosts();
+        }
+      }
+    }
+    
+    if (hosts.length === 0) {
       showStatus('No hosts configured. Please add at least one valid host.');
       if (runId) {
         await api(`/run/update/${runId}`, {
@@ -8725,15 +8800,65 @@ async function handleTrackedRunButton() {
       completeRun();
       return;
     }
+    
+    // Now acquire tokens after hosts are loaded (critical for saved configurations)
+    // Since confirmedHosts is now populated, acquireTokens() should work
+    updateRunProgress(1, 'Acquiring tokens...');
+    if (!await acquireTokens()) {
+      showStatus('Failed to acquire tokens. Please reload NHI credential and try again.');
       if (runId) {
         await api(`/run/update/${runId}`, {
           method: 'PUT',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ status: 'error', message: 'No hosts configured', errors: ['No hosts configured'] })
+          body: JSON.stringify({ 
+            status: 'error', 
+            message: 'Failed to acquire tokens', 
+            errors: ['Failed to acquire tokens. Please reload NHI credential.'] 
+          })
         });
       }
       completeRun();
       return;
+    }
+    
+    // Ensure session has NHI credential ID before making API calls
+    // This is critical - the session must have the NHI credential ID for get_access_token_from_request to work
+    // Also ensure currentNhiId is set from configuration if available
+    if (!currentNhiId) {
+      // Try to get NHI credential ID from configuration or dropdown
+      const nhiSelect = el('nhiCredentialSelect');
+      if (nhiSelect && nhiSelect.value) {
+        currentNhiId = parseInt(nhiSelect.value);
+        logMsg(`Set currentNhiId from dropdown: ${currentNhiId}`);
+      }
+    }
+    
+    if (currentNhiId) {
+      logMsg(`Using NHI credential ID: ${currentNhiId} for API calls`);
+      try {
+        // Update session with NHI credential ID and wait for it to complete
+        const sessionUpdateRes = await api('/auth/session/nhi-credential', {
+          method: 'PUT',
+          params: { nhi_credential_id: currentNhiId }
+        });
+        if (!sessionUpdateRes.ok) {
+          logMsg(`Warning: Failed to update session with NHI credential ID: ${sessionUpdateRes.status}`);
+        } else {
+          logMsg(`Session updated with NHI credential ID: ${currentNhiId}`);
+        }
+        // Small delay to ensure session is persisted
+        await new Promise(resolve => setTimeout(resolve, 100));
+      } catch (e) {
+        logMsg(`Warning: Failed to update session with NHI credential ID: ${e.message || e}`);
+        // Try to reload the credential to ensure session is updated
+        const nhiSelect = el('nhiCredentialSelect');
+        if (nhiSelect && nhiSelect.value === String(currentNhiId)) {
+          await loadSelectedNhiCredential();
+          await new Promise(resolve => setTimeout(resolve, 100));
+        }
+      }
+    } else {
+      logMsg(`Warning: No NHI credential ID available. API calls may fail.`);
     }
     
     // Show Running Tasks section

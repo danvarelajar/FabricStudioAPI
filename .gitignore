@@ -19,6 +19,8 @@ ENV/
 *.db-wal
 data/
 data/**
+backups/
+backups/**
 
 # IDE
 .vscode/

@@ -1,0 +1,1423 @@
+"""MCP (Model Context Protocol) router for FabricStudio API"""
+import json
+import secrets
+import sqlite3
+from typing import Optional, Dict, Any, List
+from fastapi import APIRouter, Request, HTTPException
+from fastapi.responses import JSONResponse
+
+from .config import Config
+from .fabricstudio.fabricstudio_api import list_all_templates, list_repositories, get_repositoryId, list_templates_for_repo
+from .db_utils import get_db_connection
+
+router = APIRouter()
+
+def verify_api_key(request: Request) -> bool:
+    """Verify API key from request headers"""
+    if not Config.MCP_ENABLED or not Config.MCP_API_KEY:
+        return False
+    
+    api_key = request.headers.get("X-API-Key") or request.headers.get("X-Api-Key")
+    if not api_key:
+        return False
+    
+    return secrets.compare_digest(api_key, Config.MCP_API_KEY)
+
+@router.post("/mcp")
+async def mcp_protocol_endpoint(request: Request):
+    """MCP protocol endpoint - handles JSON-RPC style requests"""
+    if not verify_api_key(request):
+        raise HTTPException(401, "Authentication required")
+    
+    request_id = None
+    try:
+        body = await request.json()
+        method = body.get("method")
+        params = body.get("params", {})
+        request_id = body.get("id")
+        
+        # Helper function to wrap response in JSON-RPC 2.0 format
+        def jsonrpc_response(result=None, error=None):
+            response = {"jsonrpc": "2.0", "id": request_id}
+            if error:
+                response["error"] = error
+            else:
+                response["result"] = result
+            return response
+        
+        if method == "initialize":
+            # MCP protocol initialization handshake
+            return jsonrpc_response(result={
+                "protocolVersion": "2024-11-05",
+                "capabilities": {
+                    "tools": {},
+                    "prompts": {},
+                    "resources": {}
+                },
+                "serverInfo": {
+                    "name": "FabricStudioAPI",
+                    "version": "1.0.0"
+                }
+            })
+        
+        elif method == "prompts/list":
+            return jsonrpc_response(result={
+                "prompts": [
+                    {
+                        "name": "create_configuration_from_template",
+                        "description": "Create a new FabricStudio configuration from a template. This prompt helps you create a complete configuration that includes template selection, fabric hosts, and optional SSH command profiles. The configuration can be saved and run later to deploy templates to fabric hosts.",
+                        "arguments": [
+                            {
+                                "name": "configuration_name",
+                                "description": "Name for the configuration (must be unique)",
+                                "required": True
+                            },
+                            {
+                                "name": "template_name",
+                                "description": "Name of the template to use (e.g., 'basic-fabric', 'advanced-fabric')",
+                                "required": True
+                            },
+                            {
+                                "name": "repo_name",
+                                "description": "Repository name containing the template (e.g., 'default', 'custom-repo')",
+                                "required": True
+                            },
+                            {
+                                "name": "version",
+                                "description": "Template version (e.g., '1.0.0'). If not specified, latest version will be used",
+                                "required": False
+                            },
+                            {
+                                "name": "fabric_hosts",
+                                "description": "Space-separated list of fabric hosts to deploy to (e.g., 'fs1.example.com fs2.example.com')",
+                                "required": True
+                            },
+                            {
+                                "name": "nhi_credential_id",
+                                "description": "NHI credential ID to use for authentication (optional, will use default if not specified)",
+                                "required": False
+                            },
+                            {
+                                "name": "new_hostname",
+                                "description": "Base hostname for fabric instances (optional, e.g., 'fabric.local')",
+                                "required": False
+                            },
+                            {
+                                "name": "guest_password",
+                                "description": "Guest user password (optional, must be at least 7 chars with uppercase, number, special char)",
+                                "required": False
+                            },
+                            {
+                                "name": "ssh_profile_id",
+                                "description": "SSH command profile ID to execute before workspace installation (optional)",
+                                "required": False
+                            },
+                            {
+                                "name": "run_workspace_enabled",
+                                "description": "Whether to automatically install workspace after template creation (default: true)",
+                                "required": False
+                            }
+                        ]
+                    },
+                    {
+                        "name": "schedule_event",
+                        "description": "Schedule a FabricStudio configuration run for a specific date and time. The event will automatically execute the configuration at the specified time.",
+                        "arguments": [
+                            {
+                                "name": "event_name",
+                                "description": "Name for the scheduled event",
+                                "required": True
+                            },
+                            {
+                                "name": "configuration_id",
+                                "description": "ID of the configuration to run",
+                                "required": True
+                            },
+                            {
+                                "name": "event_date",
+                                "description": "Date to run the event in YYYY-MM-DD format (e.g., '2025-12-25')",
+                                "required": True
+                            },
+                            {
+                                "name": "event_time",
+                                "description": "Time to run the event in HH:MM:SS format (e.g., '14:30:00'). Optional, defaults to 00:00:00",
+                                "required": False
+                            },
+                            {
+                                "name": "auto_run",
+                                "description": "Whether to automatically run the configuration (default: true)",
+                                "required": False
+                            },
+                            {
+                                "name": "description",
+                                "description": "Optional description for the event",
+                                "required": False
+                            }
+                        ]
+                    }
+                ]
+            })
+        
+        elif method == "prompts/get":
+            prompt_name = params.get("name")
+            if not prompt_name:
+                return jsonrpc_response(error={"code": -32602, "message": "name is required"})
+            
+            if prompt_name == "create_configuration_from_template":
+                return jsonrpc_response(result={
+                    "description": "Create a new FabricStudio configuration from a template",
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": {
+                                "type": "text",
+                                "text": """Create a FabricStudio configuration that will deploy a template to fabric hosts.
+
+Configuration Structure:
+- Configuration Name: A unique name to identify this configuration
+- Template: Selected from a repository (repo_name, template_name, version)
+- Fabric Hosts: One or more fabric hosts where templates will be deployed
+- NHI Credential: Optional - credential for authentication
+- Base Hostname: Optional - hostname base for fabric instances
+- Guest Password: Optional - password for guest user
+- SSH Profile: Optional - SSH commands to run before installation
+- Workspace Installation: Whether to automatically install workspace after template creation
+
+When you run this configuration, it will:
+1. Create templates on the specified fabric hosts
+2. Optionally execute SSH commands (if SSH profile is specified)
+3. Optionally install workspace (if run_workspace_enabled is true)
+
+Use the create_configuration tool with the collected information."""
+                            }
+                        }
+                    ]
+                })
+            elif prompt_name == "schedule_event":
+                return jsonrpc_response(result={
+                    "description": "Schedule a FabricStudio configuration run",
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": {
+                                "type": "text",
+                                "text": """Schedule a FabricStudio configuration to run automatically at a specific date and time.
+
+The event will:
+1. Load the specified configuration
+2. Execute it automatically at the scheduled time
+3. Track execution history and results
+
+Use the create_event tool with the configuration ID and schedule details."""
+                            }
+                        }
+                    ]
+                })
+            else:
+                return jsonrpc_response(error={"code": -32000, "message": f"Unknown prompt: {prompt_name}"})
+        
+        elif method == "resources/list":
+            return jsonrpc_response(result={
+                "resources": [
+                    {
+                        "uri": "fabricstudio://configurations",
+                        "name": "Configurations",
+                        "description": "List of all saved configurations",
+                        "mimeType": "application/json"
+                    },
+                    {
+                        "uri": "fabricstudio://templates",
+                        "name": "Templates",
+                        "description": "List of all available templates",
+                        "mimeType": "application/json"
+                    },
+                    {
+                        "uri": "fabricstudio://events",
+                        "name": "Events",
+                        "description": "List of all scheduled events",
+                        "mimeType": "application/json"
+                    },
+                    {
+                        "uri": "fabricstudio://reports",
+                        "name": "Reports",
+                        "description": "List of all execution reports",
+                        "mimeType": "application/json"
+                    }
+                ]
+            })
+        
+        elif method == "resources/read":
+            resource_uri = params.get("uri")
+            if not resource_uri:
+                return jsonrpc_response(error={"code": -32602, "message": "uri is required"})
+            
+            try:
+                with get_db_connection() as conn:
+                    c = conn.cursor()
+                    if resource_uri == "fabricstudio://configurations":
+                        c.execute('SELECT id, name, created_at, updated_at FROM configurations ORDER BY updated_at DESC')
+                        rows = c.fetchall()
+                        configs = [{"id": r[0], "name": r[1], "created_at": r[2], "updated_at": r[3]} for r in rows]
+                        return jsonrpc_response(result={
+                            "contents": [{
+                                "uri": resource_uri,
+                                "mimeType": "application/json",
+                                "text": json.dumps({"configurations": configs}, indent=2)
+                            }]
+                        })
+                    elif resource_uri == "fabricstudio://templates":
+                        from .app import get_cached_templates_internal
+                        templates = get_cached_templates_internal()
+                        return jsonrpc_response(result={
+                            "contents": [{
+                                "uri": resource_uri,
+                                "mimeType": "application/json",
+                                "text": json.dumps({"templates": templates}, indent=2)
+                            }]
+                        })
+                    elif resource_uri == "fabricstudio://events":
+                        c.execute('''
+                            SELECT e.id, e.name, e.event_date, e.event_time, e.event_type, e.description,
+                                   e.configuration_id, e.auto_run, c.name as configuration_name,
+                                   e.created_at, e.updated_at
+                            FROM event_schedules e
+                            LEFT JOIN configurations c ON e.configuration_id = c.id
+                            ORDER BY e.event_date ASC, COALESCE(e.event_time, '') ASC, e.name ASC
+                        ''')
+                        rows = c.fetchall()
+                        events = [{
+                            "id": r[0], "name": r[1], "event_date": r[2], "event_time": r[3],
+                            "event_type": r[4], "description": r[5], "configuration_id": r[6],
+                            "auto_run": bool(r[7]), "configuration_name": r[8], "created_at": r[9],
+                            "updated_at": r[10]
+                        } for r in rows]
+                        return jsonrpc_response(result={
+                            "contents": [{
+                                "uri": resource_uri,
+                                "mimeType": "application/json",
+                                "text": json.dumps({"events": events}, indent=2)
+                            }]
+                        })
+                    elif resource_uri == "fabricstudio://reports":
+                        c.execute('SELECT id, configuration_name, status, message, started_at, completed_at FROM manual_runs ORDER BY started_at DESC LIMIT 100')
+                        rows = c.fetchall()
+                        from datetime import datetime
+                        runs = []
+                        for r in rows:
+                            duration = None
+                            if r[4] and r[5]:
+                                try:
+                                    start_dt = datetime.fromisoformat(r[4].replace('Z', '+00:00'))
+                                    end_dt = datetime.fromisoformat(r[5].replace('Z', '+00:00'))
+                                    duration = int((end_dt - start_dt).total_seconds())
+                                except:
+                                    pass
+                            runs.append({
+                                "id": r[0], "configuration_name": r[1] or "Manual Run", "status": r[2],
+                                "message": r[3], "started_at": r[4], "completed_at": r[5], "duration_seconds": duration
+                            })
+                        return jsonrpc_response(result={
+                            "contents": [{
+                                "uri": resource_uri,
+                                "mimeType": "application/json",
+                                "text": json.dumps({"reports": runs}, indent=2)
+                            }]
+                        })
+                    else:
+                        return jsonrpc_response(error={"code": -32000, "message": f"Unknown resource: {resource_uri}"})
+            except Exception as e:
+                return jsonrpc_response(error={"code": -32603, "message": f"Error reading resource: {str(e)}"})
+        
+        elif method == "tools/list":
+            return jsonrpc_response(result={
+                "tools": [
+                    # Template tools
+                    {
+                        "name": "list_templates",
+                        "description": "List all available templates from all repositories with version and repo info",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "fabric_host": {
+                                    "type": "string",
+                                    "description": "Fabric host to query (optional)"
+                                }
+                            }
+                        }
+                    },
+                    {
+                        "name": "list_repositories",
+                        "description": "List all repositories",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "fabric_host": {
+                                    "type": "string",
+                                    "description": "Fabric host to query"
+                                }
+                            },
+                            "required": ["fabric_host"]
+                        }
+                    },
+                    {
+                        "name": "list_templates_for_repo",
+                        "description": "List templates in a specific repository with versions",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "fabric_host": {
+                                    "type": "string",
+                                    "description": "Fabric host to query"
+                                },
+                                "repo_name": {
+                                    "type": "string",
+                                    "description": "Repository name"
+                                }
+                            },
+                            "required": ["fabric_host", "repo_name"]
+                        }
+                    },
+                    # Configuration CRUD
+                    {
+                        "name": "list_configurations",
+                        "description": "List all saved configurations",
+                        "inputSchema": {"type": "object", "properties": {}}
+                    },
+                    {
+                        "name": "get_configuration",
+                        "description": "Get a configuration by ID",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "config_id": {"type": "integer", "description": "Configuration ID"}
+                            },
+                            "required": ["config_id"]
+                        }
+                    },
+                    {
+                        "name": "create_configuration",
+                        "description": "Create a new configuration",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "name": {"type": "string", "description": "Configuration name"},
+                                "config_data": {"type": "object", "description": "Configuration data"}
+                            },
+                            "required": ["name", "config_data"]
+                        }
+                    },
+                    {
+                        "name": "update_configuration",
+                        "description": "Update an existing configuration",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "id": {"type": "integer", "description": "Configuration ID"},
+                                "name": {"type": "string", "description": "Configuration name"},
+                                "config_data": {"type": "object", "description": "Configuration data"}
+                            },
+                            "required": ["id", "name", "config_data"]
+                        }
+                    },
+                    {
+                        "name": "delete_configuration",
+                        "description": "Delete a configuration by ID",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "config_id": {"type": "integer", "description": "Configuration ID"}
+                            },
+                            "required": ["config_id"]
+                        }
+                    },
+                    # SSH Command Profile CRUD
+                    {
+                        "name": "list_ssh_command_profiles",
+                        "description": "List all SSH command profiles",
+                        "inputSchema": {"type": "object", "properties": {}}
+                    },
+                    {
+                        "name": "get_ssh_command_profile",
+                        "description": "Get an SSH command profile by ID",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "profile_id": {"type": "integer", "description": "Profile ID"}
+                            },
+                            "required": ["profile_id"]
+                        }
+                    },
+                    {
+                        "name": "create_ssh_command_profile",
+                        "description": "Create a new SSH command profile",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "name": {"type": "string", "description": "Profile name"},
+                                "commands": {"type": "string", "description": "SSH commands (one per line)"},
+                                "description": {"type": "string", "description": "Optional description"},
+                                "ssh_key_id": {"type": "integer", "description": "Optional SSH key ID"}
+                            },
+                            "required": ["name", "commands"]
+                        }
+                    },
+                    {
+                        "name": "update_ssh_command_profile",
+                        "description": "Update an existing SSH command profile",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "id": {"type": "integer", "description": "Profile ID"},
+                                "name": {"type": "string", "description": "Profile name"},
+                                "commands": {"type": "string", "description": "SSH commands (one per line)"},
+                                "description": {"type": "string", "description": "Optional description"},
+                                "ssh_key_id": {"type": "integer", "description": "Optional SSH key ID"}
+                            },
+                            "required": ["id", "name", "commands"]
+                        }
+                    },
+                    {
+                        "name": "delete_ssh_command_profile",
+                        "description": "Delete an SSH command profile by ID",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "profile_id": {"type": "integer", "description": "Profile ID"}
+                            },
+                            "required": ["profile_id"]
+                        }
+                    },
+                    # Reports
+                    {
+                        "name": "list_reports",
+                        "description": "List all manual run reports",
+                        "inputSchema": {"type": "object", "properties": {}}
+                    },
+                    {
+                        "name": "get_report",
+                        "description": "Get a detailed report by run ID",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "run_id": {"type": "integer", "description": "Run ID"}
+                            },
+                            "required": ["run_id"]
+                        }
+                    },
+                    # Events CRUD
+                    {
+                        "name": "list_events",
+                        "description": "List all event schedules",
+                        "inputSchema": {"type": "object", "properties": {}}
+                    },
+                    {
+                        "name": "get_event",
+                        "description": "Get an event by ID",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "event_id": {"type": "integer", "description": "Event ID"}
+                            },
+                            "required": ["event_id"]
+                        }
+                    },
+                    {
+                        "name": "create_event",
+                        "description": "Create a new event schedule",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "name": {"type": "string", "description": "Event name"},
+                                "event_date": {"type": "string", "description": "Event date (YYYY-MM-DD)"},
+                                "event_time": {"type": "string", "description": "Event time (HH:MM:SS)"},
+                                "event_type": {"type": "string", "description": "Event type"},
+                                "description": {"type": "string", "description": "Optional description"},
+                                "configuration_id": {"type": "integer", "description": "Configuration ID"},
+                                "auto_run": {"type": "boolean", "description": "Auto-run flag"}
+                            },
+                            "required": ["name", "event_date"]
+                        }
+                    },
+                    {
+                        "name": "update_event",
+                        "description": "Update an existing event",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "id": {"type": "integer", "description": "Event ID"},
+                                "name": {"type": "string", "description": "Event name"},
+                                "event_date": {"type": "string", "description": "Event date (YYYY-MM-DD)"},
+                                "event_time": {"type": "string", "description": "Event time (HH:MM:SS)"},
+                                "event_type": {"type": "string", "description": "Event type"},
+                                "description": {"type": "string", "description": "Optional description"},
+                                "configuration_id": {"type": "integer", "description": "Configuration ID"},
+                                "auto_run": {"type": "boolean", "description": "Auto-run flag"}
+                            },
+                            "required": ["id", "name", "event_date"]
+                        }
+                    },
+                    {
+                        "name": "delete_event",
+                        "description": "Delete an event by ID",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "event_id": {"type": "integer", "description": "Event ID"}
+                            },
+                            "required": ["event_id"]
+                        }
+                    },
+                    # NHI Credentials CRUD
+                    {
+                        "name": "list_nhi_credentials",
+                        "description": "List all NHI credentials",
+                        "inputSchema": {"type": "object", "properties": {}}
+                    },
+                    {
+                        "name": "get_nhi_credential",
+                        "description": "Get an NHI credential by ID (without decrypting secret)",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "nhi_id": {"type": "integer", "description": "NHI credential ID"}
+                            },
+                            "required": ["nhi_id"]
+                        }
+                    },
+                    {
+                        "name": "create_nhi_credential",
+                        "description": "Create a new NHI credential",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "name": {"type": "string", "description": "Credential name"},
+                                "client_id": {"type": "string", "description": "Client ID"},
+                                "client_secret": {"type": "string", "description": "Client secret"},
+                                "fabric_hosts": {"type": "string", "description": "Space-separated fabric hosts"}
+                            },
+                            "required": ["name", "client_id", "client_secret"]
+                        }
+                    },
+                    {
+                        "name": "update_nhi_credential",
+                        "description": "Update an existing NHI credential",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "id": {"type": "integer", "description": "NHI credential ID"},
+                                "name": {"type": "string", "description": "Credential name"},
+                                "client_id": {"type": "string", "description": "Client ID"},
+                                "client_secret": {"type": "string", "description": "Client secret (optional for update)"},
+                                "fabric_hosts": {"type": "string", "description": "Space-separated fabric hosts"}
+                            },
+                            "required": ["id", "name", "client_id"]
+                        }
+                    },
+                    {
+                        "name": "delete_nhi_credential",
+                        "description": "Delete an NHI credential by ID",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "nhi_id": {"type": "integer", "description": "NHI credential ID"}
+                            },
+                            "required": ["nhi_id"]
+                        }
+                    },
+                    # SSH Keys CRUD
+                    {
+                        "name": "list_ssh_keys",
+                        "description": "List all SSH keys",
+                        "inputSchema": {"type": "object", "properties": {}}
+                    },
+                    {
+                        "name": "get_ssh_key",
+                        "description": "Get an SSH key by ID (public key only)",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "ssh_key_id": {"type": "integer", "description": "SSH key ID"}
+                            },
+                            "required": ["ssh_key_id"]
+                        }
+                    },
+                    {
+                        "name": "create_ssh_key",
+                        "description": "Create a new SSH key",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "name": {"type": "string", "description": "Key name"},
+                                "public_key": {"type": "string", "description": "Public key"},
+                                "private_key": {"type": "string", "description": "Private key"}
+                            },
+                            "required": ["name", "public_key", "private_key"]
+                        }
+                    },
+                    {
+                        "name": "update_ssh_key",
+                        "description": "Update an existing SSH key",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "id": {"type": "integer", "description": "SSH key ID"},
+                                "name": {"type": "string", "description": "Key name"},
+                                "public_key": {"type": "string", "description": "Public key"},
+                                "private_key": {"type": "string", "description": "Private key (optional for update)"}
+                            },
+                            "required": ["id", "name", "public_key"]
+                        }
+                    },
+                    {
+                        "name": "delete_ssh_key",
+                        "description": "Delete an SSH key by ID",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "ssh_key_id": {"type": "integer", "description": "SSH key ID"}
+                            },
+                            "required": ["ssh_key_id"]
+                        }
+                    }
+                ]
+            })
+        
+        elif method == "tools/call":
+            tool_name = params.get("name")
+            tool_params = params.get("arguments", {})
+            
+            # Template tools
+            if tool_name == "list_templates":
+                fabric_host = tool_params.get("fabric_host")
+                if not fabric_host:
+                    from .app import get_cached_templates_internal
+                    templates = get_cached_templates_internal()
+                    return jsonrpc_response(result={"content": [{"type": "text", "text": json.dumps({"templates": templates}, indent=2)}]})
+                
+                from .app import get_system_token
+                token = get_system_token(fabric_host)
+                if not token:
+                    return jsonrpc_response(error={
+                        "code": -32001,
+                        "message": f"Failed to get access token for {fabric_host}. System token not configured."
+                    })
+                
+                templates = list_all_templates(fabric_host, token)
+                return jsonrpc_response(result={"content": [{"type": "text", "text": json.dumps({"templates": templates}, indent=2)}]})
+            
+            elif tool_name == "list_repositories":
+                fabric_host = tool_params.get("fabric_host")
+                if not fabric_host:
+                    return jsonrpc_response(error={"code": -32602, "message": "fabric_host is required"})
+                
+                from .app import get_system_token
+                token = get_system_token(fabric_host)
+                if not token:
+                    return jsonrpc_response(error={
+                        "code": -32001,
+                        "message": f"Failed to get access token for {fabric_host}. System token not configured."
+                    })
+                
+                repos = list_repositories(fabric_host, token)
+                return jsonrpc_response(result={"content": [{"type": "text", "text": json.dumps({"repositories": repos}, indent=2)}]})
+            
+            elif tool_name == "list_templates_for_repo":
+                fabric_host = tool_params.get("fabric_host")
+                repo_name = tool_params.get("repo_name")
+                
+                if not fabric_host or not repo_name:
+                    return jsonrpc_response(error={"code": -32602, "message": "fabric_host and repo_name are required"})
+                
+                from .app import get_system_token
+                token = get_system_token(fabric_host)
+                if not token:
+                    return jsonrpc_response(error={
+                        "code": -32001,
+                        "message": f"Failed to get access token for {fabric_host}. System token not configured."
+                    })
+                
+                repo_id = get_repositoryId(fabric_host, token, repo_name)
+                if not repo_id:
+                    return jsonrpc_response(error={"code": -32000, "message": f"Repository '{repo_name}' not found"})
+                
+                templates = list_templates_for_repo(fabric_host, token, repo_id)
+                return jsonrpc_response(result={"content": [{"type": "text", "text": json.dumps({"templates": templates}, indent=2)}]})
+            
+            # Configuration CRUD
+            elif tool_name == "list_configurations":
+                try:
+                    with get_db_connection() as conn:
+                        c = conn.cursor()
+                        c.execute('SELECT id, name, created_at, updated_at FROM configurations ORDER BY updated_at DESC')
+                        rows = c.fetchall()
+                        configs = [{"id": r[0], "name": r[1], "created_at": r[2], "updated_at": r[3]} for r in rows]
+                        return jsonrpc_response(result={"content": [{"type": "text", "text": json.dumps({"configurations": configs}, indent=2)}]})
+                except Exception as e:
+                    return jsonrpc_response(error={"code": -32603, "message": f"Error listing configurations: {str(e)}"})
+            
+            elif tool_name == "get_configuration":
+                config_id = tool_params.get("config_id")
+                if not config_id:
+                    return jsonrpc_response(error={"code": -32602, "message": "config_id is required"})
+                
+                try:
+                    with get_db_connection() as conn:
+                        c = conn.cursor()
+                        c.execute('SELECT name, config_data, created_at, updated_at FROM configurations WHERE id = ?', (config_id,))
+                        row = c.fetchone()
+                        if not row:
+                            return jsonrpc_response(error={"code": -32000, "message": f"Configuration with id {config_id} not found"})
+                        
+                        config = {
+                            "id": config_id,
+                            "name": row[0],
+                            "config_data": json.loads(row[1]),
+                            "created_at": row[2],
+                            "updated_at": row[3]
+                        }
+                        return jsonrpc_response(result={"content": [{"type": "text", "text": json.dumps(config, indent=2)}]})
+                except json.JSONDecodeError:
+                    return jsonrpc_response(error={"code": -32603, "message": "Invalid configuration data"})
+                except Exception as e:
+                    return jsonrpc_response(error={"code": -32603, "message": f"Error getting configuration: {str(e)}"})
+            
+            elif tool_name == "create_configuration":
+                name = tool_params.get("name")
+                config_data = tool_params.get("config_data")
+                if not name or not config_data:
+                    return jsonrpc_response(error={"code": -32602, "message": "name and config_data are required"})
+                
+                try:
+                    with get_db_connection() as conn:
+                        c = conn.cursor()
+                        c.execute('INSERT INTO configurations (name, config_data, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP)',
+                                 (name.strip(), json.dumps(config_data)))
+                        conn.commit()
+                        config_id = c.lastrowid
+                        return jsonrpc_response(result={"content": [{"type": "text", "text": json.dumps({"id": config_id, "message": f"Configuration '{name}' created successfully"}, indent=2)}]})
+                except Exception as e:
+                    return jsonrpc_response(error={"code": -32603, "message": f"Error creating configuration: {str(e)}"})
+            
+            elif tool_name == "update_configuration":
+                config_id = tool_params.get("id")
+                name = tool_params.get("name")
+                config_data = tool_params.get("config_data")
+                if not config_id or not name or not config_data:
+                    return jsonrpc_response(error={"code": -32602, "message": "id, name, and config_data are required"})
+                
+                try:
+                    with get_db_connection() as conn:
+                        c = conn.cursor()
+                        c.execute('SELECT id FROM configurations WHERE id = ?', (config_id,))
+                        if not c.fetchone():
+                            return jsonrpc_response(error={"code": -32000, "message": f"Configuration with id {config_id} not found"})
+                        
+                        c.execute('UPDATE configurations SET name = ?, config_data = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?',
+                                 (name.strip(), json.dumps(config_data), config_id))
+                        conn.commit()
+                        return jsonrpc_response(result={"content": [{"type": "text", "text": json.dumps({"id": config_id, "message": f"Configuration '{name}' updated successfully"}, indent=2)}]})
+                except Exception as e:
+                    return jsonrpc_response(error={"code": -32603, "message": f"Error updating configuration: {str(e)}"})
+            
+            elif tool_name == "delete_configuration":
+                config_id = tool_params.get("config_id")
+                if not config_id:
+                    return jsonrpc_response(error={"code": -32602, "message": "config_id is required"})
+                
+                try:
+                    with get_db_connection() as conn:
+                        c = conn.cursor()
+                        c.execute('DELETE FROM configurations WHERE id = ?', (config_id,))
+                        conn.commit()
+                        if c.rowcount == 0:
+                            return jsonrpc_response(error={"code": -32000, "message": f"Configuration with id {config_id} not found"})
+                        return jsonrpc_response(result={"content": [{"type": "text", "text": json.dumps({"message": f"Configuration {config_id} deleted successfully"}, indent=2)}]})
+                except Exception as e:
+                    return jsonrpc_response(error={"code": -32603, "message": f"Error deleting configuration: {str(e)}"})
+            
+            # SSH Command Profile CRUD
+            elif tool_name == "list_ssh_command_profiles":
+                try:
+                    with get_db_connection() as conn:
+                        c = conn.cursor()
+                        c.execute('''
+                            SELECT p.id, p.name, p.commands, p.description, p.ssh_key_id, p.created_at, p.updated_at, k.name as ssh_key_name
+                            FROM ssh_command_profiles p
+                            LEFT JOIN ssh_keys k ON p.ssh_key_id = k.id
+                            ORDER BY p.name ASC
+                        ''')
+                        rows = c.fetchall()
+                        profiles = [{
+                            "id": r[0], "name": r[1], "commands": r[2], "description": r[3] or "",
+                            "ssh_key_id": r[4], "ssh_key_name": r[7] or "", "created_at": r[5], "updated_at": r[6]
+                        } for r in rows]
+                        return jsonrpc_response(result={"content": [{"type": "text", "text": json.dumps({"profiles": profiles}, indent=2)}]})
+                except Exception as e:
+                    return jsonrpc_response(error={"code": -32603, "message": f"Error listing SSH command profiles: {str(e)}"})
+            
+            elif tool_name == "get_ssh_command_profile":
+                profile_id = tool_params.get("profile_id")
+                if not profile_id:
+                    return jsonrpc_response(error={"code": -32602, "message": "profile_id is required"})
+                
+                try:
+                    with get_db_connection() as conn:
+                        c = conn.cursor()
+                        c.execute('SELECT name, commands, description, ssh_key_id, created_at, updated_at FROM ssh_command_profiles WHERE id = ?', (profile_id,))
+                        row = c.fetchone()
+                        if not row:
+                            return jsonrpc_response(error={"code": -32000, "message": f"SSH command profile with id {profile_id} not found"})
+                        
+                        ssh_key_name = None
+                        if row[3]:
+                            c.execute('SELECT name FROM ssh_keys WHERE id = ?', (row[3],))
+                            key_row = c.fetchone()
+                            if key_row:
+                                ssh_key_name = key_row[0]
+                        
+                        profile = {
+                            "id": profile_id, "name": row[0], "commands": row[1], "description": row[2] or "",
+                            "ssh_key_id": row[3], "ssh_key_name": ssh_key_name or "", "created_at": row[4], "updated_at": row[5]
+                        }
+                        return jsonrpc_response(result={"content": [{"type": "text", "text": json.dumps(profile, indent=2)}]})
+                except Exception as e:
+                    return jsonrpc_response(error={"code": -32603, "message": f"Error getting SSH command profile: {str(e)}"})
+            
+            elif tool_name == "create_ssh_command_profile":
+                name = tool_params.get("name")
+                commands = tool_params.get("commands")
+                if not name or not commands:
+                    return jsonrpc_response(error={"code": -32602, "message": "name and commands are required"})
+                
+                description = tool_params.get("description", "")
+                ssh_key_id = tool_params.get("ssh_key_id")
+                
+                try:
+                    with get_db_connection() as conn:
+                        c = conn.cursor()
+                        c.execute('SELECT id FROM ssh_command_profiles WHERE name = ?', (name.strip(),))
+                        if c.fetchone():
+                            return jsonrpc_response(error={"code": -32000, "message": f"Name '{name}' already exists"})
+                        
+                        c.execute('INSERT INTO ssh_command_profiles (name, commands, description, ssh_key_id, updated_at) VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)',
+                                 (name.strip(), commands.strip(), description.strip() if description else None, ssh_key_id))
+                        conn.commit()
+                        profile_id = c.lastrowid
+                        return jsonrpc_response(result={"content": [{"type": "text", "text": json.dumps({"id": profile_id, "message": f"SSH command profile '{name}' created successfully"}, indent=2)}]})
+                except Exception as e:
+                    return jsonrpc_response(error={"code": -32603, "message": f"Error creating SSH command profile: {str(e)}"})
+            
+            elif tool_name == "update_ssh_command_profile":
+                profile_id = tool_params.get("id")
+                name = tool_params.get("name")
+                commands = tool_params.get("commands")
+                if not profile_id or not name or not commands:
+                    return jsonrpc_response(error={"code": -32602, "message": "id, name, and commands are required"})
+                
+                description = tool_params.get("description", "")
+                ssh_key_id = tool_params.get("ssh_key_id")
+                
+                try:
+                    with get_db_connection() as conn:
+                        c = conn.cursor()
+                        c.execute('SELECT id FROM ssh_command_profiles WHERE id = ?', (profile_id,))
+                        if not c.fetchone():
+                            return jsonrpc_response(error={"code": -32000, "message": f"SSH command profile with id {profile_id} not found"})
+                        
+                        c.execute('SELECT id FROM ssh_command_profiles WHERE name = ? AND id != ?', (name.strip(), profile_id))
+                        if c.fetchone():
+                            return jsonrpc_response(error={"code": -32000, "message": f"Name '{name}' already exists"})
+                        
+                        c.execute('UPDATE ssh_command_profiles SET name = ?, commands = ?, description = ?, ssh_key_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?',
+                                 (name.strip(), commands.strip(), description.strip() if description else None, ssh_key_id, profile_id))
+                        conn.commit()
+                        return jsonrpc_response(result={"content": [{"type": "text", "text": json.dumps({"id": profile_id, "message": f"SSH command profile '{name}' updated successfully"}, indent=2)}]})
+                except Exception as e:
+                    return jsonrpc_response(error={"code": -32603, "message": f"Error updating SSH command profile: {str(e)}"})
+            
+            elif tool_name == "delete_ssh_command_profile":
+                profile_id = tool_params.get("profile_id")
+                if not profile_id:
+                    return jsonrpc_response(error={"code": -32602, "message": "profile_id is required"})
+                
+                try:
+                    with get_db_connection() as conn:
+                        c = conn.cursor()
+                        c.execute('DELETE FROM ssh_command_profiles WHERE id = ?', (profile_id,))
+                        conn.commit()
+                        if c.rowcount == 0:
+                            return jsonrpc_response(error={"code": -32000, "message": f"SSH command profile with id {profile_id} not found"})
+                        return jsonrpc_response(result={"content": [{"type": "text", "text": json.dumps({"message": f"SSH command profile {profile_id} deleted successfully"}, indent=2)}]})
+                except Exception as e:
+                    return jsonrpc_response(error={"code": -32603, "message": f"Error deleting SSH command profile: {str(e)}"})
+            
+            # Reports
+            elif tool_name == "list_reports":
+                try:
+                    with get_db_connection() as conn:
+                        c = conn.cursor()
+                        c.execute('SELECT id, configuration_name, status, message, started_at, completed_at, execution_details FROM manual_runs ORDER BY started_at DESC LIMIT 100')
+                        rows = c.fetchall()
+                        from datetime import datetime
+                        runs = []
+                        for r in rows:
+                            duration = None
+                            if r[4] and r[5]:
+                                try:
+                                    start_dt = datetime.fromisoformat(r[4].replace('Z', '+00:00'))
+                                    end_dt = datetime.fromisoformat(r[5].replace('Z', '+00:00'))
+                                    duration = int((end_dt - start_dt).total_seconds())
+                                except:
+                                    pass
+                            runs.append({
+                                "id": r[0], "configuration_name": r[1] or "Manual Run", "status": r[2],
+                                "message": r[3], "started_at": r[4], "completed_at": r[5], "duration_seconds": duration
+                            })
+                        return jsonrpc_response(result={"content": [{"type": "text", "text": json.dumps({"runs": runs}, indent=2)}]})
+                except Exception as e:
+                    return jsonrpc_response(error={"code": -32603, "message": f"Error listing reports: {str(e)}"})
+            
+            elif tool_name == "get_report":
+                run_id = tool_params.get("run_id")
+                if not run_id:
+                    return jsonrpc_response(error={"code": -32602, "message": "run_id is required"})
+                
+                try:
+                    with get_db_connection() as conn:
+                        c = conn.cursor()
+                        c.execute('SELECT configuration_name, status, message, errors, started_at, completed_at, execution_details FROM manual_runs WHERE id = ?', (run_id,))
+                        row = c.fetchone()
+                        if not row:
+                            return jsonrpc_response(error={"code": -32000, "message": f"Report with id {run_id} not found"})
+                        
+                        errors = json.loads(row[3]) if row[3] else []
+                        details = json.loads(row[6]) if row[6] else {}
+                        report = {
+                            "id": run_id, "configuration_name": row[0] or "Manual Run", "status": row[1],
+                            "message": row[2], "errors": errors, "started_at": row[4], "completed_at": row[5],
+                            "execution_details": details
+                        }
+                        return jsonrpc_response(result={"content": [{"type": "text", "text": json.dumps(report, indent=2)}]})
+                except Exception as e:
+                    return jsonrpc_response(error={"code": -32603, "message": f"Error getting report: {str(e)}"})
+            
+            # Events CRUD
+            elif tool_name == "list_events":
+                try:
+                    with get_db_connection() as conn:
+                        c = conn.cursor()
+                        c.execute('''
+                            SELECT e.id, e.name, e.event_date, e.event_time, e.event_type, e.description,
+                                   e.configuration_id, e.auto_run, c.name as configuration_name,
+                                   e.created_at, e.updated_at,
+                                   (SELECT COUNT(*) FROM event_executions WHERE event_id = e.id) as execution_count
+                            FROM event_schedules e
+                            LEFT JOIN configurations c ON e.configuration_id = c.id
+                            ORDER BY e.event_date ASC, COALESCE(e.event_time, '') ASC, e.name ASC
+                        ''')
+                        rows = c.fetchall()
+                        events = [{
+                            "id": r[0], "name": r[1], "event_date": r[2], "event_time": r[3],
+                            "event_type": r[4], "description": r[5], "configuration_id": r[6],
+                            "auto_run": bool(r[7]), "configuration_name": r[8], "created_at": r[9],
+                            "updated_at": r[10], "has_executions": (r[11] or 0) > 0
+                        } for r in rows]
+                        return jsonrpc_response(result={"content": [{"type": "text", "text": json.dumps({"events": events}, indent=2)}]})
+                except Exception as e:
+                    return jsonrpc_response(error={"code": -32603, "message": f"Error listing events: {str(e)}"})
+            
+            elif tool_name == "get_event":
+                event_id = tool_params.get("event_id")
+                if not event_id:
+                    return jsonrpc_response(error={"code": -32602, "message": "event_id is required"})
+                
+                try:
+                    with get_db_connection() as conn:
+                        c = conn.cursor()
+                        c.execute('''
+                            SELECT name, event_date, event_time, event_type, description, configuration_id, auto_run, created_at, updated_at
+                            FROM event_schedules WHERE id = ?
+                        ''', (event_id,))
+                        row = c.fetchone()
+                        if not row:
+                            return jsonrpc_response(error={"code": -32000, "message": f"Event with id {event_id} not found"})
+                        
+                        event = {
+                            "id": event_id, "name": row[0], "event_date": row[1], "event_time": row[2],
+                            "event_type": row[3], "description": row[4], "configuration_id": row[5],
+                            "auto_run": bool(row[6]), "created_at": row[7], "updated_at": row[8]
+                        }
+                        return jsonrpc_response(result={"content": [{"type": "text", "text": json.dumps(event, indent=2)}]})
+                except Exception as e:
+                    return jsonrpc_response(error={"code": -32603, "message": f"Error getting event: {str(e)}"})
+            
+            elif tool_name == "create_event":
+                name = tool_params.get("name")
+                event_date = tool_params.get("event_date")
+                if not name or not event_date:
+                    return jsonrpc_response(error={"code": -32602, "message": "name and event_date are required"})
+                
+                event_time = tool_params.get("event_time")
+                event_type = tool_params.get("event_type")
+                description = tool_params.get("description")
+                configuration_id = tool_params.get("configuration_id")
+                auto_run = tool_params.get("auto_run", False)
+                
+                try:
+                    with get_db_connection() as conn:
+                        c = conn.cursor()
+                        c.execute('''
+                            INSERT INTO event_schedules (name, event_date, event_time, event_type, description, configuration_id, auto_run, updated_at)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                        ''', (name.strip(), event_date, event_time, event_type, description, configuration_id, auto_run))
+                        conn.commit()
+                        event_id = c.lastrowid
+                        return jsonrpc_response(result={"content": [{"type": "text", "text": json.dumps({"id": event_id, "message": f"Event '{name}' created successfully"}, indent=2)}]})
+                except Exception as e:
+                    return jsonrpc_response(error={"code": -32603, "message": f"Error creating event: {str(e)}"})
+            
+            elif tool_name == "update_event":
+                event_id = tool_params.get("id")
+                name = tool_params.get("name")
+                event_date = tool_params.get("event_date")
+                if not event_id or not name or not event_date:
+                    return jsonrpc_response(error={"code": -32602, "message": "id, name, and event_date are required"})
+                
+                event_time = tool_params.get("event_time")
+                event_type = tool_params.get("event_type")
+                description = tool_params.get("description")
+                configuration_id = tool_params.get("configuration_id")
+                auto_run = tool_params.get("auto_run", False)
+                
+                try:
+                    with get_db_connection() as conn:
+                        c = conn.cursor()
+                        c.execute('SELECT id FROM event_schedules WHERE id = ?', (event_id,))
+                        if not c.fetchone():
+                            return jsonrpc_response(error={"code": -32000, "message": f"Event with id {event_id} not found"})
+                        
+                        c.execute('''
+                            UPDATE event_schedules
+                            SET name = ?, event_date = ?, event_time = ?, event_type = ?, description = ?, configuration_id = ?, auto_run = ?, updated_at = CURRENT_TIMESTAMP
+                            WHERE id = ?
+                        ''', (name.strip(), event_date, event_time, event_type, description, configuration_id, auto_run, event_id))
+                        conn.commit()
+                        return jsonrpc_response(result={"content": [{"type": "text", "text": json.dumps({"id": event_id, "message": f"Event '{name}' updated successfully"}, indent=2)}]})
+                except Exception as e:
+                    return jsonrpc_response(error={"code": -32603, "message": f"Error updating event: {str(e)}"})
+            
+            elif tool_name == "delete_event":
+                event_id = tool_params.get("event_id")
+                if not event_id:
+                    return jsonrpc_response(error={"code": -32602, "message": "event_id is required"})
+                
+                try:
+                    with get_db_connection() as conn:
+                        c = conn.cursor()
+                        c.execute('DELETE FROM event_schedules WHERE id = ?', (event_id,))
+                        conn.commit()
+                        if c.rowcount == 0:
+                            return jsonrpc_response(error={"code": -32000, "message": f"Event with id {event_id} not found"})
+                        return jsonrpc_response(result={"content": [{"type": "text", "text": json.dumps({"message": f"Event {event_id} deleted successfully"}, indent=2)}]})
+                except Exception as e:
+                    return jsonrpc_response(error={"code": -32603, "message": f"Error deleting event: {str(e)}"})
+            
+            # NHI Credentials CRUD
+            elif tool_name == "list_nhi_credentials":
+                try:
+                    with get_db_connection() as conn:
+                        c = conn.cursor()
+                        c.execute('SELECT id, name, client_id, created_at, updated_at FROM nhi_credentials ORDER BY name ASC')
+                        rows = c.fetchall()
+                        credentials = [{"id": r[0], "name": r[1], "client_id": r[2], "created_at": r[3], "updated_at": r[4]} for r in rows]
+                        return jsonrpc_response(result={"content": [{"type": "text", "text": json.dumps({"credentials": credentials}, indent=2)}]})
+                except Exception as e:
+                    return jsonrpc_response(error={"code": -32603, "message": f"Error listing NHI credentials: {str(e)}"})
+            
+            elif tool_name == "get_nhi_credential":
+                nhi_id = tool_params.get("nhi_id")
+                if not nhi_id:
+                    return jsonrpc_response(error={"code": -32602, "message": "nhi_id is required"})
+                
+                try:
+                    with get_db_connection() as conn:
+                        c = conn.cursor()
+                        c.execute('SELECT name, client_id, created_at, updated_at FROM nhi_credentials WHERE id = ?', (nhi_id,))
+                        row = c.fetchone()
+                        if not row:
+                            return jsonrpc_response(error={"code": -32000, "message": f"NHI credential with id {nhi_id} not found"})
+                        
+                        # Get hosts with tokens for this credential
+                        c.execute('''
+                            SELECT fabric_host, token_expires_at
+                            FROM nhi_tokens
+                            WHERE nhi_credential_id = ?
+                            ORDER BY fabric_host ASC
+                        ''', (nhi_id,))
+                        token_rows = c.fetchall()
+                        
+                        # Build list of hosts with token status
+                        hosts_with_tokens = []
+                        from datetime import datetime, timezone
+                        now = datetime.now(timezone.utc)
+                        for token_row in token_rows:
+                            fabric_host = token_row[0]
+                            token_expires_at = token_row[1]
+                            
+                            token_status = "Expired"
+                            if token_expires_at:
+                                try:
+                                    expires_at = datetime.fromisoformat(token_expires_at.replace('Z', '+00:00'))
+                                    if expires_at > now:
+                                        delta = expires_at - now
+                                        total_seconds = int(delta.total_seconds())
+                                        hours = total_seconds // 3600
+                                        minutes = (total_seconds % 3600) // 60
+                                        if hours > 0:
+                                            token_status = f"{hours}h {minutes}m"
+                                        else:
+                                            token_status = f"{minutes}m"
+                                except Exception:
+                                    pass
+                            
+                            hosts_with_tokens.append({
+                                "host": fabric_host,
+                                "token_lifetime": token_status
+                            })
+                        
+                        credential = {
+                            "id": nhi_id,
+                            "name": row[0],
+                            "client_id": row[1],
+                            "created_at": row[2],
+                            "updated_at": row[3],
+                            "hosts_with_tokens": hosts_with_tokens
+                        }
+                        return jsonrpc_response(result={"content": [{"type": "text", "text": json.dumps(credential, indent=2)}]})
+                except Exception as e:
+                    return jsonrpc_response(error={"code": -32603, "message": f"Error getting NHI credential: {str(e)}"})
+            
+            elif tool_name == "create_nhi_credential":
+                name = tool_params.get("name")
+                client_id = tool_params.get("client_id")
+                client_secret = tool_params.get("client_secret")
+                if not name or not client_id or not client_secret:
+                    return jsonrpc_response(error={"code": -32602, "message": "name, client_id, and client_secret are required"})
+                
+                fabric_hosts = tool_params.get("fabric_hosts", "")
+                from .app import encrypt_with_server_secret, validate_name, validate_client_id, validate_client_secret
+                try:
+                    name_stripped = validate_name(name, "Name")
+                    client_id_validated = validate_client_id(client_id)
+                    client_secret_validated = validate_client_secret(client_secret)
+                    encrypted_secret = encrypt_with_server_secret(client_secret_validated)
+                except Exception as e:
+                    return jsonrpc_response(error={"code": -32602, "message": f"Validation error: {str(e)}"})
+                
+                try:
+                    with get_db_connection() as conn:
+                        c = conn.cursor()
+                        c.execute('SELECT id FROM nhi_credentials WHERE name = ?', (name_stripped,))
+                        if c.fetchone():
+                            return jsonrpc_response(error={"code": -32000, "message": f"Name '{name_stripped}' already exists"})
+                        
+                        c.execute('INSERT INTO nhi_credentials (name, client_id, client_secret_encrypted, updated_at) VALUES (?, ?, ?, CURRENT_TIMESTAMP)',
+                                 (name_stripped, client_id_validated, encrypted_secret))
+                        conn.commit()
+                        nhi_id = c.lastrowid
+                        return jsonrpc_response(result={"content": [{"type": "text", "text": json.dumps({"id": nhi_id, "message": f"NHI credential '{name_stripped}' created successfully"}, indent=2)}]})
+                except Exception as e:
+                    return jsonrpc_response(error={"code": -32603, "message": f"Error creating NHI credential: {str(e)}"})
+            
+            elif tool_name == "update_nhi_credential":
+                nhi_id = tool_params.get("id")
+                name = tool_params.get("name")
+                client_id = tool_params.get("client_id")
+                if not nhi_id or not name or not client_id:
+                    return jsonrpc_response(error={"code": -32602, "message": "id, name, and client_id are required"})
+                
+                client_secret = tool_params.get("client_secret")
+                from .app import encrypt_with_server_secret, validate_name, validate_client_id, validate_client_secret
+                try:
+                    name_stripped = validate_name(name, "Name")
+                    client_id_validated = validate_client_id(client_id)
+                    encrypted_secret = None
+                    if client_secret:
+                        client_secret_validated = validate_client_secret(client_secret)
+                        encrypted_secret = encrypt_with_server_secret(client_secret_validated)
+                except Exception as e:
+                    return jsonrpc_response(error={"code": -32602, "message": f"Validation error: {str(e)}"})
+                
+                try:
+                    with get_db_connection() as conn:
+                        c = conn.cursor()
+                        c.execute('SELECT id FROM nhi_credentials WHERE id = ?', (nhi_id,))
+                        if not c.fetchone():
+                            return jsonrpc_response(error={"code": -32000, "message": f"NHI credential with id {nhi_id} not found"})
+                        
+                        c.execute('SELECT id FROM nhi_credentials WHERE name = ? AND id != ?', (name_stripped, nhi_id))
+                        if c.fetchone():
+                            return jsonrpc_response(error={"code": -32000, "message": f"Name '{name_stripped}' already exists"})
+                        
+                        if encrypted_secret:
+                            c.execute('UPDATE nhi_credentials SET name = ?, client_id = ?, client_secret_encrypted = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?',
+                                     (name_stripped, client_id_validated, encrypted_secret, nhi_id))
+                        else:
+                            c.execute('UPDATE nhi_credentials SET name = ?, client_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?',
+                                     (name_stripped, client_id_validated, nhi_id))
+                        conn.commit()
+                        return jsonrpc_response(result={"content": [{"type": "text", "text": json.dumps({"id": nhi_id, "message": f"NHI credential '{name_stripped}' updated successfully"}, indent=2)}]})
+                except Exception as e:
+                    return jsonrpc_response(error={"code": -32603, "message": f"Error updating NHI credential: {str(e)}"})
+            
+            elif tool_name == "delete_nhi_credential":
+                nhi_id = tool_params.get("nhi_id")
+                if not nhi_id:
+                    return jsonrpc_response(error={"code": -32602, "message": "nhi_id is required"})
+                
+                try:
+                    with get_db_connection() as conn:
+                        c = conn.cursor()
+                        c.execute('DELETE FROM nhi_credentials WHERE id = ?', (nhi_id,))
+                        conn.commit()
+                        if c.rowcount == 0:
+                            return jsonrpc_response(error={"code": -32000, "message": f"NHI credential with id {nhi_id} not found"})
+                        c.execute('DELETE FROM sessions WHERE nhi_credential_id = ?', (nhi_id,))
+                        conn.commit()
+                        return jsonrpc_response(result={"content": [{"type": "text", "text": json.dumps({"message": f"NHI credential {nhi_id} deleted successfully"}, indent=2)}]})
+                except Exception as e:
+                    return jsonrpc_response(error={"code": -32603, "message": f"Error deleting NHI credential: {str(e)}"})
+            
+            # SSH Keys CRUD
+            elif tool_name == "list_ssh_keys":
+                try:
+                    with get_db_connection() as conn:
+                        c = conn.cursor()
+                        c.execute('SELECT id, name, public_key, created_at, updated_at FROM ssh_keys ORDER BY name ASC')
+                        rows = c.fetchall()
+                        keys = [{"id": r[0], "name": r[1], "public_key": r[2], "created_at": r[3], "updated_at": r[4]} for r in rows]
+                        return jsonrpc_response(result={"content": [{"type": "text", "text": json.dumps({"keys": keys}, indent=2)}]})
+                except Exception as e:
+                    return jsonrpc_response(error={"code": -32603, "message": f"Error listing SSH keys: {str(e)}"})
+            
+            elif tool_name == "get_ssh_key":
+                ssh_key_id = tool_params.get("ssh_key_id")
+                if not ssh_key_id:
+                    return jsonrpc_response(error={"code": -32602, "message": "ssh_key_id is required"})
+                
+                try:
+                    with get_db_connection() as conn:
+                        c = conn.cursor()
+                        c.execute('SELECT name, public_key, created_at, updated_at FROM ssh_keys WHERE id = ?', (ssh_key_id,))
+                        row = c.fetchone()
+                        if not row:
+                            return jsonrpc_response(error={"code": -32000, "message": f"SSH key with id {ssh_key_id} not found"})
+                        
+                        key = {"id": ssh_key_id, "name": row[0], "public_key": row[1], "created_at": row[2], "updated_at": row[3]}
+                        return jsonrpc_response(result={"content": [{"type": "text", "text": json.dumps(key, indent=2)}]})
+                except Exception as e:
+                    return jsonrpc_response(error={"code": -32603, "message": f"Error getting SSH key: {str(e)}"})
+            
+            elif tool_name == "create_ssh_key":
+                name = tool_params.get("name")
+                public_key = tool_params.get("public_key")
+                private_key = tool_params.get("private_key")
+                if not name or not public_key or not private_key:
+                    return jsonrpc_response(error={"code": -32602, "message": "name, public_key, and private_key are required"})
+                
+                from .app import encrypt_with_server_secret
+                try:
+                    encrypted_private_key = encrypt_with_server_secret(private_key.strip())
+                except Exception as e:
+                    return jsonrpc_response(error={"code": -32603, "message": f"Error encrypting private key: {str(e)}"})
+                
+                try:
+                    with get_db_connection() as conn:
+                        c = conn.cursor()
+                        c.execute('SELECT id FROM ssh_keys WHERE name = ?', (name.strip(),))
+                        if c.fetchone():
+                            return jsonrpc_response(error={"code": -32000, "message": f"Name '{name.strip()}' already exists"})
+                        
+                        c.execute('INSERT INTO ssh_keys (name, public_key, private_key_encrypted, updated_at) VALUES (?, ?, ?, CURRENT_TIMESTAMP)',
+                                 (name.strip(), public_key.strip(), encrypted_private_key))
+                        conn.commit()
+                        ssh_key_id = c.lastrowid
+                        return jsonrpc_response(result={"content": [{"type": "text", "text": json.dumps({"id": ssh_key_id, "message": f"SSH key '{name.strip()}' created successfully"}, indent=2)}]})
+                except Exception as e:
+                    return jsonrpc_response(error={"code": -32603, "message": f"Error creating SSH key: {str(e)}"})
+            
+            elif tool_name == "update_ssh_key":
+                ssh_key_id = tool_params.get("id")
+                name = tool_params.get("name")
+                public_key = tool_params.get("public_key")
+                if not ssh_key_id or not name or not public_key:
+                    return jsonrpc_response(error={"code": -32602, "message": "id, name, and public_key are required"})
+                
+                private_key = tool_params.get("private_key")
+                try:
+                    with get_db_connection() as conn:
+                        c = conn.cursor()
+                        c.execute('SELECT id FROM ssh_keys WHERE id = ?', (ssh_key_id,))
+                        if not c.fetchone():
+                            return jsonrpc_response(error={"code": -32000, "message": f"SSH key with id {ssh_key_id} not found"})
+                        
+                        c.execute('SELECT id FROM ssh_keys WHERE name = ? AND id != ?', (name.strip(), ssh_key_id))
+                        if c.fetchone():
+                            return jsonrpc_response(error={"code": -32000, "message": f"Name '{name.strip()}' already exists"})
+                        
+                        if private_key:
+                            from .app import encrypt_with_server_secret
+                            try:
+                                encrypted_private_key = encrypt_with_server_secret(private_key.strip())
+                            except Exception as e:
+                                return jsonrpc_response(error={"code": -32603, "message": f"Error encrypting private key: {str(e)}"})
+                            c.execute('UPDATE ssh_keys SET name = ?, public_key = ?, private_key_encrypted = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?',
+                                     (name.strip(), public_key.strip(), encrypted_private_key, ssh_key_id))
+                        else:
+                            c.execute('UPDATE ssh_keys SET name = ?, public_key = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?',
+                                     (name.strip(), public_key.strip(), ssh_key_id))
+                        conn.commit()
+                        return jsonrpc_response(result={"content": [{"type": "text", "text": json.dumps({"id": ssh_key_id, "message": f"SSH key '{name.strip()}' updated successfully"}, indent=2)}]})
+                except Exception as e:
+                    return jsonrpc_response(error={"code": -32603, "message": f"Error updating SSH key: {str(e)}"})
+            
+            elif tool_name == "delete_ssh_key":
+                ssh_key_id = tool_params.get("ssh_key_id")
+                if not ssh_key_id:
+                    return jsonrpc_response(error={"code": -32602, "message": "ssh_key_id is required"})
+                
+                try:
+                    with get_db_connection() as conn:
+                        c = conn.cursor()
+                        c.execute('DELETE FROM ssh_keys WHERE id = ?', (ssh_key_id,))
+                        conn.commit()
+                        if c.rowcount == 0:
+                            return jsonrpc_response(error={"code": -32000, "message": f"SSH key with id {ssh_key_id} not found"})
+                        return jsonrpc_response(result={"content": [{"type": "text", "text": json.dumps({"message": f"SSH key {ssh_key_id} deleted successfully"}, indent=2)}]})
+                except Exception as e:
+                    return jsonrpc_response(error={"code": -32603, "message": f"Error deleting SSH key: {str(e)}"})
+            
+            else:
+                return jsonrpc_response(error={"code": -32601, "message": f"Unknown tool: {tool_name}"})
+        
+        else:
+            return jsonrpc_response(error={
+                "code": -32601,
+                "message": f"Unknown method: {method}"
+            })
+    
+    except HTTPException as e:
+        # Convert HTTPException to JSON-RPC error format
+        # Note: request_id may be None if JSON parsing failed
+        return {"jsonrpc": "2.0", "id": request_id, "error": {
+            "code": -32000,
+            "message": e.detail
+        }}
+    except Exception as e:
+        # Note: request_id may be None if JSON parsing failed
+        return {"jsonrpc": "2.0", "id": request_id, "error": {
+            "code": -32603,
+            "message": f"Internal error: {str(e)}"
+        }}
+
+

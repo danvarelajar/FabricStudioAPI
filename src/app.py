@@ -298,8 +298,15 @@ def get_access_token_from_request(request: Request, fabric_host: str = None, nhi
             logger.debug(f"Using NHI credential {nhi_credential_id} from session for {fabric_host}")
     
     if not nhi_credential_id:
-        logger.warning(f"No NHI credential selected in session for fabric_host {fabric_host}")
+        # Log session details for debugging
+        if session:
+            logger.warning(f"No NHI credential selected in session for fabric_host {fabric_host}. Session ID: {session.get('session_id')}, User ID: {session.get('user_id')}, NHI credential ID in session: {session.get('nhi_credential_id')}")
+        else:
+            logger.warning(f"No NHI credential selected in session for fabric_host {fabric_host}. No session found.")
+        logger.info(f"get_access_token_from_request returning None for {fabric_host} - no nhi_credential_id provided")
         return None
+    
+    logger.info(f"get_access_token_from_request called for {fabric_host} with nhi_credential_id={nhi_credential_id}")
     
     # Get token from nhi_tokens table (encrypted with FS_SERVER_SECRET)
     try:
@@ -357,9 +364,11 @@ def get_access_token_from_request(request: Request, fabric_host: str = None, nhi
         credential_row = c.fetchone()
         
         if not credential_row:
-            logger.warning(f"NHI credential {nhi_credential_id} not found")
+            logger.error(f"NHI credential {nhi_credential_id} not found in database")
             conn.close()
             return None
+        
+        logger.info(f"Found NHI credential {nhi_credential_id} in database, attempting to get token")
         
         cred_id, client_id, client_secret_encrypted = credential_row
         
@@ -7252,6 +7261,14 @@ def update_session_nhi_credential_endpoint(request: Request, nhi_credential_id: 
     success = update_session_nhi_credential(session['session_id'], nhi_credential_id)
     if not success:
         raise HTTPException(500, "Failed to update session")
+    
+    # Verify the update was successful by reading the session back
+    updated_session = get_session(session['session_id'])
+    if updated_session and updated_session.get('nhi_credential_id') != nhi_credential_id:
+        logger.error(f"Session update verification failed: Expected nhi_credential_id={nhi_credential_id}, got {updated_session.get('nhi_credential_id')}")
+        raise HTTPException(500, "Session update verification failed")
+    
+    logger.info(f"Session {session['session_id']} updated with NHI credential {nhi_credential_id}")
     
     if nhi_credential_id is None:
         return {"status": "ok", "message": "Session NHI credential cleared"}
