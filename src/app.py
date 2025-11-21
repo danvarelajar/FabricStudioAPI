@@ -5376,8 +5376,9 @@ def run_configuration(config_data: dict, event_name: str, event_id: Optional[int
             return host_result
         
         # Execute all hosts in parallel using pipeline
-        logger.info(f"Event '{event_name}': Starting per-host pipeline execution for {len(host_tokens)} host(s)")
-        with ThreadPoolExecutor(max_workers=min(10, len(host_tokens))) as executor:
+        max_parallel = min(Config.MAX_PARALLEL_HOSTS, len(host_tokens))
+        logger.info(f"Event '{event_name}': Starting per-host pipeline execution for {len(host_tokens)} host(s) (max {max_parallel} parallel)")
+        with ThreadPoolExecutor(max_workers=max_parallel) as executor:
             pipeline_results = list(executor.map(process_host_pipeline, host_tokens.keys()))
         
         # Aggregate results

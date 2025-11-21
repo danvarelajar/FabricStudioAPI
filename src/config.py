@@ -32,6 +32,9 @@ class Config:
     MAX_SSH_COMMANDS = 100
     MAX_TOTAL_COMMANDS_SIZE = 100000
     
+    # Parallel Execution Configuration
+    MAX_PARALLEL_HOSTS = int(os.environ.get("MAX_PARALLEL_HOSTS", "10"))  # Max concurrent hosts in pipeline
+    
     # SSH Configuration
     SSH_OPERATION_TIMEOUT = int(os.environ.get("SSH_OPERATION_TIMEOUT", "300"))
     
@@ -88,4 +91,8 @@ class Config:
     
     # Teams Webhook Configuration
     TEAMS_WEBHOOK_URL = os.environ.get("TEAMS_WEBHOOK_URL", "").strip()
+    
+    # MCP Configuration
+    MCP_ENABLED = os.environ.get("MCP_ENABLED", "true").strip().lower() in ("true", "1", "yes")
+    MCP_API_KEY = os.environ.get("MCP_API_KEY", "XSgKyxLZjm-oSNztCPrLfdW1U3yepHjsIePCsPXGDdk").strip()
 
