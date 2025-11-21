@@ -264,8 +264,14 @@ def get_recent_task_errors(fabric_host, access_token, limit=50, since_timestamp=
                     # If we can't parse timestamp, include the task to be safe
                     pass
         
-        # Filter by fabric name if provided
-        if fabric_name:
+        # Check returncode FIRST - tasks with non-zero returncode are errors regardless of fabric_name
+        # This ensures we catch errors like returncode 254 even if fabric_name filter would exclude them
+        returncode = task_obj.get("returncode")
+        has_non_zero_returncode = returncode is not None and returncode != 0
+        
+        # Filter by fabric name if provided (but skip this filter if task has non-zero returncode)
+        # Tasks with non-zero returncode should always be included if they're within the timestamp window
+        if fabric_name and not has_non_zero_returncode:
             # Check if task name contains fabric name or if fabric is mentioned in task
             # Fabric-related tasks often have the fabric name in the task name
             task_name_lower = task_name.lower()
@@ -343,8 +349,7 @@ def get_recent_task_errors(fabric_host, access_token, limit=50, since_timestamp=
         # Get status from top level or task object
         status = task.get("status", "").lower() or task_obj.get("status", "").lower()
         
-        # Check returncode in task object (most reliable indicator of failure)
-        returncode = task_obj.get("returncode")
+        # Returncode was already checked above (before fabric_name filter)
         
         # Check for failed status, error messages, or non-zero returncode
         has_error = False
@@ -983,6 +988,11 @@ def install_fabric(fabric_host, access_token, template, version):
         logger.warning("Could not verify fabric exists before installation: %s", exc)
         # Continue anyway - the installation request will fail if fabric doesn't exist
     
+    # Capture timestamp BEFORE making the POST request
+    # This ensures tasks created by the installation API call are included
+    from datetime import datetime, timezone, timedelta
+    install_start_time = datetime.now(timezone.utc)
+    
     url_install = (f"https://{fabric_host}/api/v1/runtime/fabric/{fabric_id}")
     try:
         response = requests.post(url_install, headers=headers, verify=False, timeout=30)
@@ -991,9 +1001,6 @@ def install_fabric(fabric_host, access_token, template, version):
         return (False, [f"Request error installing fabric: {str(exc)}"])
     
     if response.status_code == 200:
-        # Capture timestamp before checking tasks to filter errors
-        from datetime import datetime, timezone
-        install_start_time = datetime.now(timezone.utc)
         
         result = check_tasks(fabric_host, access_token)
         if result is None:
@@ -1005,9 +1012,13 @@ def install_fabric(fabric_host, access_token, template, version):
             return (False, ["Timed out waiting for tasks to finish after 15 minutes"])
         
         # Check for task errors after tasks complete, filtering by fabric name and timestamp
-        task_errors = get_recent_task_errors(fabric_host, access_token, limit=20, since_timestamp=install_start_time, fabric_name=template)
+        # Use a slightly earlier timestamp (5 seconds before) to catch tasks created just before the install call
+        # Also increase limit to catch more tasks
+        error_check_start_time = install_start_time - timedelta(seconds=5)
+        task_errors = get_recent_task_errors(fabric_host, access_token, limit=50, since_timestamp=error_check_start_time, fabric_name=template)
         if task_errors:
-            error_messages = [f"Task '{err['task_name']}': {err['error']}" for err in task_errors]
+            # Error messages from get_recent_task_errors already include task name, so use them as-is
+            error_messages = [err['error'] for err in task_errors]
             logger.warning("Found %d task errors after fabric installation for '%s'", len(task_errors), template)
             return (False, error_messages)
         

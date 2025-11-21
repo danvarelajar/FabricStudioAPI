@@ -209,10 +209,11 @@ app.add_middleware(CSRFProtectionMiddleware)
 class AuthenticationMiddleware(BaseHTTPMiddleware):
     """Middleware to require authentication for all endpoints except login and static files"""
     async def dispatch(self, request: Request, call_next):
-        # Allow access to login, health check, and static files without authentication
+        # Allow access to login, health check, static files, and MCP endpoints without authentication
         path = request.url.path
         if path in ["/auth/login", "/login", "/health", "/docs", "/redoc", "/openapi.json"] or \
            path.startswith("/static/") or \
+           path.startswith("/mcp") or \
            path.endswith((".woff2", ".ico", ".svg")) or \
            path in ["/images/", "/fonts/"]:
             response = await call_next(request)
@@ -250,6 +251,11 @@ class AuthenticationMiddleware(BaseHTTPMiddleware):
         return response
 
 app.add_middleware(AuthenticationMiddleware)
+
+# Include MCP router if enabled
+if Config.MCP_ENABLED:
+    from .mcp_router import router as mcp_router
+    app.include_router(mcp_router)
 
 # HTTP request logging middleware removed - now using INFO log handler instead
 
@@ -5348,10 +5354,9 @@ def run_configuration(config_data: dict, event_name: str, event_id: Optional[int
                                     pass
                                 host_result["stages_completed"].append("installation")
                             else:
-                                msg = f"Installation failed on host {host}"
-                                if task_errors:
-                                    msg += ": " + "; ".join(task_errors)
-                                logger.error(f"Event '{event_name}': {msg}")
+                                # Use task errors directly - they already contain all necessary information
+                                msg = "; ".join(task_errors) if task_errors else "Installation failed"
+                                logger.error(f"Event '{event_name}': Installation failed on host {host}: {msg}")
                                 host_result["failed_at_stage"] = "installation"
                                 host_result["error"] = msg
                                 return host_result
