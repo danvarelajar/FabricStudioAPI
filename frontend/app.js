@@ -84,12 +84,17 @@ function alertStyled(titleText, messageText, isError = false) {
     dialog.appendChild(title);
 
     const message = document.createElement('div');
-    message.textContent = messageText || '';
+    // Check if messageText contains HTML tags
+    if (messageText && (messageText.includes('<') && messageText.includes('>'))) {
+      message.innerHTML = messageText;
+    } else {
+      message.textContent = messageText || '';
+      message.style.whiteSpace = 'pre-wrap';
+      message.style.fontFamily = 'monospace';
+    }
     message.style.marginBottom = '16px';
     message.style.color = '#1d1d1f';
     message.style.fontSize = '13px';
-    message.style.whiteSpace = 'pre-wrap';
-    message.style.fontFamily = 'monospace';
     message.style.background = '#f5f5f7';
     message.style.padding = '12px';
     message.style.border = '1px solid #d2d2d7';
@@ -120,6 +125,90 @@ function alertStyled(titleText, messageText, isError = false) {
     okBtn.focus();
   });
 }
+
+// Custom modal for MCP log details (wider and supports HTML)
+function showMcpLogDetailsModal(htmlContent) {
+  return new Promise((resolve) => {
+    const overlay = document.createElement('div');
+    overlay.style.position = 'fixed';
+    overlay.style.top = '0';
+    overlay.style.left = '0';
+    overlay.style.right = '0';
+    overlay.style.bottom = '0';
+    overlay.style.background = 'rgba(0,0,0,0.5)';
+    overlay.style.display = 'flex';
+    overlay.style.alignItems = 'center';
+    overlay.style.justifyContent = 'center';
+    overlay.style.zIndex = '9999';
+
+    const dialog = document.createElement('div');
+    dialog.style.background = '#ffffff';
+    dialog.style.border = '1px solid #d1d5db';
+    dialog.style.borderRadius = '8px';
+    dialog.style.boxShadow = '0 10px 25px rgba(0,0,0,0.2)';
+    dialog.style.width = '90%';
+    dialog.style.maxWidth = '1400px';
+    dialog.style.maxHeight = '90vh';
+    dialog.style.padding = '24px';
+    dialog.style.display = 'flex';
+    dialog.style.flexDirection = 'column';
+    dialog.style.overflow = 'hidden';
+
+    const title = document.createElement('div');
+    title.textContent = 'MCP Log Details';
+    title.style.fontWeight = '600';
+    title.style.marginBottom = '20px';
+    title.style.color = '#111827';
+    title.style.fontSize = '20px';
+    title.style.borderBottom = '2px solid #e5e7eb';
+    title.style.paddingBottom = '12px';
+    dialog.appendChild(title);
+
+    const content = document.createElement('div');
+    content.innerHTML = htmlContent;
+    content.style.color = '#374151';
+    content.style.fontSize = '14px';
+    content.style.lineHeight = '1.6';
+    content.style.flex = '1';
+    content.style.overflow = 'auto';
+    content.style.paddingRight = '8px';
+    dialog.appendChild(content);
+
+    const actions = document.createElement('div');
+    actions.style.display = 'flex';
+    actions.style.justifyContent = 'flex-end';
+    actions.style.gap = '8px';
+    actions.style.marginTop = '20px';
+    actions.style.paddingTop = '16px';
+    actions.style.borderTop = '1px solid #e5e7eb';
+
+    const okBtn = document.createElement('button');
+    okBtn.type = 'button';
+    okBtn.textContent = 'Close';
+    okBtn.style.padding = '10px 20px';
+    okBtn.style.background = '#007aff';
+    okBtn.style.color = 'white';
+    okBtn.style.border = 'none';
+    okBtn.style.borderRadius = '6px';
+    okBtn.style.cursor = 'pointer';
+    okBtn.style.fontSize = '14px';
+    okBtn.style.fontWeight = '500';
+    okBtn.onmouseover = () => { okBtn.style.background = '#0056b3'; };
+    okBtn.onmouseout = () => { okBtn.style.background = '#007aff'; };
+    okBtn.onclick = () => { document.body.removeChild(overlay); resolve(); };
+
+    actions.appendChild(okBtn);
+    dialog.appendChild(actions);
+    overlay.appendChild(dialog);
+    document.body.appendChild(overlay);
+    
+    // Close on Escape
+    overlay.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape') okBtn.click();
+    });
+  });
+}
+
 function isValidIp(v) {
   // IPv4 dotted-quad, each octet 0-255
   if (!/^\d{1,3}(?:\.\d{1,3}){3}$/.test(v)) return false;
@@ -2469,6 +2558,10 @@ function initializeSection(sectionName) {
     // Server Logs initialization
     setupServerLogsButtons();
     loadServerLogs();
+  } else if (sectionName === 'mcp-logs') {
+    // MCP Logs section initialization
+    setupMcpLogsButtons();
+    loadMcpLogs();
   } else if (sectionName === 'reports') {
     // Reports section initialization
     setupReportsButtons();
@@ -3074,6 +3167,13 @@ async function loadEventConfigs() {
 }
 
 // Helper function to format date/time as DD/MM/YYYY HH:MM
+function escapeHtml(text) {
+  if (!text) return '';
+  const div = document.createElement('div');
+  div.textContent = text;
+  return div.innerHTML;
+}
+
 function formatDateTime(dateString) {
   if (!dateString) return 'N/A';
   try {
@@ -12554,6 +12654,292 @@ async function exportAuditLogs() {
     showStatus('Audit logs exported successfully');
   } catch (error) {
     showStatus(`Error exporting audit logs: ${error.message || error}`);
+  }
+}
+
+// MCP Logs Management functions
+let currentMcpFilters = { method: '', tool_name: '', date_from: '', date_to: '' };
+
+function setupMcpLogsButtons() {
+  const refreshBtn = el('btnRefreshMcpLogs');
+  const exportBtn = el('btnExportLogs');
+  const applyFilterBtn = el('btnApplyFilter');
+  const clearFilterBtn = el('btnClearFilter');
+  
+  if (refreshBtn) {
+    refreshBtn.addEventListener('click', () => {
+      loadMcpLogs();
+    });
+  }
+  
+  if (exportBtn) {
+    exportBtn.addEventListener('click', () => {
+      exportMcpLogs();
+    });
+  }
+  
+  if (applyFilterBtn) {
+    applyFilterBtn.addEventListener('click', () => {
+      applyMcpFilters();
+    });
+  }
+  
+  if (clearFilterBtn) {
+    clearFilterBtn.addEventListener('click', () => {
+      clearMcpFilters();
+    });
+  }
+}
+
+function applyMcpFilters() {
+  const methodFilter = el('filterMethod');
+  const toolNameFilter = el('filterToolName');
+  const dateFromFilter = el('filterDateFrom');
+  const dateToFilter = el('filterDateTo');
+  
+  currentMcpFilters.method = methodFilter ? methodFilter.value : '';
+  currentMcpFilters.tool_name = toolNameFilter ? toolNameFilter.value.trim() : '';
+  currentMcpFilters.date_from = dateFromFilter ? dateFromFilter.value : '';
+  currentMcpFilters.date_to = dateToFilter ? dateToFilter.value : '';
+  
+  loadMcpLogs();
+}
+
+function clearMcpFilters() {
+  const methodFilter = el('filterMethod');
+  const toolNameFilter = el('filterToolName');
+  const dateFromFilter = el('filterDateFrom');
+  const dateToFilter = el('filterDateTo');
+  
+  if (methodFilter) methodFilter.value = '';
+  if (toolNameFilter) toolNameFilter.value = '';
+  if (dateFromFilter) dateFromFilter.value = '';
+  if (dateToFilter) dateToFilter.value = '';
+  
+  currentMcpFilters = { method: '', tool_name: '', date_from: '', date_to: '' };
+  loadMcpLogs();
+}
+
+async function loadMcpLogs() {
+  const logsList = el('mcpLogsList');
+  if (!logsList) return;
+  
+  try {
+    logsList.innerHTML = '<p>Loading MCP logs...</p>';
+    
+    let url = '/mcp-logs/list?limit=1000';
+    if (currentMcpFilters.method) {
+      url += `&method=${encodeURIComponent(currentMcpFilters.method)}`;
+    }
+    if (currentMcpFilters.tool_name) {
+      url += `&tool_name=${encodeURIComponent(currentMcpFilters.tool_name)}`;
+    }
+    if (currentMcpFilters.date_from) {
+      url += `&date_from=${encodeURIComponent(currentMcpFilters.date_from)}`;
+    }
+    if (currentMcpFilters.date_to) {
+      url += `&date_to=${encodeURIComponent(currentMcpFilters.date_to)}`;
+    }
+    
+    const res = await api(url);
+    if (!res.ok) {
+      logsList.innerHTML = `<p style="color: #f87171;">Error loading MCP logs: ${res.statusText}</p>`;
+      return;
+    }
+    
+    const data = await res.json();
+    const logs = data.logs || [];
+    
+    if (logs.length === 0) {
+      logsList.innerHTML = '<p>No MCP logs found.</p>';
+      return;
+    }
+    
+    // Create table for logs
+    let html = '<table style="width: 100%; border-collapse: collapse; background: white; border: 1px solid #d2d2d7;">';
+    html += '<thead><tr style="background: #f5f5f7; border-bottom: 2px solid #d2d2d7;">';
+    html += '<th style="padding: 12px; text-align: left; font-weight: 600; border-right: 1px solid #d2d2d7;">Timestamp</th>';
+    html += '<th style="padding: 12px; text-align: left; font-weight: 600; border-right: 1px solid #d2d2d7;">Method</th>';
+    html += '<th style="padding: 12px; text-align: left; font-weight: 600; border-right: 1px solid #d2d2d7;">Tool Name</th>';
+    html += '<th style="padding: 12px; text-align: left; font-weight: 600; border-right: 1px solid #d2d2d7;">Duration (ms)</th>';
+    html += '<th style="padding: 12px; text-align: left; font-weight: 600; border-right: 1px solid #d2d2d7;">IP Address</th>';
+    html += '<th style="padding: 12px; text-align: left; font-weight: 600; border-right: 1px solid #d2d2d7;">Error</th>';
+    html += '<th style="padding: 12px; text-align: left; font-weight: 600;">Actions</th>';
+    html += '</tr></thead><tbody>';
+    
+    logs.forEach(log => {
+      const timestamp = formatDateTime(log.created_at);
+      const hasError = log.error && log.error.trim() !== '';
+      const errorDisplay = hasError ? 'Yes' : 'No';
+      const errorColor = hasError ? '#f87171' : '#34d399';
+      
+      html += '<tr style="border-bottom: 1px solid #e5e5e7;">';
+      html += `<td style="padding: 10px; border-right: 1px solid #e5e5e7; font-size: 13px;">${timestamp}</td>`;
+      html += `<td style="padding: 10px; border-right: 1px solid #e5e5e7; font-size: 13px; font-weight: 500; font-family: monospace;">${log.method || '-'}</td>`;
+      html += `<td style="padding: 10px; border-right: 1px solid #e5e5e7; font-size: 13px;">${log.tool_name || '-'}</td>`;
+      html += `<td style="padding: 10px; border-right: 1px solid #e5e5e7; font-size: 13px;">${log.duration_ms !== null && log.duration_ms !== undefined ? log.duration_ms : '-'}</td>`;
+      html += `<td style="padding: 10px; border-right: 1px solid #e5e5e7; font-size: 13px; font-family: monospace;">${log.ip_address || '-'}</td>`;
+      html += `<td style="padding: 10px; border-right: 1px solid #e5e5e7; font-size: 13px; color: ${errorColor};">${errorDisplay}</td>`;
+      html += `<td style="padding: 10px; font-size: 13px;"><button onclick="showMcpLogDetails(${log.id})" style="padding: 4px 8px; font-size: 12px; cursor: pointer;">View Details</button></td>`;
+      html += '</tr>';
+    });
+    
+    html += '</tbody></table>';
+    logsList.innerHTML = html;
+  } catch (error) {
+    logsList.innerHTML = `<p style="color: #f87171;">Error loading MCP logs: ${error.message || error}</p>`;
+  }
+}
+
+async function showMcpLogDetails(logId) {
+  try {
+    const res = await api(`/mcp-logs/list?limit=1000`);
+    if (!res.ok) {
+      showStatus(`Error loading log details: ${res.statusText}`);
+      return;
+    }
+    
+    const data = await res.json();
+    const log = data.logs.find(l => l.id === logId);
+    
+    if (!log) {
+      showStatus('Log not found');
+      return;
+    }
+    
+    let detailsHtml = '<div style="display: grid; grid-template-columns: 200px 1fr; gap: 12px 16px; margin-bottom: 20px; align-items: start;">';
+    detailsHtml += '<div style="font-weight: 600; color: #374151;">Timestamp:</div>';
+    detailsHtml += '<div style="color: #6b7280; font-family: monospace;">' + formatDateTime(log.created_at) + '</div>';
+    
+    detailsHtml += '<div style="font-weight: 600; color: #374151;">Method:</div>';
+    detailsHtml += '<div style="color: #111827; font-family: monospace; font-weight: 500;">' + escapeHtml(log.method || '-') + '</div>';
+    
+    detailsHtml += '<div style="font-weight: 600; color: #374151;">Tool Name:</div>';
+    detailsHtml += '<div style="color: #111827;">' + escapeHtml(log.tool_name || '-') + '</div>';
+    
+    detailsHtml += '<div style="font-weight: 600; color: #374151;">Request ID:</div>';
+    detailsHtml += '<div style="color: #6b7280; font-family: monospace;">' + escapeHtml(log.request_id || '-') + '</div>';
+    
+    detailsHtml += '<div style="font-weight: 600; color: #374151;">Duration:</div>';
+    detailsHtml += '<div style="color: #111827;">' + (log.duration_ms !== null && log.duration_ms !== undefined ? log.duration_ms + ' ms' : '-') + '</div>';
+    
+    detailsHtml += '<div style="font-weight: 600; color: #374151;">IP Address:</div>';
+    detailsHtml += '<div style="color: #6b7280; font-family: monospace;">' + escapeHtml(log.ip_address || '-') + '</div>';
+    detailsHtml += '</div>';
+    
+    if (log.error) {
+      detailsHtml += '<div style="margin-bottom: 20px;">';
+      detailsHtml += '<div style="font-weight: 600; color: #dc2626; margin-bottom: 8px;">Error:</div>';
+      detailsHtml += '<pre style="background: #fef2f2; padding: 12px; border: 1px solid #fecaca; border-radius: 6px; overflow-x: auto; overflow-y: auto; max-height: 300px; white-space: pre-wrap; word-wrap: break-word; font-family: \'Monaco\', \'Menlo\', \'Ubuntu Mono\', monospace; font-size: 13px; line-height: 1.5; color: #991b1b; margin: 0;">' + escapeHtml(log.error) + '</pre>';
+      detailsHtml += '</div>';
+    }
+    
+    // Helper function to recursively parse JSON strings within objects
+    function parseNestedJson(obj) {
+      if (typeof obj === 'string') {
+        // Try to parse as JSON if it looks like JSON
+        const trimmed = obj.trim();
+        if ((trimmed.startsWith('{') && trimmed.endsWith('}')) || 
+            (trimmed.startsWith('[') && trimmed.endsWith(']'))) {
+          try {
+            const parsed = JSON.parse(obj);
+            return parseNestedJson(parsed);
+          } catch (e) {
+            // Not valid JSON, return as-is
+            return obj;
+          }
+        }
+        return obj;
+      } else if (Array.isArray(obj)) {
+        return obj.map(item => parseNestedJson(item));
+      } else if (obj !== null && typeof obj === 'object') {
+        const result = {};
+        for (const key in obj) {
+          if (obj.hasOwnProperty(key)) {
+            result[key] = parseNestedJson(obj[key]);
+          }
+        }
+        return result;
+      }
+      return obj;
+    }
+    
+    if (log.request_body) {
+      let requestJson;
+      try {
+        const parsed = typeof log.request_body === 'string' ? JSON.parse(log.request_body) : log.request_body;
+        const fullyParsed = parseNestedJson(parsed);
+        requestJson = JSON.stringify(fullyParsed, null, 2);
+      } catch (e) {
+        requestJson = log.request_body;
+      }
+      detailsHtml += '<div style="margin-bottom: 24px;">';
+      detailsHtml += '<div style="font-weight: 600; color: #374151; margin-bottom: 10px; font-size: 15px;">Request Body:</div>';
+      detailsHtml += '<pre style="background: #f9fafb; padding: 16px; border: 1px solid #e5e7eb; border-radius: 8px; overflow-x: auto; overflow-y: auto; max-height: 500px; white-space: pre; word-wrap: break-word; font-family: \'Monaco\', \'Menlo\', \'Ubuntu Mono\', \'Courier New\', monospace; font-size: 12px; line-height: 1.6; color: #111827; margin: 0; tab-size: 2;">' + escapeHtml(requestJson) + '</pre>';
+      detailsHtml += '</div>';
+    }
+    
+    if (log.response_body) {
+      let responseJson;
+      try {
+        const parsed = typeof log.response_body === 'string' ? JSON.parse(log.response_body) : log.response_body;
+        const fullyParsed = parseNestedJson(parsed);
+        responseJson = JSON.stringify(fullyParsed, null, 2);
+      } catch (e) {
+        responseJson = log.response_body;
+      }
+      detailsHtml += '<div style="margin-bottom: 24px;">';
+      detailsHtml += '<div style="font-weight: 600; color: #374151; margin-bottom: 10px; font-size: 15px;">Response Body:</div>';
+      detailsHtml += '<pre style="background: #f9fafb; padding: 16px; border: 1px solid #e5e7eb; border-radius: 8px; overflow-x: auto; overflow-y: auto; max-height: 500px; white-space: pre; word-wrap: break-word; font-family: \'Monaco\', \'Menlo\', \'Ubuntu Mono\', \'Courier New\', monospace; font-size: 12px; line-height: 1.6; color: #111827; margin: 0; tab-size: 2;">' + escapeHtml(responseJson) + '</pre>';
+      detailsHtml += '</div>';
+    }
+    
+    // Use a custom modal for MCP log details since they can be wide
+    showMcpLogDetailsModal(detailsHtml);
+  } catch (error) {
+    showStatus(`Error loading log details: ${error.message || error}`);
+  }
+}
+
+async function exportMcpLogs() {
+  try {
+    let url = '/mcp-logs/export';
+    const params = [];
+    if (currentMcpFilters.method) {
+      params.push(`method=${encodeURIComponent(currentMcpFilters.method)}`);
+    }
+    if (currentMcpFilters.tool_name) {
+      params.push(`tool_name=${encodeURIComponent(currentMcpFilters.tool_name)}`);
+    }
+    if (currentMcpFilters.date_from) {
+      params.push(`date_from=${encodeURIComponent(currentMcpFilters.date_from)}`);
+    }
+    if (currentMcpFilters.date_to) {
+      params.push(`date_to=${encodeURIComponent(currentMcpFilters.date_to)}`);
+    }
+    if (params.length > 0) {
+      url += '?' + params.join('&');
+    }
+    
+    const res = await fetch(url);
+    if (!res.ok) {
+      showStatus(`Failed to export MCP logs: ${res.statusText}`);
+      return;
+    }
+    
+    const blob = await res.blob();
+    const downloadUrl = window.URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = downloadUrl;
+    a.download = 'mcp_logs.csv';
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    window.URL.revokeObjectURL(downloadUrl);
+    
+    showStatus('MCP logs exported successfully');
+  } catch (error) {
+    showStatus(`Error exporting MCP logs: ${error.message || error}`);
   }
 }
 

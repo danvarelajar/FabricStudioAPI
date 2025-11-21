@@ -2,6 +2,7 @@
 import json
 import secrets
 import sqlite3
+import time
 from typing import Optional, Dict, Any, List
 from fastapi import APIRouter, Request, HTTPException
 from fastapi.responses import JSONResponse
@@ -29,24 +30,53 @@ async def mcp_protocol_endpoint(request: Request):
     if not verify_api_key(request):
         raise HTTPException(401, "Authentication required")
     
+    # Import here to avoid circular import
+    from .app import log_mcp_request, get_client_ip
+    
+    import time
+    start_time = time.time()
     request_id = None
+    tool_name = None
+    request_body_str = None
+    response_body_str = None
+    error_str = None
+    ip_address = get_client_ip(request)
+    
     try:
         body = await request.json()
+        request_body_str = json.dumps(body, indent=2)
         method = body.get("method")
         params = body.get("params", {})
         request_id = body.get("id")
         
-        # Helper function to wrap response in JSON-RPC 2.0 format
+        # Extract tool name if this is a tools/call request
+        if method == "tools/call":
+            tool_name = params.get("name")
+        
+        # Helper function to wrap response in JSON-RPC 2.0 format and log it
         def jsonrpc_response(result=None, error=None):
             response = {"jsonrpc": "2.0", "id": request_id}
             if error:
                 response["error"] = error
             else:
                 response["result"] = result
+            
+            # Log the request/response
+            response_body_str = json.dumps(response)
+            duration_ms = int((time.time() - start_time) * 1000)
+            log_mcp_request(method, tool_name, str(request_id) if request_id else None, request_body_str, response_body_str, json.dumps(error) if error else None, ip_address, duration_ms)
+            
             return response
+        
+        # Helper function to log notifications (no response expected)
+        def log_notification():
+            duration_ms = int((time.time() - start_time) * 1000)
+            # Notifications don't have a response, so we log with empty response_body
+            log_mcp_request(method, None, None, request_body_str, None, None, ip_address, duration_ms)
         
         if method == "initialize":
             # MCP protocol initialization handshake
+            # Client sends initialize request, server responds with capabilities
             return jsonrpc_response(result={
                 "protocolVersion": "2024-11-05",
                 "capabilities": {
@@ -59,6 +89,14 @@ async def mcp_protocol_endpoint(request: Request):
                     "version": "1.0.0"
                 }
             })
+        
+        elif method == "notifications/initialized":
+            # MCP protocol: Client notification after initialization is complete
+            # This is a notification (no id, no response expected)
+            # Client sends this after processing the initialize response to indicate readiness
+            log_notification()
+            # Notifications don't return a response in JSON-RPC 2.0
+            return JSONResponse(content=None, status_code=200)
         
         elif method == "prompts/list":
             return jsonrpc_response(result={
@@ -426,6 +464,17 @@ Use the create_event tool with the configuration ID and schedule details."""
                             "type": "object",
                             "properties": {
                                 "config_id": {"type": "integer", "description": "Configuration ID"}
+                            },
+                            "required": ["config_id"]
+                        }
+                    },
+                    {
+                        "name": "execute_configuration",
+                        "description": "Execute/run a configuration immediately",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "config_id": {"type": "integer", "description": "Configuration ID to execute"}
                             },
                             "required": ["config_id"]
                         }
@@ -834,6 +883,32 @@ Use the create_event tool with the configuration ID and schedule details."""
                         return jsonrpc_response(result={"content": [{"type": "text", "text": json.dumps({"message": f"Configuration {config_id} deleted successfully"}, indent=2)}]})
                 except Exception as e:
                     return jsonrpc_response(error={"code": -32603, "message": f"Error deleting configuration: {str(e)}"})
+            
+            elif tool_name == "execute_configuration":
+                config_id = tool_params.get("config_id")
+                if not config_id:
+                    return jsonrpc_response(error={"code": -32602, "message": "config_id is required"})
+                
+                try:
+                    with get_db_connection() as conn:
+                        c = conn.cursor()
+                        c.execute('SELECT name, config_data FROM configurations WHERE id = ?', (config_id,))
+                        row = c.fetchone()
+                        if not row:
+                            return jsonrpc_response(error={"code": -32000, "message": f"Configuration with id {config_id} not found"})
+                        
+                        config_name, config_data_json = row
+                        config_data = json.loads(config_data_json)
+                        
+                        # Import run_configuration from app
+                        from .app import run_configuration
+                        result = run_configuration(config_data, config_name or f"Configuration {config_id}", event_id=None)
+                        
+                        return jsonrpc_response(result={"content": [{"type": "text", "text": json.dumps(result, indent=2)}]})
+                except json.JSONDecodeError:
+                    return jsonrpc_response(error={"code": -32603, "message": "Invalid configuration data"})
+                except Exception as e:
+                    return jsonrpc_response(error={"code": -32603, "message": f"Error executing configuration: {str(e)}"})
             
             # SSH Command Profile CRUD
             elif tool_name == "list_ssh_command_profiles":
@@ -1409,15 +1484,25 @@ Use the create_event tool with the configuration ID and schedule details."""
     except HTTPException as e:
         # Convert HTTPException to JSON-RPC error format
         # Note: request_id may be None if JSON parsing failed
-        return {"jsonrpc": "2.0", "id": request_id, "error": {
+        error_str = e.detail
+        response = {"jsonrpc": "2.0", "id": request_id, "error": {
             "code": -32000,
             "message": e.detail
         }}
+        response_body_str = json.dumps(response)
+        duration_ms = int((time.time() - start_time) * 1000)
+        log_mcp_request(method or "unknown", tool_name, str(request_id) if request_id else None, request_body_str, response_body_str, error_str, ip_address, duration_ms)
+        return response
     except Exception as e:
         # Note: request_id may be None if JSON parsing failed
-        return {"jsonrpc": "2.0", "id": request_id, "error": {
+        error_str = str(e)
+        response = {"jsonrpc": "2.0", "id": request_id, "error": {
             "code": -32603,
             "message": f"Internal error: {str(e)}"
         }}
+        response_body_str = json.dumps(response)
+        duration_ms = int((time.time() - start_time) * 1000)
+        log_mcp_request(method or "unknown", tool_name, str(request_id) if request_id else None, request_body_str, response_body_str, error_str, ip_address, duration_ms)
+        return response
 
 

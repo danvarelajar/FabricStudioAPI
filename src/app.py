@@ -1502,6 +1502,25 @@ def init_db():
     c.execute('CREATE INDEX IF NOT EXISTS idx_event_executions_event_status ON event_executions(event_id, status)')
     c.execute('CREATE INDEX IF NOT EXISTS idx_event_executions_started_at ON event_executions(started_at DESC)')
     c.execute('CREATE INDEX IF NOT EXISTS idx_sessions_last_used ON sessions(last_used)')
+    
+    # Create mcp_logs table to track MCP requests and responses
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS mcp_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            method TEXT NOT NULL,
+            tool_name TEXT,
+            request_id TEXT,
+            request_body TEXT,
+            response_body TEXT,
+            error TEXT,
+            ip_address TEXT,
+            duration_ms INTEGER,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    c.execute('CREATE INDEX IF NOT EXISTS idx_mcp_logs_method ON mcp_logs(method)')
+    c.execute('CREATE INDEX IF NOT EXISTS idx_mcp_logs_tool_name ON mcp_logs(tool_name)')
+    c.execute('CREATE INDEX IF NOT EXISTS idx_mcp_logs_created_at ON mcp_logs(created_at)')
     c.execute('CREATE INDEX IF NOT EXISTS idx_cached_templates_repo_name ON cached_templates(repo_name, template_name)')
     c.execute('CREATE INDEX IF NOT EXISTS idx_cached_templates_expires ON cached_templates(expires_at)')
     
@@ -1859,6 +1878,145 @@ def log_audit(action: str, user: str = None, details: str = None, ip_address: st
     except queue.Full:
         # Queue is full, log warning and drop entry
         logger.warning(f"Audit log queue full, dropping audit log entry: {action}")
+
+# MCP log queue for batch writes
+_mcp_log_queue = queue.Queue(maxsize=1000)
+_mcp_log_thread = None
+_mcp_log_thread_lock = threading.Lock()
+
+def _mcp_log_worker():
+    """Background thread to batch write MCP logs to database"""
+    batch = []
+    batch_size = Config.AUDIT_LOG_BATCH_SIZE  # Reuse same batch size config
+    batch_timeout = Config.AUDIT_LOG_BATCH_TIMEOUT  # Reuse same timeout config
+    last_write = time.time()
+    
+    while True:
+        try:
+            # Try to get an item from queue with timeout
+            try:
+                item = _mcp_log_queue.get(timeout=1.0)
+                if item is None:  # Shutdown signal
+                    # Write remaining batch before exiting
+                    if batch:
+                        _write_mcp_log_batch(batch)
+                    break
+                
+                batch.append(item)
+                _mcp_log_queue.task_done()
+            except queue.Empty:
+                pass
+            
+            # Write batch if it's full or timeout reached
+            now = time.time()
+            if len(batch) >= batch_size or (batch and (now - last_write) >= batch_timeout):
+                if batch:
+                    _write_mcp_log_batch(batch)
+                    batch = []
+                    last_write = now
+        except Exception as e:
+            logger.error(f"Error in MCP log worker: {e}", exc_info=True)
+            time.sleep(0.1)  # Brief pause on error
+
+def _write_mcp_log_batch(batch: list):
+    """Write a batch of MCP logs to the database"""
+    if not batch:
+        return
+    
+    conn = None
+    try:
+        conn = db_connect_with_retry(timeout=10.0, max_retries=5, retry_delay=0.05)
+        if not conn:
+            logger.error("Failed to connect to database for batch MCP log write")
+            return
+        
+        c = conn.cursor()
+        
+        # Insert all entries
+        c.executemany('''
+            INSERT INTO mcp_logs (method, tool_name, request_id, request_body, response_body, error, ip_address, duration_ms, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', [
+            (
+                item['method'],
+                item.get('tool_name'),
+                item.get('request_id'),
+                item.get('request_body'),
+                item.get('response_body'),
+                item.get('error'),
+                item.get('ip_address'),
+                item.get('duration_ms'),
+                item['created_at']
+            )
+            for item in batch
+        ])
+        conn.commit()
+    except sqlite3.OperationalError as e:
+        if "database is locked" in str(e).lower():
+            logger.warning(f"Database locked when writing MCP log batch, retrying later")
+            # Put items back in queue (at front) for retry
+            for item in reversed(batch):
+                try:
+                    _mcp_log_queue.put_nowait(item)
+                except queue.Full:
+                    logger.warning("MCP log queue full, dropping MCP log entry")
+        else:
+            logger.error(f"Failed to write MCP log batch: {e}", exc_info=True)
+    except Exception as e:
+        logger.error(f"Error writing MCP log batch: {e}", exc_info=True)
+    finally:
+        if conn:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+def _start_mcp_log_worker():
+    """Start the MCP log worker thread if not already running"""
+    global _mcp_log_thread
+    with _mcp_log_thread_lock:
+        if _mcp_log_thread is None or not _mcp_log_thread.is_alive():
+            _mcp_log_thread = threading.Thread(target=_mcp_log_worker, daemon=True)
+            _mcp_log_thread.start()
+            logger.info("MCP log worker thread started")
+
+def log_mcp_request(method: str, tool_name: str = None, request_id: str = None, request_body: str = None, 
+                   response_body: str = None, error: str = None, ip_address: str = None, duration_ms: int = None):
+    """Log an MCP request/response to the database via queue (batched writes)
+    
+    Args:
+        method: The MCP method (e.g., "tools/call", "tools/list")
+        tool_name: The tool name if applicable
+        request_id: The JSON-RPC request ID
+        request_body: JSON string of the request body
+        response_body: JSON string of the response body
+        error: Error message if any
+        ip_address: IP address of the client
+        duration_ms: Duration of the request in milliseconds
+    """
+    # Ensure worker thread is running
+    _start_mcp_log_worker()
+    
+    # Prepare log entry
+    now_utc = datetime.now(timezone.utc)
+    log_entry = {
+        'method': method,
+        'tool_name': tool_name,
+        'request_id': request_id,
+        'request_body': request_body,
+        'response_body': response_body,
+        'error': error,
+        'ip_address': ip_address,
+        'duration_ms': duration_ms,
+        'created_at': now_utc.isoformat()
+    }
+    
+    # Add to queue (non-blocking)
+    try:
+        _mcp_log_queue.put_nowait(log_entry)
+    except queue.Full:
+        # Queue is full, log warning and drop entry
+        logger.warning(f"MCP log queue full, dropping MCP log entry: {method}")
 
 def get_current_username(request: Request) -> Optional[str]:
     """Get the current logged-in username from the request session"""
@@ -7008,6 +7166,159 @@ def export_audit_logs(action: Optional[str] = None, user: Optional[str] = None, 
             media_type="text/csv",
             headers={"Content-Disposition": "attachment; filename=audit_logs.csv"}
         )
+    except sqlite3.Error as e:
+        raise HTTPException(500, f"Database error: {str(e)}")
+    finally:
+        if conn:
+            conn.close()
+
+# MCP Logs endpoints
+@app.get("/mcp-logs/list")
+def list_mcp_logs(method: Optional[str] = None, tool_name: Optional[str] = None, date_from: Optional[str] = None, date_to: Optional[str] = None, limit: int = 1000):
+    """List MCP logs with optional filtering"""
+    conn = None
+    try:
+        conn = db_connect_with_retry(timeout=10.0, max_retries=5, retry_delay=0.05)
+        if not conn:
+            raise HTTPException(500, "Failed to connect to database")
+        
+        c = conn.cursor()
+        
+        query = '''
+            SELECT id, method, tool_name, request_id, request_body, response_body, error, ip_address, duration_ms, created_at
+            FROM mcp_logs
+            WHERE 1=1
+        '''
+        params = []
+        
+        if method:
+            query += ' AND method = ?'
+            params.append(method)
+        
+        if tool_name:
+            query += ' AND tool_name = ?'
+            params.append(tool_name)
+        
+        # Add date range filters
+        if date_from:
+            try:
+                if date_from.endswith('Z'):
+                    from_dt = datetime.fromisoformat(date_from.replace('Z', '+00:00'))
+                else:
+                    from_dt = datetime.fromisoformat(date_from)
+                query += ' AND created_at >= ?'
+                params.append(from_dt.isoformat())
+            except ValueError:
+                pass
+        
+        if date_to:
+            try:
+                if date_to.endswith('Z'):
+                    to_dt = datetime.fromisoformat(date_to.replace('Z', '+00:00'))
+                else:
+                    to_dt = datetime.fromisoformat(date_to)
+                to_dt = to_dt + timedelta(days=1) - timedelta(seconds=1)
+                query += ' AND created_at <= ?'
+                params.append(to_dt.isoformat())
+            except ValueError:
+                pass
+        
+        query += ' ORDER BY created_at DESC LIMIT ?'
+        params.append(limit)
+        
+        c.execute(query, params)
+        rows = c.fetchall()
+        
+        logs = []
+        for row in rows:
+            logs.append({
+                "id": row[0],
+                "method": row[1],
+                "tool_name": row[2],
+                "request_id": row[3],
+                "request_body": row[4],
+                "response_body": row[5],
+                "error": row[6],
+                "ip_address": row[7],
+                "duration_ms": row[8],
+                "created_at": row[9]
+            })
+        
+        return {"logs": logs}
+    except sqlite3.Error as e:
+        raise HTTPException(500, f"Database error: {str(e)}")
+    finally:
+        if conn:
+            conn.close()
+
+@app.get("/mcp-logs/export")
+def export_mcp_logs(method: Optional[str] = None, tool_name: Optional[str] = None, date_from: Optional[str] = None, date_to: Optional[str] = None):
+    """Export MCP logs as CSV"""
+    conn = None
+    try:
+        conn = db_connect_with_retry(timeout=10.0, max_retries=5, retry_delay=0.05)
+        if not conn:
+            raise HTTPException(500, "Failed to connect to database")
+        
+        c = conn.cursor()
+        
+        query = '''
+            SELECT method, tool_name, request_id, request_body, response_body, error, ip_address, duration_ms, created_at
+            FROM mcp_logs
+            WHERE 1=1
+        '''
+        params = []
+        
+        if method:
+            query += ' AND method = ?'
+            params.append(method)
+        
+        if tool_name:
+            query += ' AND tool_name = ?'
+            params.append(tool_name)
+        
+        # Add date range filters
+        if date_from:
+            try:
+                from_dt = datetime.fromisoformat(date_from.replace('Z', '+00:00'))
+                query += ' AND created_at >= ?'
+                params.append(from_dt.isoformat())
+            except ValueError:
+                pass
+        
+        if date_to:
+            try:
+                to_dt = datetime.fromisoformat(date_to.replace('Z', '+00:00'))
+                to_dt = to_dt + timedelta(days=1) - timedelta(seconds=1)
+                query += ' AND created_at <= ?'
+                params.append(to_dt.isoformat())
+            except ValueError:
+                pass
+        
+        query += ' ORDER BY created_at DESC'
+        
+        c.execute(query, params)
+        rows = c.fetchall()
+        
+        import csv
+        import io
+        output = io.StringIO()
+        writer = csv.writer(output)
+        
+        # Write header
+        writer.writerow(['Method', 'Tool Name', 'Request ID', 'Request Body', 'Response Body', 'Error', 'IP Address', 'Duration (ms)', 'Created At'])
+        
+        # Write data
+        for row in rows:
+            writer.writerow(row)
+        
+        csv_content = output.getvalue()
+        output.close()
+        
+        from fastapi.responses import Response
+        return Response(content=csv_content, media_type="text/csv", headers={
+            "Content-Disposition": f"attachment; filename=mcp_logs_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        })
     except sqlite3.Error as e:
         raise HTTPException(500, f"Database error: {str(e)}")
     finally:
