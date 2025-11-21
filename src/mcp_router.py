@@ -13,6 +13,10 @@ from .db_utils import get_db_connection
 
 router = APIRouter()
 
+# Store client capabilities by IP address (for MCP clients)
+# Key: IP address, Value: dict with capabilities
+_client_capabilities: Dict[str, Dict[str, Any]] = {}
+
 def verify_api_key(request: Request) -> bool:
     """Verify API key from request headers"""
     if not Config.MCP_ENABLED or not Config.MCP_API_KEY:
@@ -74,16 +78,41 @@ async def mcp_protocol_endpoint(request: Request):
             # Notifications don't have a response, so we log with empty response_body
             log_mcp_request(method, None, None, request_body_str, None, None, ip_address, duration_ms)
         
+        # Helper function to check if client supports elicitation
+        def client_supports_elicitation() -> bool:
+            """Check if the current client (by IP) supports elicitation"""
+            client_caps = _client_capabilities.get(ip_address, {})
+            return "elicitation" in client_caps
+        
+        # Helper function to create elicitation response (for fallback when elicitation not supported)
+        def create_elicitation_fallback_response(message: str, item_details: Dict[str, Any]) -> Dict[str, Any]:
+            """Create a response that indicates elicitation is needed but client doesn't support it"""
+            details_text = "\n".join([f"• {k}: {v}" for k, v in item_details.items()])
+            return {
+                "content": [{
+                    "type": "text",
+                    "text": f"{message}\n\n{details_text}\n\n⚠️ WARNING: This action cannot be undone!\n\nTo confirm deletion, call this tool again with confirm_delete=true"
+                }]
+            }
+        
         if method == "initialize":
             # MCP protocol initialization handshake
             # Client sends initialize request, server responds with capabilities
+            # Store client capabilities for later use (e.g., elicitation support)
+            client_capabilities = params.get("capabilities", {})
+            _client_capabilities[ip_address] = client_capabilities
+            
+            # Server capabilities - add elicitation support
+            server_capabilities = {
+                "tools": {},
+                "prompts": {},
+                "resources": {},
+                "elicitation": {}  # Server supports elicitation
+            }
+            
             return jsonrpc_response(result={
-                "protocolVersion": "2024-11-05",
-                "capabilities": {
-                    "tools": {},
-                    "prompts": {},
-                    "resources": {}
-                },
+                "protocolVersion": "2025-06-18",  # Updated to support elicitation
+                "capabilities": server_capabilities,
                 "serverInfo": {
                     "name": "FabricStudioAPI",
                     "version": "1.0.0"
@@ -459,11 +488,12 @@ Use the create_event tool with the configuration ID and schedule details."""
                     },
                     {
                         "name": "delete_configuration",
-                        "description": "Delete a configuration by ID",
+                        "description": "Delete a configuration by ID. Requires confirmation - if client supports elicitation, confirmation will be requested automatically. Otherwise, call again with confirm_delete=true after reviewing the preview.",
                         "inputSchema": {
                             "type": "object",
                             "properties": {
-                                "config_id": {"type": "integer", "description": "Configuration ID"}
+                                "config_id": {"type": "integer", "description": "Configuration ID"},
+                                "confirm_delete": {"type": "boolean", "description": "Set to true to confirm deletion (required if client doesn't support elicitation)"}
                             },
                             "required": ["config_id"]
                         }
@@ -527,11 +557,12 @@ Use the create_event tool with the configuration ID and schedule details."""
                     },
                     {
                         "name": "delete_ssh_command_profile",
-                        "description": "Delete an SSH command profile by ID",
+                        "description": "Delete an SSH command profile by ID. Requires confirmation - if client supports elicitation, confirmation will be requested automatically. Otherwise, call again with confirm_delete=true after reviewing the preview.",
                         "inputSchema": {
                             "type": "object",
                             "properties": {
-                                "profile_id": {"type": "integer", "description": "Profile ID"}
+                                "profile_id": {"type": "integer", "description": "Profile ID"},
+                                "confirm_delete": {"type": "boolean", "description": "Set to true to confirm deletion (required if client doesn't support elicitation)"}
                             },
                             "required": ["profile_id"]
                         }
@@ -607,11 +638,12 @@ Use the create_event tool with the configuration ID and schedule details."""
                     },
                     {
                         "name": "delete_event",
-                        "description": "Delete an event by ID",
+                        "description": "Delete an event schedule by ID. Requires confirmation - if client supports elicitation, confirmation will be requested automatically. Otherwise, call again with confirm_delete=true after reviewing the preview.",
                         "inputSchema": {
                             "type": "object",
                             "properties": {
-                                "event_id": {"type": "integer", "description": "Event ID"}
+                                "event_id": {"type": "integer", "description": "Event ID"},
+                                "confirm_delete": {"type": "boolean", "description": "Set to true to confirm deletion (required if client doesn't support elicitation)"}
                             },
                             "required": ["event_id"]
                         }
@@ -664,11 +696,12 @@ Use the create_event tool with the configuration ID and schedule details."""
                     },
                     {
                         "name": "delete_nhi_credential",
-                        "description": "Delete an NHI credential by ID",
+                        "description": "Delete an NHI credential by ID. This will also delete all associated sessions and tokens. Requires confirmation - if client supports elicitation, confirmation will be requested automatically. Otherwise, call again with confirm_delete=true after reviewing the preview.",
                         "inputSchema": {
                             "type": "object",
                             "properties": {
-                                "nhi_id": {"type": "integer", "description": "NHI credential ID"}
+                                "nhi_id": {"type": "integer", "description": "NHI credential ID"},
+                                "confirm_delete": {"type": "boolean", "description": "Set to true to confirm deletion (required if client doesn't support elicitation)"}
                             },
                             "required": ["nhi_id"]
                         }
@@ -719,11 +752,12 @@ Use the create_event tool with the configuration ID and schedule details."""
                     },
                     {
                         "name": "delete_ssh_key",
-                        "description": "Delete an SSH key by ID",
+                        "description": "Delete an SSH key by ID. Any SSH command profiles using this key will be affected. Requires confirmation - if client supports elicitation, confirmation will be requested automatically. Otherwise, call again with confirm_delete=true after reviewing the preview.",
                         "inputSchema": {
                             "type": "object",
                             "properties": {
-                                "ssh_key_id": {"type": "integer", "description": "SSH key ID"}
+                                "ssh_key_id": {"type": "integer", "description": "SSH key ID"},
+                                "confirm_delete": {"type": "boolean", "description": "Set to true to confirm deletion (required if client doesn't support elicitation)"}
                             },
                             "required": ["ssh_key_id"]
                         }
@@ -870,17 +904,97 @@ Use the create_event tool with the configuration ID and schedule details."""
             
             elif tool_name == "delete_configuration":
                 config_id = tool_params.get("config_id")
+                confirm_delete = tool_params.get("confirm_delete", False)
+                
                 if not config_id:
                     return jsonrpc_response(error={"code": -32602, "message": "config_id is required"})
                 
                 try:
                     with get_db_connection() as conn:
                         c = conn.cursor()
+                        # First, fetch configuration details for preview/confirmation
+                        c.execute('SELECT name, config_data, created_at, updated_at FROM configurations WHERE id = ?', (config_id,))
+                        config_row = c.fetchone()
+                        
+                        if not config_row:
+                            return jsonrpc_response(error={"code": -32000, "message": f"Configuration with id {config_id} not found"})
+                        
+                        config_name, config_data_json, created_at, updated_at = config_row
+                        config_data = json.loads(config_data_json) if config_data_json else {}
+                        
+                        # Check for associated events
+                        c.execute('SELECT COUNT(*) FROM event_schedules WHERE configuration_id = ?', (config_id,))
+                        event_count = c.fetchone()[0] or 0
+                        
+                        # If not confirmed, show preview and request confirmation
+                        if not confirm_delete:
+                            # Check if client supports elicitation
+                            if client_supports_elicitation():
+                                # Use elicitation - return elicitation request format
+                                # Note: In real MCP, server would send elicitation/create during execution
+                                # For now, we return an error indicating elicitation is needed
+                                # The client should handle this by showing confirmation UI
+                                details = {
+                                    "Name": config_name,
+                                    "ID": config_id,
+                                    "Created": created_at,
+                                    "Updated": updated_at,
+                                    "Associated Events": event_count
+                                }
+                                message = f"You are about to delete configuration '{config_name}' (ID: {config_id})."
+                                if event_count > 0:
+                                    message += f" This configuration has {event_count} associated event(s) that will be affected."
+                                
+                                # Return elicitation-style response with full configuration details
+                                config_details = {
+                                    "id": config_id,
+                                    "name": config_name,
+                                    "config_data": config_data,  # Include full configuration data
+                                    "created_at": created_at,
+                                    "updated_at": updated_at,
+                                    "associated_events": event_count
+                                }
+                                
+                                return jsonrpc_response(result={
+                                    "isError": False,
+                                    "content": [{
+                                        "type": "text",
+                                        "text": f"{message}\n\n⚠️ WARNING: This action cannot be undone!"
+                                    }],
+                                    "elicitation": {
+                                        "message": message,
+                                        "content": config_details,  # Include full configuration details
+                                        "schema": {
+                                            "type": "object",
+                                            "properties": {
+                                                "confirm": {
+                                                    "type": "boolean",
+                                                    "description": "Set to true to confirm deletion"
+                                                }
+                                            },
+                                            "required": ["confirm"]
+                                        }
+                                    }
+                                })
+                            else:
+                                # Fallback: return preview requiring confirm_delete parameter
+                                details = {
+                                    "Name": config_name,
+                                    "ID": config_id,
+                                    "Created": created_at,
+                                    "Updated": updated_at,
+                                    "Associated Events": event_count
+                                }
+                                message = f"You are about to delete configuration '{config_name}' (ID: {config_id})."
+                                if event_count > 0:
+                                    message += f" This configuration has {event_count} associated event(s)."
+                                
+                                return jsonrpc_response(result=create_elicitation_fallback_response(message, details))
+                        
+                        # Confirmation received - proceed with deletion
                         c.execute('DELETE FROM configurations WHERE id = ?', (config_id,))
                         conn.commit()
-                        if c.rowcount == 0:
-                            return jsonrpc_response(error={"code": -32000, "message": f"Configuration with id {config_id} not found"})
-                        return jsonrpc_response(result={"content": [{"type": "text", "text": json.dumps({"message": f"Configuration {config_id} deleted successfully"}, indent=2)}]})
+                        return jsonrpc_response(result={"content": [{"type": "text", "text": json.dumps({"message": f"Configuration '{config_name}' (ID: {config_id}) deleted successfully"}, indent=2)}]})
                 except Exception as e:
                     return jsonrpc_response(error={"code": -32603, "message": f"Error deleting configuration: {str(e)}"})
             
@@ -1012,17 +1126,83 @@ Use the create_event tool with the configuration ID and schedule details."""
             
             elif tool_name == "delete_ssh_command_profile":
                 profile_id = tool_params.get("profile_id")
+                confirm_delete = tool_params.get("confirm_delete", False)
+                
                 if not profile_id:
                     return jsonrpc_response(error={"code": -32602, "message": "profile_id is required"})
                 
                 try:
                     with get_db_connection() as conn:
                         c = conn.cursor()
+                        # Fetch profile details
+                        c.execute('''
+                            SELECT p.name, p.commands, p.description, p.ssh_key_id, p.created_at, p.updated_at, k.name as ssh_key_name
+                            FROM ssh_command_profiles p
+                            LEFT JOIN ssh_keys k ON p.ssh_key_id = k.id
+                            WHERE p.id = ?
+                        ''', (profile_id,))
+                        profile_row = c.fetchone()
+                        
+                        if not profile_row:
+                            return jsonrpc_response(error={"code": -32000, "message": f"SSH command profile with id {profile_id} not found"})
+                        
+                        profile_name, commands, description, ssh_key_id, created_at, updated_at, ssh_key_name = profile_row
+                        command_count = len(commands.split('\n')) if commands else 0
+                        
+                        # If not confirmed, show preview and request confirmation
+                        if not confirm_delete:
+                            details = {
+                                "Name": profile_name,
+                                "ID": profile_id,
+                                "Commands": f"{command_count} command(s)",
+                                "SSH Key": ssh_key_name or "None",
+                                "Created": created_at,
+                                "Updated": updated_at
+                            }
+                            message = f"You are about to delete SSH command profile '{profile_name}' (ID: {profile_id})."
+                            
+                            if client_supports_elicitation():
+                                # Include full profile details in elicitation response
+                                profile_details = {
+                                    "id": profile_id,
+                                    "name": profile_name,
+                                    "command_count": command_count,
+                                    "commands": commands,
+                                    "description": description or "",
+                                    "ssh_key_id": ssh_key_id,
+                                    "ssh_key_name": ssh_key_name or "",
+                                    "created_at": created_at,
+                                    "updated_at": updated_at
+                                }
+                                
+                                return jsonrpc_response(result={
+                                    "isError": False,
+                                    "content": [{
+                                        "type": "text",
+                                        "text": f"{message}\n\n⚠️ WARNING: This action cannot be undone!"
+                                    }],
+                                    "elicitation": {
+                                        "message": message,
+                                        "content": profile_details,  # Include full profile details
+                                        "schema": {
+                                            "type": "object",
+                                            "properties": {
+                                                "confirm": {
+                                                    "type": "boolean",
+                                                    "description": "Set to true to confirm deletion"
+                                                }
+                                            },
+                                            "required": ["confirm"]
+                                        }
+                                    }
+                                })
+                            else:
+                                return jsonrpc_response(result=create_elicitation_fallback_response(message, details))
+                        
+                        # Confirmation received - proceed with deletion
                         c.execute('DELETE FROM ssh_command_profiles WHERE id = ?', (profile_id,))
                         conn.commit()
-                        if c.rowcount == 0:
-                            return jsonrpc_response(error={"code": -32000, "message": f"SSH command profile with id {profile_id} not found"})
-                        return jsonrpc_response(result={"content": [{"type": "text", "text": json.dumps({"message": f"SSH command profile {profile_id} deleted successfully"}, indent=2)}]})
+                        return jsonrpc_response(result={"content": [{"type": "text", "text": json.dumps({"message": f"SSH command profile '{profile_name}' (ID: {profile_id}) deleted successfully"}, indent=2)}]})
                 except Exception as e:
                     return jsonrpc_response(error={"code": -32603, "message": f"Error deleting SSH command profile: {str(e)}"})
             
@@ -1183,17 +1363,93 @@ Use the create_event tool with the configuration ID and schedule details."""
             
             elif tool_name == "delete_event":
                 event_id = tool_params.get("event_id")
+                confirm_delete = tool_params.get("confirm_delete", False)
+                
                 if not event_id:
                     return jsonrpc_response(error={"code": -32602, "message": "event_id is required"})
                 
                 try:
                     with get_db_connection() as conn:
                         c = conn.cursor()
+                        # Fetch event details
+                        c.execute('''
+                            SELECT e.name, e.event_date, e.event_time, e.event_type, e.description,
+                                   e.configuration_id, e.auto_run, c.name as configuration_name,
+                                   e.created_at, e.updated_at,
+                                   (SELECT COUNT(*) FROM event_executions WHERE event_id = e.id) as execution_count
+                            FROM event_schedules e
+                            LEFT JOIN configurations c ON e.configuration_id = c.id
+                            WHERE e.id = ?
+                        ''', (event_id,))
+                        event_row = c.fetchone()
+                        
+                        if not event_row:
+                            return jsonrpc_response(error={"code": -32000, "message": f"Event with id {event_id} not found"})
+                        
+                        event_name, event_date, event_time, event_type, description, config_id, auto_run, config_name, created_at, updated_at, execution_count = event_row
+                        scheduled_time = f"{event_date} {event_time or '00:00:00'}" if event_date else "Not scheduled"
+                        
+                        # If not confirmed, show preview and request confirmation
+                        if not confirm_delete:
+                            details = {
+                                "Name": event_name,
+                                "ID": event_id,
+                                "Scheduled": scheduled_time,
+                                "Configuration": config_name or "None",
+                                "Auto-run": "Yes" if auto_run else "No",
+                                "Executions": execution_count or 0,
+                                "Created": created_at,
+                                "Updated": updated_at
+                            }
+                            message = f"You are about to delete event '{event_name}' (ID: {event_id})."
+                            if execution_count > 0:
+                                message += f" This event has {execution_count} execution(s) in history."
+                            
+                            if client_supports_elicitation():
+                                # Include full event details in elicitation response
+                                event_details = {
+                                    "id": event_id,
+                                    "name": event_name,
+                                    "event_date": event_date,
+                                    "event_time": event_time,
+                                    "event_type": event_type,
+                                    "description": description or "",
+                                    "configuration_id": config_id,
+                                    "configuration_name": config_name or "",
+                                    "auto_run": bool(auto_run),
+                                    "execution_count": execution_count or 0,
+                                    "created_at": created_at,
+                                    "updated_at": updated_at
+                                }
+                                
+                                return jsonrpc_response(result={
+                                    "isError": False,
+                                    "content": [{
+                                        "type": "text",
+                                        "text": f"{message}\n\n⚠️ WARNING: This action cannot be undone!"
+                                    }],
+                                    "elicitation": {
+                                        "message": message,
+                                        "content": event_details,  # Include full event details
+                                        "schema": {
+                                            "type": "object",
+                                            "properties": {
+                                                "confirm": {
+                                                    "type": "boolean",
+                                                    "description": "Set to true to confirm deletion"
+                                                }
+                                            },
+                                            "required": ["confirm"]
+                                        }
+                                    }
+                                })
+                            else:
+                                return jsonrpc_response(result=create_elicitation_fallback_response(message, details))
+                        
+                        # Confirmation received - proceed with deletion
                         c.execute('DELETE FROM event_schedules WHERE id = ?', (event_id,))
                         conn.commit()
-                        if c.rowcount == 0:
-                            return jsonrpc_response(error={"code": -32000, "message": f"Event with id {event_id} not found"})
-                        return jsonrpc_response(result={"content": [{"type": "text", "text": json.dumps({"message": f"Event {event_id} deleted successfully"}, indent=2)}]})
+                        return jsonrpc_response(result={"content": [{"type": "text", "text": json.dumps({"message": f"Event '{event_name}' (ID: {event_id}) deleted successfully"}, indent=2)}]})
                 except Exception as e:
                     return jsonrpc_response(error={"code": -32603, "message": f"Error deleting event: {str(e)}"})
             
@@ -1347,19 +1603,88 @@ Use the create_event tool with the configuration ID and schedule details."""
             
             elif tool_name == "delete_nhi_credential":
                 nhi_id = tool_params.get("nhi_id")
+                confirm_delete = tool_params.get("confirm_delete", False)
+                
                 if not nhi_id:
                     return jsonrpc_response(error={"code": -32602, "message": "nhi_id is required"})
                 
                 try:
                     with get_db_connection() as conn:
                         c = conn.cursor()
+                        # Fetch credential details
+                        c.execute('SELECT name, client_id, created_at, updated_at FROM nhi_credentials WHERE id = ?', (nhi_id,))
+                        credential_row = c.fetchone()
+                        
+                        if not credential_row:
+                            return jsonrpc_response(error={"code": -32000, "message": f"NHI credential with id {nhi_id} not found"})
+                        
+                        credential_name, client_id, created_at, updated_at = credential_row
+                        
+                        # Count associated sessions
+                        c.execute('SELECT COUNT(*) FROM sessions WHERE nhi_credential_id = ?', (nhi_id,))
+                        session_count = c.fetchone()[0] or 0
+                        
+                        # Count fabric hosts with tokens
+                        c.execute('SELECT COUNT(DISTINCT fabric_host) FROM nhi_tokens WHERE nhi_credential_id = ?', (nhi_id,))
+                        host_count = c.fetchone()[0] or 0
+                        
+                        # If not confirmed, show preview and request confirmation
+                        if not confirm_delete:
+                            details = {
+                                "Name": credential_name,
+                                "ID": nhi_id,
+                                "Client ID": client_id,
+                                "Associated Sessions": session_count,
+                                "Fabric Hosts with Tokens": host_count,
+                                "Created": created_at,
+                                "Updated": updated_at
+                            }
+                            message = f"You are about to delete NHI credential '{credential_name}' (ID: {nhi_id})."
+                            if session_count > 0 or host_count > 0:
+                                message += f" This will also delete {session_count} session(s) and tokens for {host_count} fabric host(s)."
+                            
+                            if client_supports_elicitation():
+                                # Include full credential details in elicitation response
+                                credential_details = {
+                                    "id": nhi_id,
+                                    "name": credential_name,
+                                    "client_id": client_id,
+                                    "session_count": session_count,
+                                    "host_count": host_count,
+                                    "created_at": created_at,
+                                    "updated_at": updated_at
+                                }
+                                
+                                return jsonrpc_response(result={
+                                    "isError": False,
+                                    "content": [{
+                                        "type": "text",
+                                        "text": f"{message}\n\n⚠️ WARNING: This action cannot be undone!"
+                                    }],
+                                    "elicitation": {
+                                        "message": message,
+                                        "content": credential_details,  # Include full credential details
+                                        "schema": {
+                                            "type": "object",
+                                            "properties": {
+                                                "confirm": {
+                                                    "type": "boolean",
+                                                    "description": "Set to true to confirm deletion"
+                                                }
+                                            },
+                                            "required": ["confirm"]
+                                        }
+                                    }
+                                })
+                            else:
+                                return jsonrpc_response(result=create_elicitation_fallback_response(message, details))
+                        
+                        # Confirmation received - proceed with deletion
                         c.execute('DELETE FROM nhi_credentials WHERE id = ?', (nhi_id,))
                         conn.commit()
-                        if c.rowcount == 0:
-                            return jsonrpc_response(error={"code": -32000, "message": f"NHI credential with id {nhi_id} not found"})
                         c.execute('DELETE FROM sessions WHERE nhi_credential_id = ?', (nhi_id,))
                         conn.commit()
-                        return jsonrpc_response(result={"content": [{"type": "text", "text": json.dumps({"message": f"NHI credential {nhi_id} deleted successfully"}, indent=2)}]})
+                        return jsonrpc_response(result={"content": [{"type": "text", "text": json.dumps({"message": f"NHI credential '{credential_name}' (ID: {nhi_id}) deleted successfully. {session_count} session(s) also deleted."}, indent=2)}]})
                 except Exception as e:
                     return jsonrpc_response(error={"code": -32603, "message": f"Error deleting NHI credential: {str(e)}"})
             
@@ -1458,17 +1783,82 @@ Use the create_event tool with the configuration ID and schedule details."""
             
             elif tool_name == "delete_ssh_key":
                 ssh_key_id = tool_params.get("ssh_key_id")
+                confirm_delete = tool_params.get("confirm_delete", False)
+                
                 if not ssh_key_id:
                     return jsonrpc_response(error={"code": -32602, "message": "ssh_key_id is required"})
                 
                 try:
                     with get_db_connection() as conn:
                         c = conn.cursor()
+                        # Fetch key details
+                        c.execute('SELECT name, public_key, created_at, updated_at FROM ssh_keys WHERE id = ?', (ssh_key_id,))
+                        key_row = c.fetchone()
+                        
+                        if not key_row:
+                            return jsonrpc_response(error={"code": -32000, "message": f"SSH key with id {ssh_key_id} not found"})
+                        
+                        key_name, public_key, created_at, updated_at = key_row
+                        public_key_preview = public_key[:50] + "..." if len(public_key) > 50 else public_key
+                        
+                        # Count associated SSH profiles
+                        c.execute('SELECT COUNT(*) FROM ssh_command_profiles WHERE ssh_key_id = ?', (ssh_key_id,))
+                        profile_count = c.fetchone()[0] or 0
+                        
+                        # If not confirmed, show preview and request confirmation
+                        if not confirm_delete:
+                            details = {
+                                "Name": key_name,
+                                "ID": ssh_key_id,
+                                "Public Key": public_key_preview,
+                                "Associated Profiles": profile_count,
+                                "Created": created_at,
+                                "Updated": updated_at
+                            }
+                            message = f"You are about to delete SSH key '{key_name}' (ID: {ssh_key_id})."
+                            if profile_count > 0:
+                                message += f" {profile_count} SSH command profile(s) are using this key and will be affected."
+                            
+                            if client_supports_elicitation():
+                                # Include full SSH key details in elicitation response
+                                key_details = {
+                                    "id": ssh_key_id,
+                                    "name": key_name,
+                                    "public_key": public_key,
+                                    "public_key_preview": public_key_preview,
+                                    "associated_profiles": profile_count,
+                                    "created_at": created_at,
+                                    "updated_at": updated_at
+                                }
+                                
+                                return jsonrpc_response(result={
+                                    "isError": False,
+                                    "content": [{
+                                        "type": "text",
+                                        "text": f"{message}\n\n⚠️ WARNING: This action cannot be undone!"
+                                    }],
+                                    "elicitation": {
+                                        "message": message,
+                                        "content": key_details,  # Include full SSH key details
+                                        "schema": {
+                                            "type": "object",
+                                            "properties": {
+                                                "confirm": {
+                                                    "type": "boolean",
+                                                    "description": "Set to true to confirm deletion"
+                                                }
+                                            },
+                                            "required": ["confirm"]
+                                        }
+                                    }
+                                })
+                            else:
+                                return jsonrpc_response(result=create_elicitation_fallback_response(message, details))
+                        
+                        # Confirmation received - proceed with deletion
                         c.execute('DELETE FROM ssh_keys WHERE id = ?', (ssh_key_id,))
                         conn.commit()
-                        if c.rowcount == 0:
-                            return jsonrpc_response(error={"code": -32000, "message": f"SSH key with id {ssh_key_id} not found"})
-                        return jsonrpc_response(result={"content": [{"type": "text", "text": json.dumps({"message": f"SSH key {ssh_key_id} deleted successfully"}, indent=2)}]})
+                        return jsonrpc_response(result={"content": [{"type": "text", "text": json.dumps({"message": f"SSH key '{key_name}' (ID: {ssh_key_id}) deleted successfully"}, indent=2)}]})
                 except Exception as e:
                     return jsonrpc_response(error={"code": -32603, "message": f"Error deleting SSH key: {str(e)}"})
             
