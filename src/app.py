@@ -395,12 +395,14 @@ def get_access_token_from_request(request: Request, fabric_host: str = None, nhi
                 expires_at = datetime.now() + timedelta(seconds=expires_in)
                 token_expires_at = expires_at.isoformat()
                 
-                # Store token in nhi_tokens
-                c.execute('''
-                    INSERT OR REPLACE INTO nhi_tokens 
-                    (nhi_credential_id, fabric_host, token_encrypted, token_expires_at, updated_at)
-                    VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
-                ''', (cred_id, fabric_host, token_encrypted, token_expires_at))
+                # Store token in nhi_tokens without changing host order (existing row only)
+                upsert_nhi_token(
+                    cursor=c,
+                    nhi_credential_id=cred_id,
+                    fabric_host=fabric_host,
+                    token_encrypted=token_encrypted,
+                    token_expires_at=token_expires_at,
+                )
                 conn.commit()
                 logger.info(f"Automatically retrieved and stored new token for {fabric_host} using NHI credential {cred_id} (expires at {token_expires_at})")
                 
@@ -483,6 +485,45 @@ def get_access_token_for_host(fabric_host: str, nhi_credential_id: int) -> Optio
         logger.error(f"Error retrieving token from nhi_tokens for {fabric_host}: {e}")
     
     return None
+
+def upsert_nhi_token(
+    cursor: sqlite3.Cursor,
+    nhi_credential_id: int,
+    fabric_host: str,
+    token_encrypted: str,
+    token_expires_at: str,
+    host_order: Optional[int] = None,
+) -> None:
+    """Insert or update a token entry while preserving user-defined host order."""
+    if host_order is not None:
+        cursor.execute(
+            '''
+            INSERT INTO nhi_tokens
+                (nhi_credential_id, fabric_host, host_order, token_encrypted, token_expires_at, updated_at)
+            VALUES
+                (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(nhi_credential_id, fabric_host) DO UPDATE SET
+                token_encrypted = excluded.token_encrypted,
+                token_expires_at = excluded.token_expires_at,
+                updated_at = CURRENT_TIMESTAMP,
+                host_order = excluded.host_order
+            ''',
+            (nhi_credential_id, fabric_host, host_order, token_encrypted, token_expires_at),
+        )
+    else:
+        cursor.execute(
+            '''
+            INSERT INTO nhi_tokens
+                (nhi_credential_id, fabric_host, token_encrypted, token_expires_at, updated_at)
+            VALUES
+                (?, ?, ?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(nhi_credential_id, fabric_host) DO UPDATE SET
+                token_encrypted = excluded.token_encrypted,
+                token_expires_at = excluded.token_expires_at,
+                updated_at = CURRENT_TIMESTAMP
+            ''',
+            (nhi_credential_id, fabric_host, token_encrypted, token_expires_at),
+        )
 
 def get_system_token(fabric_host: str) -> Optional[str]:
     """
@@ -1088,6 +1129,7 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             nhi_credential_id INTEGER NOT NULL,
             fabric_host TEXT NOT NULL,
+            host_order INTEGER NOT NULL DEFAULT 0,
             token_encrypted TEXT NOT NULL,
             token_expires_at TIMESTAMP NOT NULL,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -1096,6 +1138,37 @@ def init_db():
             UNIQUE(nhi_credential_id, fabric_host)
         )
     ''')
+    
+    # Ensure host_order column exists (older databases won't have it)
+    c.execute("PRAGMA table_info(nhi_tokens)")
+    nhi_token_columns = [column[1] for column in c.fetchall()]
+    host_order_added = False
+    if 'host_order' not in nhi_token_columns:
+        try:
+            c.execute('ALTER TABLE nhi_tokens ADD COLUMN host_order INTEGER NOT NULL DEFAULT 0')
+            conn.commit()
+            host_order_added = True
+        except sqlite3.OperationalError as e:
+            logger.warning(f"Could not add host_order column to nhi_tokens: {e}")
+    
+    # Backfill host_order sequentially the first time the column is created
+    if host_order_added:
+        try:
+            c.execute('SELECT DISTINCT nhi_credential_id FROM nhi_tokens')
+            credential_ids = [row[0] for row in c.fetchall()]
+            for cred_id in credential_ids:
+                c.execute('''
+                    SELECT id
+                    FROM nhi_tokens
+                    WHERE nhi_credential_id = ?
+                    ORDER BY id ASC
+                ''', (cred_id,))
+                rows = c.fetchall()
+                for order_idx, (token_id,) in enumerate(rows):
+                    c.execute('UPDATE nhi_tokens SET host_order = ? WHERE id = ?', (order_idx, token_id))
+            conn.commit()
+        except sqlite3.Error as e:
+            logger.warning(f"Failed to backfill host order for existing NHI tokens: {e}")
     
     # Create system_tokens table for internal/system tokens (LEAD_FABRIC_HOST)
     # These are never exposed and are completely separate from NHI credentials
@@ -5038,11 +5111,13 @@ def run_configuration(config_data: dict, event_name: str, event_id: Optional[int
                                     conn = db_connect_with_retry()
                                     if conn:
                                         c = conn.cursor()
-                                        c.execute('''
-                                            INSERT OR REPLACE INTO nhi_tokens 
-                                            (nhi_credential_id, fabric_host, token_encrypted, token_expires_at, updated_at)
-                                            VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
-                                        ''', (nhi_cred_id, host, token_encrypted, token_expires_at))
+                                        upsert_nhi_token(
+                                            cursor=c,
+                                            nhi_credential_id=nhi_cred_id,
+                                            fabric_host=host,
+                                            token_encrypted=token_encrypted,
+                                            token_expires_at=token_expires_at,
+                                        )
                                         conn.commit()
                                         conn.close()
                                         logger.info(f"Event '{event_name}': Stored new token for {host} (expires at {token_expires_at})")
@@ -6727,12 +6802,15 @@ def save_nhi(req: SaveNhiReq, request: Request):
                             expires_at = datetime.now() + timedelta(seconds=expires_in)
                             token_expires_at = expires_at.isoformat()
                             
-                            # Insert or update token for this host
-                            c.execute('''
-                                INSERT OR REPLACE INTO nhi_tokens 
-                                (nhi_credential_id, fabric_host, token_encrypted, token_expires_at, updated_at)
-                                VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
-                            ''', (nhi_id, fabric_host, token_encrypted, token_expires_at))
+                            # Insert token for this host using the user-provided order
+                            upsert_nhi_token(
+                                cursor=c,
+                                nhi_credential_id=nhi_id,
+                                fabric_host=fabric_host,
+                                token_encrypted=token_encrypted,
+                                token_expires_at=token_expires_at,
+                                host_order=idx - 1,
+                            )
                             tokens_stored += 1
                         else:
                             # No expiration time in response
@@ -6814,7 +6892,7 @@ def list_nhi(background_tasks: BackgroundTasks):
                 SELECT fabric_host, token_expires_at
                 FROM nhi_tokens
                 WHERE nhi_credential_id = ?
-                ORDER BY fabric_host ASC
+                ORDER BY host_order ASC, id ASC
             ''', (nhi_id,))
             token_rows = c.fetchall()
             
@@ -6896,7 +6974,7 @@ async def get_nhi(nhi_id: int, request: Request):
             SELECT fabric_host, token_encrypted, token_expires_at
             FROM nhi_tokens
             WHERE nhi_credential_id = ?
-            ORDER BY fabric_host ASC
+            ORDER BY host_order ASC, id ASC
         ''', (nhi_id,))
         token_rows = c.fetchall()
         
@@ -6999,12 +7077,14 @@ async def update_nhi_token(request: Request, nhi_id: int):
         expires_at = datetime.now() + timedelta(seconds=expires_in)
         token_expires_at = expires_at.isoformat()
         
-        # Insert or update token for this host
-        c.execute('''
-            INSERT OR REPLACE INTO nhi_tokens 
-            (nhi_credential_id, fabric_host, token_encrypted, token_expires_at, updated_at)
-            VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
-        ''', (nhi_id, fabric_host.strip(), token_encrypted, token_expires_at))
+        # Insert or update token for this host without altering stored order
+        upsert_nhi_token(
+            cursor=c,
+            nhi_credential_id=nhi_id,
+            fabric_host=fabric_host.strip(),
+            token_encrypted=token_encrypted,
+            token_expires_at=token_expires_at,
+        )
         
         conn.commit()
         return {"status": "ok", "message": f"Token updated for host {fabric_host}"}

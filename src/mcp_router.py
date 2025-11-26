@@ -1483,7 +1483,7 @@ Use the create_event tool with the configuration ID and schedule details."""
                             SELECT fabric_host, token_expires_at
                             FROM nhi_tokens
                             WHERE nhi_credential_id = ?
-                            ORDER BY fabric_host ASC
+                            ORDER BY host_order ASC, id ASC
                         ''', (nhi_id,))
                         token_rows = c.fetchall()
                         
