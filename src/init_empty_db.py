@@ -65,6 +65,7 @@ def init_empty_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             nhi_credential_id INTEGER NOT NULL,
             fabric_host TEXT NOT NULL,
+            host_order INTEGER NOT NULL DEFAULT 0,
             token_encrypted TEXT NOT NULL,
             token_expires_at TIMESTAMP NOT NULL,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
