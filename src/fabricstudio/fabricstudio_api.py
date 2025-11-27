@@ -5,8 +5,88 @@ import time
 import sys
 import itertools
 import logging
+from .rate_limiter import wait_for_rate_limit, record_api_request
 
 logger = logging.getLogger(__name__)
+
+
+def _make_rate_limited_request(fabric_host, request_func, max_retries=3, retry_delay=1.0):
+    """
+    Make an API request with retry logic for rate limit errors and timeouts.
+    
+    NOTE: Client-side rate limiting is disabled. This function only handles
+    retries when the API returns 429 errors or when requests timeout.
+    
+    Args:
+        fabric_host: The Fabric host address
+        request_func: A function that makes the request and returns the response
+        max_retries: Maximum number of retries for rate limit errors and timeouts
+        retry_delay: Initial delay between retries (will be doubled on each retry)
+        
+    Returns:
+        The response object
+        
+    Raises:
+        RuntimeError: If the request fails after all retries
+    """
+    # Rate limiting disabled - make request immediately
+    
+    for attempt in range(max_retries + 1):
+        try:
+            response = request_func()
+            
+            # Check for rate limit error from API
+            if response.status_code == 429:
+                # Parse retry-after header if available
+                retry_after = response.headers.get('Retry-After')
+                if retry_after:
+                    try:
+                        wait_time = float(retry_after)
+                    except ValueError:
+                        wait_time = retry_delay * (2 ** attempt)
+                else:
+                    wait_time = retry_delay * (2 ** attempt)
+                
+                if attempt < max_retries:
+                    logger.warning(
+                        "Rate limit exceeded for %s (attempt %d/%d). Waiting %.2f seconds",
+                        fabric_host, attempt + 1, max_retries + 1, wait_time
+                    )
+                    time.sleep(wait_time)
+                    continue
+                else:
+                    error_msg = f"Rate limit exceeded by API server."
+                    logger.error("Rate limit exceeded for %s after %d attempts", fabric_host, max_retries + 1)
+                    raise RuntimeError(error_msg)
+            
+            return response
+            
+        except requests.Timeout as exc:
+            # Handle timeout errors specifically - retry with longer delay
+            if attempt < max_retries:
+                wait_time = retry_delay * (2 ** attempt) * 2  # Longer delay for timeouts
+                logger.warning(
+                    "Request timeout for %s (attempt %d/%d). Retrying in %.2f seconds",
+                    fabric_host, attempt + 1, max_retries + 1, wait_time
+                )
+                time.sleep(wait_time)
+                continue
+            else:
+                logger.error("Request timeout for %s after %d attempts", fabric_host, max_retries + 1)
+                raise RuntimeError(f"Request timeout after {max_retries + 1} attempts: {exc}")
+        except requests.RequestException as exc:
+            if attempt < max_retries:
+                wait_time = retry_delay * (2 ** attempt)
+                logger.warning(
+                    "Request failed for %s (attempt %d/%d): %s. Retrying in %.2f seconds",
+                    fabric_host, attempt + 1, max_retries + 1, exc, wait_time
+                )
+                time.sleep(wait_time)
+                continue
+            else:
+                raise RuntimeError(f"Request failed after {max_retries + 1} attempts: {exc}")
+    
+    raise RuntimeError(f"Request failed after {max_retries + 1} attempts")
 
 def check_tasks(fabric_host, access_token, display_progress=False):
     logger.info("Checking for running tasks on host %s", fabric_host)
@@ -82,7 +162,10 @@ def check_tasks(fabric_host, access_token, display_progress=False):
 
 
 def get_running_task_count(fabric_host, access_token):
-    """Return current count of running tasks without waiting."""
+    """Return current count of running tasks without waiting.
+    Returns (count, error_message) tuple. If successful, error_message is None.
+    If failed, count is None and error_message contains the error details.
+    """
     url = f"https://{fabric_host}/api/v1/task?running=true"
     headers = {
         "Authorization": f"Bearer {access_token}",
@@ -91,17 +174,21 @@ def get_running_task_count(fabric_host, access_token):
     try:
         response = requests.get(url, headers=headers, verify=False, timeout=15)
     except requests.RequestException as exc:
+        error_msg = f"Network error querying task status: {str(exc)}"
         logger.error("Error querying task status: %s", exc)
-        return None
+        return (None, error_msg)
     if response.status_code != 200:
+        error_msg = f"Task status API returned {response.status_code}: {response.text[:200]}"
         logger.error("Task status error: %s - %s", response.status_code, response.text)
-        return None
+        return (None, error_msg)
     try:
         data = response.json()
     except ValueError:
+        error_msg = "Task status response is not valid JSON"
         logger.error("Task status JSON parse error")
-        return None
-    return data.get("page", {}).get("count", 0)
+        return (None, error_msg)
+    count = data.get("page", {}).get("count", 0)
+    return (count, None)
 
 
 def get_recent_task_errors(fabric_host, access_token, limit=50, since_timestamp=None, fabric_name=None):
@@ -441,10 +528,17 @@ def get_userId(fabric_host, access_token, username):
     }
     params = {"select": f"username={username}"}
     try:
-        response = requests.get(url, headers=headers, params=params, verify=False, timeout=30)
-    except requests.RequestException as exc:
+        response = _make_rate_limited_request(
+            fabric_host,
+            lambda: requests.get(url, headers=headers, params=params, verify=False, timeout=30)
+        )
+    except RuntimeError as exc:
         logger.error("Error finding user: %s", exc)
         return None
+    except Exception as exc:
+        logger.error("Error finding user: %s", exc)
+        return None
+    
     if response.status_code == 200:
         try:
             data = response.json()
@@ -484,13 +578,19 @@ def change_password(fabric_host, access_token, user_id, password):
     logger.info("Password change request - Data: %s", {**data, "new_password": "***" if data.get("new_password") else ""})
     
     try:
-        response = requests.post(url, headers=headers, json=data, verify=False, timeout=30)
+        response = _make_rate_limited_request(
+            fabric_host,
+            lambda: requests.post(url, headers=headers, json=data, verify=False, timeout=30)
+        )
         
         # Log response details
         logger.info("Password change response - Status: %s", response.status_code)
         logger.info("Password change response - Headers: %s", dict(response.headers))
         logger.info("Password change response - Body: %s", response.text)
         
+    except RuntimeError as exc:
+        logger.error("Error updating guest user password: %s", exc, exc_info=True)
+        raise
     except requests.RequestException as exc:
         logger.error("Error updating guest user password: %s", exc, exc_info=True)
         raise RuntimeError(f"Failed to change password: {exc}")
@@ -505,7 +605,11 @@ def change_password(fabric_host, access_token, user_id, password):
 
 
 def reset_fabric(fabric_host, access_token):
-    logger.info("Resetting fabric on host %s", fabric_host)
+    """
+    Reset fabric on host (asynchronous).
+    Returns immediately after initiating the reset task.
+    """
+    logger.info("Initiating fabric reset on host %s", fabric_host)
     url = f"https://{fabric_host}/api/v1/runtime/fabric"
     headers = {
         "Authorization": f"Bearer {access_token}",
@@ -514,19 +618,22 @@ def reset_fabric(fabric_host, access_token):
     try:
         response = requests.delete(url, headers=headers, verify=False, timeout=30)
     except requests.RequestException as exc:
-        logger.error("Error in reset Fabric: %s", exc)
-        return None
+        logger.error("Error initiating reset Fabric: %s", exc)
+        return False
     if response.status_code == 200:
-        check_tasks(fabric_host, access_token)
-        logger.info("Fabric reset successful")
-        return None
+        logger.info("Fabric reset task initiated successfully (async)")
+        return True
     else:
-        logger.error("Error in reset Fabric: %s - %s", response.status_code, response.text)
-        return None
+        logger.error("Error initiating reset Fabric: %s - %s", response.status_code, response.text)
+        return False
 
 
 def batch_delete(fabric_host, access_token):
-    logger.info("Deleting all fabrics in batch on host %s", fabric_host)
+    """
+    Delete all fabrics in batch on host (asynchronous).
+    Returns immediately after initiating the delete task.
+    """
+    logger.info("Initiating batch delete of all fabrics on host %s", fabric_host)
     url = f"https://{fabric_host}/api/v1/model/fabric/batch?interactive=false"
     headers = {
         "Authorization": f"Bearer {access_token}",
@@ -535,29 +642,29 @@ def batch_delete(fabric_host, access_token):
     try:
         response = requests.delete(url, headers=headers, verify=False, timeout=30)
     except requests.RequestException as exc:
-        logger.error("Error in batch delete: %s", exc)
-        return None
+        logger.error("Error initiating batch delete: %s", exc)
+        return False
     if response.status_code == 200:
-        check_tasks(fabric_host, access_token)
-        logger.info("Batch delete successful")
-        return None
+        logger.info("Batch delete task initiated successfully (async)")
+        return True
     else:
-        logger.error("Error in batch delete: %s - %s", response.status_code, response.text)
-        return None
+        logger.error("Error initiating batch delete: %s - %s", response.status_code, response.text)
+        return False
 
 
 def refresh_repositories(fabric_host, access_token):
     """
-    Refresh all remote repositories on host.
+    Refresh all remote repositories on host (asynchronous).
+    Returns immediately after initiating the refresh task.
     
     Args:
         fabric_host: Fabric host address
         access_token: Access token for authentication
     
     Returns:
-        True if successful, False otherwise
+        True if API call was successful (task initiated), False otherwise
     """
-    logger.info("Refreshing all remote repositories on host %s", fabric_host)
+    logger.info("Initiating refresh of all remote repositories on host %s", fabric_host)
     url = f"https://{fabric_host}/api/v1/system/repository/remote:refresh-all"
     headers = {
         "Authorization": f"Bearer {access_token}",
@@ -569,16 +676,15 @@ def refresh_repositories(fabric_host, access_token):
     try:
         response = requests.post(url, headers=headers, json=data, verify=False, timeout=30)
     except requests.RequestException as exc:
-        logger.error("Error in refresh all repositories: %s", exc)
+        logger.error("Error initiating refresh all repositories: %s", exc)
         return False
     
     if response.status_code == 200:
-        check_tasks(fabric_host, access_token)
-        logger.info("Refresh all repositories successful")
+        logger.info("Refresh all repositories task initiated successfully (async)")
         return True
     else:
         error_msg = f"{response.status_code} - {response.text}"
-        logger.error("Error in refresh all repositories: %s", error_msg)
+        logger.error("Error initiating refresh all repositories: %s", error_msg)
         return False
 
 
@@ -605,8 +711,11 @@ def get_repositoryId(fabric_host, access_token, repo_name):
     }
     params = {"select": f"name={repo_name}"}
     try:
-        response = requests.get(url, headers=headers, params=params, verify=False, timeout=30)
-    except requests.RequestException as exc:
+        response = _make_rate_limited_request(
+            fabric_host,
+            lambda: requests.get(url, headers=headers, params=params, verify=False, timeout=30)
+        )
+    except (RuntimeError, requests.RequestException) as exc:
         logger.error("Error finding Repository Id: %s", exc)
         return None
     if response.status_code == 200:
@@ -645,10 +754,14 @@ def list_repositories(fabric_host, access_token):
         "Cache-Control": "no-cache"
     }
     try:
-        response = requests.get(url, headers=headers, verify=False, timeout=30)
-    except requests.RequestException as exc:
+        response = _make_rate_limited_request(
+            fabric_host,
+            lambda: requests.get(url, headers=headers, verify=False, timeout=30)
+        )
+    except (RuntimeError, requests.RequestException) as exc:
         logger.error("Error listing repositories: %s", exc)
         return []
+    
     if response.status_code != 200:
         logger.error("Error listing repositories: %s - %s", response.status_code, response.text)
         return []
@@ -697,8 +810,11 @@ def list_templates_for_repo(fabric_host, access_token, repo_id):
             "per_page": per_page,
         }
         try:
-            response = requests.get(base_url, headers=headers, params=params, verify=False, timeout=30)
-        except requests.RequestException as exc:
+            response = _make_rate_limited_request(
+                fabric_host,
+                lambda: requests.get(base_url, headers=headers, params=params, verify=False, timeout=30)
+            )
+        except (RuntimeError, requests.RequestException) as exc:
             logger.error("Error listing templates for repo %s (page %s): %s", repo_id, page, exc)
             break
         if response.status_code != 200:
@@ -778,7 +894,11 @@ def download_template(fabric_host, access_token, template_id):
 
 
 def create_fabric(fabric_host, access_token, template_id, template, version):
-    logger.info("Creating fabric from template_id %s on host %s", template_id, fabric_host)
+    """
+    Create fabric from template (asynchronous).
+    Returns immediately after initiating the create task.
+    """
+    logger.info("Initiating fabric creation from template_id %s on host %s", template_id, fabric_host)
     url = (f"https://{fabric_host}/api/v1/model/fabric")
     headers = {
         "Authorization": f"Bearer {access_token}",
@@ -789,122 +909,21 @@ def create_fabric(fabric_host, access_token, template_id, template, version):
         "template": template_id
     }
     try:
-        response = requests.post(url, headers=headers, json=data, verify=False, timeout=30)
+        response = _make_rate_limited_request(
+            fabric_host,
+            lambda: requests.post(url, headers=headers, json=data, verify=False, timeout=180)  # 3 minutes for fabric creation
+        )
+    except RuntimeError as exc:
+        logger.error("Error initiating fabric creation for template %s: %s", template_id, exc)
+        return (False, [f"Request error: {str(exc)}"])
     except requests.RequestException as exc:
-        logger.error("Error creating template %s: %s", template_id, exc)
+        logger.error("Error initiating fabric creation for template %s: %s", template_id, exc)
         return (False, [f"Request error: {str(exc)}"])
     if response.status_code == 200:
-        # Capture timestamp before checking tasks to filter errors
-        from datetime import datetime, timezone
-        creation_start_time = datetime.now(timezone.utc)
-        
-        # Check if response contains created fabric information
-        created_fabric_id = None
-        try:
-            response_data = response.json()
-            # API might return the created fabric in 'object' or directly
-            if isinstance(response_data, dict):
-                created_obj = response_data.get('object')
-                if isinstance(created_obj, dict):
-                    created_fabric_id = created_obj.get('id')
-                elif isinstance(created_obj, list) and len(created_obj) > 0:
-                    created_fabric_id = created_obj[0].get('id')
-                # Also check if fabric ID is at root level
-                if not created_fabric_id:
-                    created_fabric_id = response_data.get('id')
-        except (ValueError, AttributeError):
-            pass  # Response might not be JSON or might not contain fabric info
-        
-        result = check_tasks(fabric_host, access_token)
-        if result is None:
-            logger.error("Error checking tasks after fabric creation")
-            return (False, ["Error checking task status after fabric creation"])
-        elapsed_time, success = result if isinstance(result, tuple) else (result, True)
-        if not success:
-            logger.error("Timed out waiting for tasks to finish after fabric creation")
-            return (False, ["Timed out waiting for tasks to finish after 15 minutes"])
-        
-        # Check for task errors after tasks complete, filtering by fabric name and timestamp
-        task_errors = get_recent_task_errors(fabric_host, access_token, limit=20, since_timestamp=creation_start_time, fabric_name=template)
-        if task_errors:
-            error_messages = [f"Task '{err['task_name']}': {err['error']}" for err in task_errors]
-            logger.warning("Found %d task errors after fabric creation for '%s'", len(task_errors), template)
-            return (False, error_messages)
-        
-        # Verify fabric was actually created by checking if it exists
-        # This is important because the API might return 200 OK but the fabric creation could still fail
-        # List all fabrics and check for the one we created (by ID if available, or by name+version)
-        template_name_lower = (template or "").strip().lower()
-        fabric_exists = False
-        fabric_id_verified = None
-        fabric_name_verified = None
-        
-        for attempt in range(3):  # Try up to 3 times
-            if attempt > 0:
-                time.sleep(2)  # Wait 2 seconds between retries
-            
-            try:
-                # List all fabrics instead of using select (more reliable)
-                url_list = f"https://{fabric_host}/api/v1/model/fabric"
-                verify_response = requests.get(url_list, headers=headers, verify=False, timeout=30)
-                if verify_response.status_code == 200:
-                    verify_data = verify_response.json()
-                    verify_objects = verify_data.get('object', [])
-                    
-                    # First, try to find by ID if we got it from the response
-                    if created_fabric_id:
-                        for item in verify_objects:
-                            if item.get('id') == created_fabric_id:
-                                fabric_exists = True
-                                fabric_id_verified = created_fabric_id
-                                fabric_name_verified = item.get('name')
-                                logger.info("Verified fabric exists by ID %s: '%s' v%s", created_fabric_id, fabric_name_verified, item.get('version'))
-                                break
-                    
-                    # If not found by ID, try by name and version
-                    if not fabric_exists:
-                        for item in verify_objects:
-                            item_name = (item.get('name') or "").strip().lower()
-                            item_version = item.get('version')
-                            if item_name == template_name_lower and item_version == version:
-                                fabric_exists = True
-                                fabric_id_verified = item.get('id')
-                                fabric_name_verified = item.get('name')
-                                logger.info("Verified fabric '%s' v%s exists (id: %s)", fabric_name_verified, version, fabric_id_verified)
-                                break
-                    
-                    # If still not found, log all fabrics with matching version for debugging
-                    if not fabric_exists and attempt == 2:
-                        fabrics_with_version = [item for item in verify_objects if item.get('version') == version]
-                        if fabrics_with_version:
-                            fabric_names = [f"{item.get('name')} (id: {item.get('id')})" for item in fabrics_with_version]
-                            logger.warning("Fabric '%s' v%s not found, but found %d fabric(s) with version %s: %s", 
-                                         template, version, len(fabrics_with_version), version, ', '.join(fabric_names))
-                        else:
-                            all_fabric_names = [f"{item.get('name')} v{item.get('version')}" for item in verify_objects[:10]]
-                            logger.warning("Fabric '%s' v%s not found. Sample of existing fabrics: %s", 
-                                         template, version, ', '.join(all_fabric_names) if all_fabric_names else 'none')
-                    
-                    if fabric_exists:
-                        break
-                else:
-                    if attempt == 2:  # Only log warning on last attempt
-                        logger.warning("Could not verify fabric creation - status %s: %s", verify_response.status_code, verify_response.text)
-            except requests.RequestException as exc:
-                if attempt == 2:  # Only log warning on last attempt
-                    logger.warning("Could not verify fabric exists after creation: %s", exc)
-        
-        if not fabric_exists:
-            error_msg = f"Fabric '{template}' v{version} was not created - verification failed. Fabric does not exist after creation (checked 3 times)."
-            if created_fabric_id:
-                error_msg += f" API returned fabric ID {created_fabric_id} but fabric not found."
-            logger.error(error_msg)
-            return (False, [error_msg])
-        
-        logger.info("Fabric created from template_id %s", template_id)
+        logger.info("Fabric creation task initiated successfully (async)")
         return (True, [])
     else:
-        error_msg = f"Error creating template {template_id}: {response.status_code} - {response.text}"
+        error_msg = f"Error initiating fabric creation for template {template_id}: {response.status_code} - {response.text}"
         logger.error(error_msg)
         return (False, [error_msg])
 
@@ -995,34 +1014,19 @@ def install_fabric(fabric_host, access_token, template, version):
     
     url_install = (f"https://{fabric_host}/api/v1/runtime/fabric/{fabric_id}")
     try:
-        response = requests.post(url_install, headers=headers, verify=False, timeout=30)
+        response = _make_rate_limited_request(
+            fabric_host,
+            lambda: requests.post(url_install, headers=headers, verify=False, timeout=900)  # 15 minutes for installation
+        )
+    except RuntimeError as exc:
+        logger.error("Error installing Fabric %s: %s", fabric_id, exc)
+        return (False, [f"Request error installing fabric: {str(exc)}"])
     except requests.RequestException as exc:
         logger.error("Error installing Fabric %s: %s", fabric_id, exc)
         return (False, [f"Request error installing fabric: {str(exc)}"])
     
     if response.status_code == 200:
-        
-        result = check_tasks(fabric_host, access_token)
-        if result is None:
-            logger.error("Error checking tasks after installation")
-            return (False, ["Error checking task status after installation"])
-        elapsed_time, success = result if isinstance(result, tuple) else (result, True)
-        if not success:
-            logger.error("Timed out waiting for tasks to finish after installation")
-            return (False, ["Timed out waiting for tasks to finish after 15 minutes"])
-        
-        # Check for task errors after tasks complete, filtering by fabric name and timestamp
-        # Use a slightly earlier timestamp (5 seconds before) to catch tasks created just before the install call
-        # Also increase limit to catch more tasks
-        error_check_start_time = install_start_time - timedelta(seconds=5)
-        task_errors = get_recent_task_errors(fabric_host, access_token, limit=50, since_timestamp=error_check_start_time, fabric_name=template)
-        if task_errors:
-            # Error messages from get_recent_task_errors already include task name, so use them as-is
-            error_messages = [err['error'] for err in task_errors]
-            logger.warning("Found %d task errors after fabric installation for '%s'", len(task_errors), template)
-            return (False, error_messages)
-        
-        logger.info("Fabric %s installed successfully", fabric_id)
+        logger.info("Fabric installation task initiated successfully (async)")
         return (True, [])
     else:
         # Parse error response to provide better error message

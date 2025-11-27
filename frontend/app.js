@@ -10,6 +10,7 @@ let sessionExpiresAt = null; // Track session expiration time
 let sessionStatusCache = null; // Cache for session status check
 let sessionStatusCacheTime = 0; // Timestamp of last session status check
 const SESSION_STATUS_CACHE_DURATION = 2000; // Cache session status for 2 seconds
+const BACKEND_MAX_PARALLEL_HOSTS = 30; // Matches backend MAX_PARALLEL_HOSTS limit
 
 // Global error handler for unhandled errors
 window.addEventListener('error', (event) => {
@@ -343,6 +344,11 @@ function populateHostsFromInput(hostsString, targetInputId = 'fabricHost', targe
       validateAndAddHostToArray(host.trim(), targetValidatedHosts);
     });
     
+    // Log after populating NHI hosts
+    if (targetInputId === 'fabricHostFromNhi') {
+      logMsg(`populateHostsFromInput: Populated ${targetValidatedHosts.length} host(s) into window.validatedNhiHosts: ${targetValidatedHosts.map(h => h.host).join(', ')}`);
+    }
+    
     // Render chips and update status for the target
     if (targetInputId === 'fabricHostFromNhi') {
       // For NHI hosts, render with mismatch detection
@@ -384,7 +390,8 @@ function validateAndAddHostToArray(hostText, targetArray) {
   return isValid;
 }
 
-function renderHostChipsForTarget(inputId, chipsContainerId, statusId, targetValidatedHosts, isMismatchedFn = null) {
+function renderHostChipsForTarget(inputId, chipsContainerId, statusId, targetValidatedHosts, isMismatchedFn = null, options = {}) {
+  const allowDelete = options.allowDelete !== false;
   const chipsContainer = el(chipsContainerId);
   if (!chipsContainer) return;
   
@@ -413,6 +420,7 @@ function renderHostChipsForTarget(inputId, chipsContainerId, statusId, targetVal
     chipText.textContent = entry;
     chip.appendChild(chipText);
     
+    if (allowDelete) {
     const chipDelete = document.createElement('button');
     chipDelete.className = 'chip-delete';
     chipDelete.textContent = '×';
@@ -422,6 +430,7 @@ function renderHostChipsForTarget(inputId, chipsContainerId, statusId, targetVal
       removeValidatedHostFromArray(index, inputId, chipsContainerId, statusId, targetValidatedHosts);
     });
     chip.appendChild(chipDelete);
+    }
     
     chipsContainer.appendChild(chip);
   });
@@ -811,6 +820,153 @@ async function checkRunningTasks(host, timeoutMs = 60000) {
   return {running: true, error: false}; // Timeout - tasks still running
 }
 
+/**
+ * Poll /tasks/status at specified interval until no tasks are running
+ * @param {string} host - Fabric host
+ * @param {number} timeoutMs - Maximum time to wait (default: 15 minutes)
+ * @param {string} operationName - Name of operation for logging
+ * @param {number} pollIntervalMs - Polling interval in milliseconds (default: 15 seconds)
+ * @returns {Promise<{success: boolean, error?: string}>}
+ */
+async function waitForTasksComplete(host, timeoutMs = 15 * 60 * 1000, operationName = 'operation', pollIntervalMs = 15000, waitForTasksToAppear = false) {
+  const start = Date.now();
+  let firstCheck = true;
+  let tasksSeen = false;
+  
+  logMsg(`[${host}] Waiting for ${operationName} tasks to complete...`);
+  
+  while (Date.now() - start < timeoutMs) {
+    try {
+      const res = await api('/tasks/status', { 
+        params: { fabric_host: host },
+        timeout: 15 * 60 * 1000,
+        credentials: 'include'
+      });
+      
+      if (!res.ok) {
+        if (res.status === 401) {
+          handleSessionExpired();
+        }
+        return {success: false, error: `Status check failed: HTTP ${res.status}`};
+      }
+      
+      const data = await res.json();
+      const runningCount = data.running_count ?? 0;
+      
+      // Track if we've seen tasks running
+      if (runningCount > 0) {
+        tasksSeen = true;
+      }
+      
+      // If this is the first check and we're waiting for tasks to appear, and no tasks are running yet
+      if (firstCheck && waitForTasksToAppear && runningCount === 0) {
+        firstCheck = false;
+        logMsg(`[${host}] No tasks running yet, waiting for ${operationName} tasks to appear...`);
+        await new Promise(r => setTimeout(r, pollIntervalMs));
+        continue; // Check again
+      }
+      
+      firstCheck = false;
+      
+      if (runningCount === 0) {
+        // If we were waiting for tasks to appear and never saw any, that's an error
+        if (waitForTasksToAppear && !tasksSeen) {
+          // Give it one more check cycle in case tasks appeared and completed very quickly
+          const elapsed = Date.now() - start;
+          if (elapsed < pollIntervalMs * 2) {
+            logMsg(`[${host}] No tasks seen yet, waiting one more cycle...`);
+            await new Promise(r => setTimeout(r, pollIntervalMs));
+            continue;
+          }
+          return {success: false, error: `No ${operationName} tasks appeared on ${host}`};
+        }
+        logMsg(`[${host}] ${operationName} tasks completed`);
+        return {success: true};
+      }
+      
+      const intervalSeconds = pollIntervalMs / 1000;
+      logMsg(`[${host}] ${operationName}: ${runningCount} task(s) still running, waiting ${intervalSeconds} seconds...`);
+      await new Promise(r => setTimeout(r, pollIntervalMs));
+    } catch (error) {
+      let errorMsg = error.message || error.toString();
+      if (errorMsg.includes('timeout') || errorMsg.includes('abort') || errorMsg.includes('signal')) {
+        errorMsg = `Connection error during polling: ${errorMsg}`;
+      }
+      logMsg(`[${host}] Error checking task status: ${errorMsg}`);
+      return {success: false, error: errorMsg};
+    }
+  }
+  
+  return {success: false, error: `Timeout waiting for ${operationName} tasks to complete`};
+}
+
+/**
+ * Wait for a fabric to appear after creation by verifying tasks are complete
+ * and adding a short delay for the fabric to become available in the API
+ * @param {string} host - Fabric host
+ * @param {string} templateName - Template/fabric name
+ * @param {string} version - Fabric version
+ * @param {number} maxWaitMs - Maximum time to wait (default: 30 seconds)
+ * @param {number} pollIntervalMs - Polling interval in milliseconds (default: 2 seconds)
+ * @returns {Promise<{success: boolean, error?: string}>}
+ */
+async function waitForFabricToAppear(host, templateName, version, maxWaitMs = 30000, pollIntervalMs = 2000) {
+  const start = Date.now();
+  
+  logMsg(`[${host}] Waiting for fabric '${templateName}' v${version} to become available...`);
+  
+  // First, verify tasks are complete (double-check)
+  let tasksComplete = false;
+  let attempts = 0;
+  const maxAttempts = 3;
+  
+  while (attempts < maxAttempts && Date.now() - start < maxWaitMs) {
+    try {
+      const res = await api('/tasks/status', { 
+        params: { fabric_host: host },
+        credentials: 'include'
+      });
+      
+      if (res.ok) {
+        const data = await res.json();
+        const runningCount = data.running_count ?? 0;
+        
+        if (runningCount === 0) {
+          tasksComplete = true;
+          logMsg(`[${host}] Tasks confirmed complete, waiting for fabric '${templateName}' v${version} to appear...`);
+          break;
+        } else {
+          logMsg(`[${host}] ${runningCount} task(s) still running, waiting...`);
+        }
+      }
+    } catch (error) {
+      logMsg(`[${host}] Error checking task status: ${error.message || error}`);
+    }
+    
+    attempts++;
+    if (attempts < maxAttempts) {
+      await new Promise(r => setTimeout(r, pollIntervalMs));
+    }
+  }
+  
+  if (!tasksComplete) {
+    logMsg(`[${host}] Warning: Could not confirm all tasks are complete, but proceeding anyway...`);
+  }
+  
+  // Add a short delay to allow the fabric to appear in the API after tasks complete
+  // This is necessary because the fabric may not be immediately queryable even after tasks finish
+  const remainingTime = maxWaitMs - (Date.now() - start);
+  if (remainingTime > 0) {
+    const delayMs = Math.min(5000, remainingTime); // Wait up to 5 seconds
+    logMsg(`[${host}] Waiting ${delayMs/1000}s for fabric to become available in API...`);
+    await new Promise(r => setTimeout(r, delayMs));
+  }
+  
+  // The fabric should be available now. The installation attempt will verify it exists.
+  // If installation fails with "fabric not found", that will be caught and handled.
+  return {success: true};
+}
+
 async function waitForNoRunningTasks(hosts, actionName) {
   const checks = hosts.map(async ({host}) => {
     // User is already authenticated via login - proceed with check
@@ -857,6 +1013,7 @@ async function executeOnAllHosts(actionName, actionFn, options = {}) {
   }
   
   const results = [];
+  // Rate limiting disabled - process all hosts in parallel
   const promises = hosts.map(async ({host}) => {
     // User is already authenticated via login - proceed with operation
     try {
@@ -868,6 +1025,7 @@ async function executeOnAllHosts(actionName, actionFn, options = {}) {
     }
   });
   results.push(...await Promise.all(promises));
+  
   const successCount = results.filter(r => r.success).length;
   if (successCount === hosts.length) {
     showStatus(`${actionName} completed successfully on all ${hosts.length} host(s)`);
@@ -1019,18 +1177,7 @@ async function loadSelectedNhiCredential() {
       const addRowBtnError = el('btnAddRow');
       if (addRowBtnError) addRowBtnError.disabled = true;
       
-      // Disable the NHI credential input and radio button on error
-      const fabricHostFromNhiInput = el('fabricHostFromNhi');
-      if (fabricHostFromNhiInput) {
-        fabricHostFromNhiInput.disabled = true;
-        fabricHostFromNhiInput.value = '';
-        fabricHostFromNhiInput.style.backgroundColor = '#f5f5f7';
-        fabricHostFromNhiInput.style.cursor = 'not-allowed';
-        try {
-          populateHostsFromInput('', 'fabricHostFromNhi', 'fabricHostFromNhiChips', 'fabricHostFromNhiStatus');
-        } catch (e) {
-        }
-      }
+      // Disable the NHI credential radio button on error
       const hostSourceNhi = el('hostSourceNhi');
       if (hostSourceNhi) {
         hostSourceNhi.disabled = true;
@@ -1048,6 +1195,8 @@ async function loadSelectedNhiCredential() {
     let nhiData;
     try {
       nhiData = await res.json();
+      logMsg(`loadSelectedNhiCredential: API response keys: ${Object.keys(nhiData).join(', ')}`);
+      logMsg(`loadSelectedNhiCredential: nhiData.hosts_with_tokens = ${JSON.stringify(nhiData.hosts_with_tokens)}`);
     } catch (jsonError) {
       if (statusSpan) statusSpan.textContent = 'Invalid response';
       showStatus(`Failed to parse response from server: ${jsonError.message || jsonError}`);
@@ -1068,6 +1217,7 @@ async function loadSelectedNhiCredential() {
         method: 'PUT',
         params: { nhi_credential_id: currentNhiId }
       });
+      logMsg(`Session updated with NHI credential ID in loadSelectedNhiCredential: ${currentNhiId}`);
     } catch (error) {
       console.warn(`Failed to update session with NHI credential ID: ${error.message || error}`);
       // Continue anyway - the credential is still loaded
@@ -1087,38 +1237,37 @@ async function loadSelectedNhiCredential() {
       // Collect host list from hosts_with_tokens array
       nhiHosts.push(...nhiData.hosts_with_tokens);
       // NHI credential contains stored tokens
+      logMsg(`loadSelectedNhiCredential: Found ${nhiHosts.length} host(s) in nhiData.hosts_with_tokens: ${nhiHosts.join(', ')}`);
+    } else {
+      logMsg(`loadSelectedNhiCredential: No hosts found in nhiData.hosts_with_tokens. Type: ${typeof nhiData.hosts_with_tokens}, IsArray: ${Array.isArray(nhiData.hosts_with_tokens)}, Length: ${nhiData.hosts_with_tokens ? nhiData.hosts_with_tokens.length : 'N/A'}`);
     }
-    
-    // Handle Fabric Host population from NHI credential
-    const fabricHostFromNhiInput = el('fabricHostFromNhi');
     
     if (nhiHosts.length > 0) {
       // Always populate the NHI hosts input (enable it and make it editable)
       const nhiHostsStr = nhiHosts.join(' ');
-      if (fabricHostFromNhiInput) {
-        fabricHostFromNhiInput.value = nhiHostsStr;
-        // Enable the input
-        fabricHostFromNhiInput.disabled = false;
-        fabricHostFromNhiInput.style.backgroundColor = '';
-        fabricHostFromNhiInput.style.cursor = '';
-        populateHostsFromInput(nhiHostsStr, 'fabricHostFromNhi', 'fabricHostFromNhiChips', 'fabricHostFromNhiStatus');
-        // Update mismatch highlighting after populating
-        updateNhiHostMismatches();
+      logMsg(`loadSelectedNhiCredential: About to populate hosts: "${nhiHostsStr}"`);
+      
+      // Initialize window.validatedNhiHosts if it doesn't exist
+      if (!window.validatedNhiHosts) {
+        window.validatedNhiHosts = [];
       }
+      
+      // Parse and populate hosts directly into window.validatedNhiHosts
+      window.validatedNhiHosts.length = 0; // Clear existing
+      nhiHosts.forEach(hostStr => {
+        const {host, port} = splitHostPort(hostStr);
+        if (host) {
+          window.validatedNhiHosts.push({host, port, isValid: true});
+        }
+      });
+      logMsg(`loadSelectedNhiCredential: Directly populated ${window.validatedNhiHosts.length} host(s) into window.validatedNhiHosts: ${window.validatedNhiHosts.map(h => h.host).join(', ')}`);
+      
       // Enable the NHI Credential radio button
       const hostSourceNhi = el('hostSourceNhi');
       if (hostSourceNhi) {
         hostSourceNhi.disabled = false;
       }
     } else {
-      // Clear NHI hosts if credential has none
-      if (fabricHostFromNhiInput) {
-        fabricHostFromNhiInput.value = '';
-        fabricHostFromNhiInput.disabled = true;
-        fabricHostFromNhiInput.style.backgroundColor = '#f5f5f7';
-        fabricHostFromNhiInput.style.cursor = 'not-allowed';
-        populateHostsFromInput('', 'fabricHostFromNhi', 'fabricHostFromNhiChips', 'fabricHostFromNhiStatus');
-      }
       // Disable the NHI Credential radio button if no hosts
       const hostSourceNhi = el('hostSourceNhi');
       if (hostSourceNhi) {
@@ -1173,18 +1322,7 @@ async function loadSelectedNhiCredential() {
     const runBtnError = el('btnInstallSelected');
     if (runBtnError) runBtnError.disabled = true;
     
-    // Disable the NHI credential input and radio button on error
-    const fabricHostFromNhiInput = el('fabricHostFromNhi');
-    if (fabricHostFromNhiInput) {
-      fabricHostFromNhiInput.disabled = true;
-      fabricHostFromNhiInput.value = '';
-      fabricHostFromNhiInput.style.backgroundColor = '#f5f5f7';
-      fabricHostFromNhiInput.style.cursor = 'not-allowed';
-      try {
-        populateHostsFromInput('', 'fabricHostFromNhi', 'fabricHostFromNhiChips', 'fabricHostFromNhiStatus');
-      } catch (e) {
-      }
-    }
+    // Disable the NHI credential radio button on error
     const hostSourceNhi = el('hostSourceNhi');
     if (hostSourceNhi) {
       hostSourceNhi.disabled = true;
@@ -1238,18 +1376,8 @@ async function loadSelectedNhiCredentialForEdit() {
       nhiHosts.push(...nhiData.hosts_with_tokens);
     }
     
-    // Populate editFabricHost with hosts from NHI credential
-    const editFabricHostInput = el('editFabricHost');
-    
     if (nhiHosts.length > 0) {
-      // Populate the edit fabric host input
-      // nhiHosts is an array of host strings
-      const nhiHostsStr = nhiHosts.join(' ');
-      if (editFabricHostInput) {
-        editFabricHostInput.value = nhiHostsStr;
-        
-        // Parse and validate hosts
-        const hosts = nhiHostsStr.split(/\s+/).filter(h => h.trim()).map(hostStr => {
+      const hosts = nhiHosts.map(hostStr => {
           const parts = hostStr.split(':');
           return {
             host: parts[0],
@@ -1257,23 +1385,16 @@ async function loadSelectedNhiCredentialForEdit() {
             isValid: true
           };
         });
-        
-        // Store validated hosts
         window.editValidatedHosts = hosts;
-        
-        // Render host chips
-        renderHostChipsForTarget('editFabricHost', 'editFabricHostChips', 'editFabricHostStatus', hosts);
-      }
+      renderHostChipsForTarget(null, 'editFabricHostChips', 'editFabricHostStatus', hosts, null, { allowDelete: false });
     } else {
-      // Clear hosts if credential has none
-      if (editFabricHostInput) {
-        editFabricHostInput.value = '';
-      }
       const editFabricHostChips = el('editFabricHostChips');
       if (editFabricHostChips) {
         editFabricHostChips.innerHTML = '';
       }
       window.editValidatedHosts = [];
+      const statusSpan = el('editFabricHostStatus');
+      if (statusSpan) statusSpan.textContent = '';
       showStatus(`NHI credential '${nhiData.name}' loaded (no hosts in credential)`);
     }
   } catch (error) {
@@ -1368,6 +1489,20 @@ function logMsg(msg) {
     out.textContent += `[${timestamp}] ${msg}\n`;
     // Auto-scroll to bottom
     out.scrollTop = out.scrollHeight;
+  }
+}
+
+function logHostBatches(hosts, context = 'Run') {
+  if (!Array.isArray(hosts) || hosts.length === 0) {
+    return;
+  }
+  const maxParallel = BACKEND_MAX_PARALLEL_HOSTS;
+  logMsg(`[${context}] Backend processes up to ${maxParallel} host(s) in parallel.`);
+  const totalBatches = Math.ceil(hosts.length / maxParallel);
+  for (let i = 0; i < totalBatches; i++) {
+    const batchHosts = hosts.slice(i * maxParallel, (i + 1) * maxParallel)
+      .map((item) => (item?.host ? item.host : String(item)));
+    logMsg(`[${context}] Batch ${i + 1}/${totalBatches} (${batchHosts.length} host(s)): ${batchHosts.join(', ')}`);
   }
 }
 
@@ -1575,6 +1710,12 @@ async function api(path, options = {}) {
           }
           
           return response;
+        } catch (error) {
+          clearTimeout(timeoutId);
+          if (error.name === 'AbortError') {
+            throw new Error(`Request timeout after ${timeout}ms`);
+          }
+          throw error;
         } finally {
           // Remove from pending requests when done
           _pendingRequests.delete(cacheKey);
@@ -2243,13 +2384,22 @@ function createFilteredDropdown(placeholder, width = '130px') {
     },
     getValue: () => {
       if (selectedValue) return selectedValue;
+      // Check hidden select value as fallback
+      if (hiddenSelect.value) return hiddenSelect.value;
       // Try to find matching value from input text
       const inputText = input.value.trim();
+      if (!inputText) return '';
       const matched = allOptions.find(opt => {
+        const optValue = opt.value || opt;
         const optText = opt.textContent || opt;
-        return optText === inputText || optText.toLowerCase() === inputText.toLowerCase();
+        return optValue === inputText || optText === inputText || optText.toLowerCase() === inputText.toLowerCase();
       });
-      return matched ? (matched.value || matched) : '';
+      if (matched) {
+        const value = matched.value || matched;
+        selectedValue = value; // Update selectedValue for next call
+        return value;
+      }
+      return '';
     },
     disable: () => {
       input.disabled = true;
@@ -4300,8 +4450,33 @@ async function runConfigurationById(configId) {
     // Restore configuration to run view (uses same element IDs as preparation section)
     await restoreConfiguration(configData.config_data);
     
-    // Wait a bit to ensure everything is set up, then ensure button is enabled
-    await new Promise(resolve => setTimeout(resolve, 500));
+    // Wait for templates to be fully restored and verify all conditions
+    let retries = 0;
+    const maxRetries = 20;
+    while (retries < maxRetries) {
+      await new Promise(resolve => setTimeout(resolve, 200));
+      
+      // Check if all conditions are met
+      const hostsConfirmed = confirmedHosts && confirmedHosts.length > 0;
+      const nhiLoaded = !!currentNhiId;
+      const rows = Array.from(document.querySelectorAll('.tpl-row'));
+      const allRowsFilled = rows.length > 0 && rows.every(r => {
+        const selects = r.querySelectorAll('select');
+        const repoSelect = selects[0];
+        const templateFiltered = r._templateFiltered;
+        const versionSelect = selects.length > 2 ? selects[selects.length - 1] : (selects[1] || null);
+        const repo_name = repoSelect?.value || '';
+        const template_name = templateFiltered ? templateFiltered.getValue() : '';
+        const version = versionSelect?.value || '';
+        return Boolean(repo_name && template_name && version);
+      });
+      
+      if (hostsConfirmed && nhiLoaded && allRowsFilled) {
+        break; // All conditions met
+      }
+      
+      retries++;
+    }
     
     // Verify the Run button handler is set up
     const runBtn = el('btnInstallSelected');
@@ -4311,15 +4486,34 @@ async function runConfigurationById(configId) {
         runBtn.onclick = handleTrackedRunButton;
       }
       
-      // Force enable the button if configuration was loaded successfully
-      // The button should be enabled since hosts are confirmed and tokens are acquired
-      // Update button state
+      // Update button state - this should enable it if all conditions are met
       updateCreateEnabled();
       
-      // If button is still disabled after updateCreateEnabled, force enable it
-      // since we know the configuration was loaded successfully
+      // If button is still disabled after updateCreateEnabled, check why and log
       if (runBtn.disabled) {
+        const hostsConfirmed = confirmedHosts && confirmedHosts.length > 0;
+        const nhiLoaded = !!currentNhiId;
+        const rows = Array.from(document.querySelectorAll('.tpl-row'));
+        const allRowsFilled = rows.length > 0 && rows.every(r => {
+          const selects = r.querySelectorAll('select');
+          const repoSelect = selects[0];
+          const templateFiltered = r._templateFiltered;
+          const versionSelect = selects.length > 2 ? selects[selects.length - 1] : (selects[1] || null);
+          const repo_name = repoSelect?.value || '';
+          const template_name = templateFiltered ? templateFiltered.getValue() : '';
+          const version = versionSelect?.value || '';
+          return Boolean(repo_name && template_name && version);
+        });
+        
+        logMsg(`Run button disabled - hosts: ${hostsConfirmed}, nhi: ${nhiLoaded}, rows filled: ${allRowsFilled}, row count: ${rows.length}`);
+        
+        // If all conditions are actually met, force enable the button
+        if (hostsConfirmed && nhiLoaded && allRowsFilled) {
         runBtn.disabled = false;
+          logMsg('Force-enabled run button - all conditions met');
+        }
+      } else {
+        logMsg('Run button enabled successfully');
       }
     }
     hideLoadingScreen();
@@ -4416,23 +4610,13 @@ async function populateConfigEditForm(name, config) {
   }
   window.editValidatedHosts = [];
   
-  const fabricHostInput = el('editFabricHost');
-  if (fabricHostInput) {
     if (config.confirmedHosts && config.confirmedHosts.length > 0) {
-      // Show confirmed hosts as space-separated string and populate chips
-      const hostString = config.confirmedHosts.map(h => 
-        h.host + (h.port !== undefined ? ':' + h.port : '')
-      ).join(' ');
-      fabricHostInput.value = hostString;
-      // Create validated hosts array for chips
       window.editValidatedHosts = config.confirmedHosts.map(h => ({
         host: h.host,
         port: h.port,
         isValid: true
       }));
     } else if (config.fabricHost) {
-      fabricHostInput.value = config.fabricHost;
-      // Parse hosts from string if available
       const hosts = config.fabricHost.split(/\s+/).filter(h => h.trim()).map(hostStr => {
         const parts = hostStr.split(':');
         return {
@@ -4443,26 +4627,16 @@ async function populateConfigEditForm(name, config) {
       });
       window.editValidatedHosts = hosts;
     } else {
-      fabricHostInput.value = '';
-    }
+    window.editValidatedHosts = [];
   }
-  
-  // Render host chips - use the global array
-  const chipsContainer = el('editFabricHostChips');
-  const statusSpan = el('editFabricHostStatus');
-  if (window.editValidatedHosts && window.editValidatedHosts.length > 0) {
-    renderHostChipsForTarget('editFabricHost', 'editFabricHostChips', 'editFabricHostStatus', window.editValidatedHosts);
+  if (window.editValidatedHosts.length > 0) {
+    renderHostChipsForTarget(null, 'editFabricHostChips', 'editFabricHostStatus', window.editValidatedHosts, null, { allowDelete: false });
   } else {
+    const chipsContainer = el('editFabricHostChips');
     if (chipsContainer) chipsContainer.innerHTML = '';
-    if (chipsContainer) chipsContainer.style.display = 'none';
+    const statusSpan = el('editFabricHostStatus');
     if (statusSpan) statusSpan.textContent = '';
   }
-  
-  // Initialize editFabricHost input listeners (same logic as preparation section)
-  // Wait a bit to ensure DOM is ready
-  setTimeout(() => {
-    initializeEditFabricHostInput();
-  }, 100);
   
   // Load NHI credentials into dropdown and set selected value
   const nhiCredentialSelect = el('editNhiCredentialSelect');
@@ -4514,15 +4688,13 @@ async function populateConfigEditForm(name, config) {
           await loadSelectedNhiCredentialForEdit();
         } else {
           // Clear hosts if no credential selected
-          const editFabricHostInput = el('editFabricHost');
-          if (editFabricHostInput) {
-            editFabricHostInput.value = '';
-          }
           const editFabricHostChips = el('editFabricHostChips');
           if (editFabricHostChips) {
             editFabricHostChips.innerHTML = '';
           }
           window.editValidatedHosts = [];
+          const statusSpan = el('editFabricHostStatus');
+          if (statusSpan) statusSpan.textContent = '';
         }
       });
       nhiCredentialSelect.setAttribute('data-listener-added', 'true');
@@ -4664,6 +4836,7 @@ async function populateConfigEditForm(name, config) {
 
 // Initialize editFabricHost input with same logic as fabricHost in preparation section
 function initializeEditFabricHostInput() {
+  return;
   let fh = el('editFabricHost');
   if (!fh) {
     return;
@@ -5291,7 +5464,6 @@ function collectConfigFromEditForm() {
   
   const config = {
     // API Base removed
-    fabricHost: el('editFabricHost')?.value || '',
     nhiCredentialId: nhiCredentialId,
     expertMode: el('editExpertMode')?.checked || false,
     newHostname: el('editNewHostname')?.value || '',
@@ -5304,21 +5476,9 @@ function collectConfigFromEditForm() {
     templates: []
   };
   
-  // Parse confirmed hosts from fabricHost input or use validated hosts
+  // Confirmed hosts come from selected NHI credential
   if (window.editValidatedHosts && window.editValidatedHosts.length > 0) {
     config.confirmedHosts = window.editValidatedHosts.map(h => ({ host: h.host, port: h.port }));
-  } else {
-    const fabricHostValue = config.fabricHost;
-    if (fabricHostValue) {
-      const hosts = fabricHostValue.split(/\s+/).filter(h => h.trim()).map(hostStr => {
-        const parts = hostStr.split(':');
-        return {
-          host: parts[0],
-          port: parts.length > 1 ? parts[1] : undefined
-        };
-      });
-      config.confirmedHosts = hosts;
-    }
   }
   
   // Collect templates from edit form rows
@@ -5379,12 +5539,36 @@ async function handleSaveEditConfig() {
     
     const config = collectConfigFromEditForm();
     
+    if (!config.nhiCredentialId) {
+      showStatus('Please select an NHI credential (hosts are derived from the credential).');
+      return;
+    }
+    
     // Templates are now collected from the form rows, so no need to preserve from original
     
     // If confirmedHosts are not parsed from fabricHost input, preserve from original
     if ((!config.confirmedHosts || config.confirmedHosts.length === 0) && 
         originalConfigData && originalConfigData.confirmedHosts) {
       config.confirmedHosts = originalConfigData.confirmedHosts;
+    }
+    if ((!config.confirmedHosts || config.confirmedHosts.length === 0) &&
+        originalConfigData && originalConfigData.fabricHost) {
+      const hosts = originalConfigData.fabricHost.split(/\s+/).filter(h => h.trim()).map(hostStr => {
+        const parts = hostStr.split(':');
+        return {
+          host: parts[0],
+          port: parts.length > 1 ? parts[1] : undefined
+        };
+      });
+      if (hosts.length > 0) {
+        config.confirmedHosts = hosts;
+      }
+    }
+    
+    // Validate hosts AFTER fallback logic - must have at least one host to save
+    if (!config.confirmedHosts || !Array.isArray(config.confirmedHosts) || config.confirmedHosts.length === 0) {
+      showStatus('Selected NHI credential does not have any hosts. Please refresh tokens before saving.');
+      return;
     }
     
     const payload = {
@@ -5472,7 +5656,7 @@ function showNewConfigView() {
   if (title) title.textContent = 'New Configuration';
   
   // Clear form
-  const inputs = ['editConfigName', 'editFabricHost', 'editNewHostname', 'editChgPass', 'editSshWaitTime'];
+  const inputs = ['editConfigName', 'editNewHostname', 'editChgPass', 'editSshWaitTime'];
   inputs.forEach(id => {
     const input = el(id);
     if (input) input.value = '';
@@ -5521,10 +5705,6 @@ function showNewConfigView() {
         await loadSelectedNhiCredentialForEdit();
       } else {
         // Clear hosts if no credential selected
-        const editFabricHostInput = el('editFabricHost');
-        if (editFabricHostInput) {
-          editFabricHostInput.value = '';
-        }
         const editFabricHostChips = el('editFabricHostChips');
         if (editFabricHostChips) {
           editFabricHostChips.innerHTML = '';
@@ -5594,7 +5774,7 @@ function cancelEditConfig() {
   showConfigsListView();
   
   // Clear form
-  const inputs = ['editConfigName', 'editFabricHost', 'editNewHostname', 'editChgPass', 'editSshWaitTime'];
+  const inputs = ['editConfigName', 'editNewHostname', 'editChgPass', 'editSshWaitTime'];
   inputs.forEach(id => {
     const input = el(id);
     if (input) input.value = '';
@@ -6430,6 +6610,7 @@ async function handleRunButton() {
     }
     return;
   }
+  logHostBatches(hosts, 'Manual Run');
   
   runBtn = runBtn || el('btnInstallSelected');
   if (runBtn) runBtn.disabled = true;
@@ -6510,88 +6691,140 @@ async function handleRunButton() {
     
     // If we need to create templates, run preparation steps first
     if (templatesToCreate.length > 0) {
-      // Execute preparation steps (5-20%)
-      updateRunProgress(7, 'Executing preparation steps...');
+      // Execute preparation steps - each host processes independently
+      updateRunProgress(7, 'Executing preparation steps on all hosts...');
+      logMsg('Executing preparation steps on all hosts (each host processes independently)...');
       
-      // Refresh repositories
-      updateRunProgress(9, 'Refreshing repositories...');
-      logMsg('Refreshing repositories...');
-      await executeOnAllHosts('Refresh Repositories', async (fabric_host) => {
-        const res = await api('/repo/refresh', { method: 'POST', params: { fabric_host } });
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      });
-      
-      // Uninstall workspaces (reset)
-      updateRunProgress(11, 'Uninstalling workspaces...');
-      logMsg('Uninstalling workspaces...');
-      await executeOnAllHosts('Uninstall Workspaces', async (fabric_host) => {
-        const res = await api('/runtime/reset', { method: 'POST', params: { fabric_host } });
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      });
-      
-      // Remove workspaces (batch delete)
-      updateRunProgress(13, 'Removing workspaces...');
-      logMsg('Removing workspaces...');
-      await executeOnAllHosts('Remove Workspaces', async (fabric_host) => {
-        const res = await api('/model/fabric/batch', { method: 'DELETE', params: { fabric_host } });
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      });
-      
-      // Change hostname (if provided)
       const hostnameBase = el('newHostname').value.trim();
-      if (hostnameBase) {
-        updateRunProgress(15, 'Changing hostnames...');
-        // Check for running tasks before changing hostname
-        await waitForNoRunningTasks(hosts, 'Change Hostname');
-        const hostnamePromises = hosts.map(async ({host}, index) => {
+      const new_password = el('chgPass').value.trim();
+      const username = 'guest';
+      
+      // Process each host independently through all stages
+      const hostPromises = hosts.map(async ({host}, index) => {
+        try {
+          // Stage 1: Refresh repositories (async)
+          logMsg(`[${host}] Initiating repository refresh...`);
+          const refreshRes = await api('/repo/refresh', { method: 'POST', params: { fabric_host: host } });
+          if (!refreshRes.ok) throw new Error(`Refresh initiation failed: HTTP ${refreshRes.status}`);
+          
+          // Wait for refresh tasks to complete (poll every 2 seconds)
+          const refreshWait = await waitForTasksComplete(host, 15 * 60 * 1000, 'repository refresh', 2000);
+          if (!refreshWait.success) throw new Error(`Refresh tasks failed: ${refreshWait.error || 'unknown error'}`);
+          
+          // Check for errors after refresh
           try {
+            const errorRes = await api('/tasks/errors', { 
+              params: { fabric_host: host, limit: 20 },
+              timeout: 15 * 60 * 1000
+            });
+            if (errorRes.ok) {
+              const errorData = await errorRes.json();
+              if (errorData.errors && errorData.errors.length > 0) {
+                logMsg(`[${host}] Warning: Found ${errorData.errors.length} error(s) after refresh`);
+              }
+            }
+          } catch (e) {
+            logMsg(`[${host}] Could not check for errors after refresh: ${e.message || e}`);
+          }
+          
+          // Stage 2: Uninstall workspaces (reset) (async)
+          logMsg(`[${host}] Initiating workspace uninstall...`);
+          const resetRes = await api('/runtime/reset', { method: 'POST', params: { fabric_host: host } });
+          if (!resetRes.ok) throw new Error(`Uninstall initiation failed: HTTP ${resetRes.status}`);
+          
+          // Wait for reset tasks to complete (poll every 2 seconds)
+          const resetWait = await waitForTasksComplete(host, 15 * 60 * 1000, 'workspace uninstall', 2000);
+          if (!resetWait.success) throw new Error(`Uninstall tasks failed: ${resetWait.error || 'unknown error'}`);
+          
+          // Check for errors after reset
+          try {
+            const errorRes = await api('/tasks/errors', { 
+              params: { fabric_host: host, limit: 20 },
+              timeout: 15 * 60 * 1000
+            });
+            if (errorRes.ok) {
+              const errorData = await errorRes.json();
+              if (errorData.errors && errorData.errors.length > 0) {
+                logMsg(`[${host}] Warning: Found ${errorData.errors.length} error(s) after uninstall`);
+              }
+            }
+          } catch (e) {
+            logMsg(`[${host}] Could not check for errors after uninstall: ${e.message || e}`);
+          }
+          
+          // Stage 3: Remove workspaces (batch delete) (async)
+          logMsg(`[${host}] Initiating workspace removal...`);
+          const deleteRes = await api('/model/fabric/batch', { method: 'DELETE', params: { fabric_host: host } });
+          if (!deleteRes.ok) throw new Error(`Remove initiation failed: HTTP ${deleteRes.status}`);
+          
+          // Wait for delete tasks to complete (poll every 2 seconds)
+          const deleteWait = await waitForTasksComplete(host, 15 * 60 * 1000, 'workspace removal', 2000);
+          if (!deleteWait.success) throw new Error(`Remove tasks failed: ${deleteWait.error || 'unknown error'}`);
+          
+          // Check for errors after delete
+          try {
+            const errorRes = await api('/tasks/errors', { 
+              params: { fabric_host: host, limit: 20 },
+              timeout: 15 * 60 * 1000
+            });
+            if (errorRes.ok) {
+              const errorData = await errorRes.json();
+              if (errorData.errors && errorData.errors.length > 0) {
+                logMsg(`[${host}] Warning: Found ${errorData.errors.length} error(s) after removal`);
+              }
+            }
+          } catch (e) {
+            logMsg(`[${host}] Could not check for errors after removal: ${e.message || e}`);
+          }
+          
+          // Stage 4: Change hostname (if provided)
+      if (hostnameBase) {
             const hostname = hostnameBase + (index + 1);
-            const res = await api('/system/hostname', {
+            logMsg(`[${host}] Changing hostname to ${hostname}...`);
+            const hostnameRes = await api('/system/hostname', {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({ fabric_host: host, hostname })
             });
-            if (!res.ok) throw new Error(`HTTP ${res.status}`);
+            if (!hostnameRes.ok) throw new Error(`Hostname change failed: HTTP ${hostnameRes.status}`);
             logMsg(`Hostname changed to ${hostname} for ${host}`);
-          } catch (error) {
-            logMsg(`Change hostname failed on ${host}: ${error.message || error}`);
-          }
-        });
-        await Promise.all(hostnamePromises);
       }
       
-      // Change password (if provided)
-      const new_password = el('chgPass').value.trim();
+          // Stage 5: Change password (if provided)
       if (new_password) {
-        updateRunProgress(17, 'Changing guest user password...');
-        const username = 'guest';
-        await executeOnAllHosts('Change password', async (fabric_host) => {
-          const res = await api('/user/password', {
+            logMsg(`[${host}] Changing guest user password...`);
+            const passwordRes = await api('/user/password', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ fabric_host, username, new_password })
+              body: JSON.stringify({ fabric_host: host, username, new_password })
           });
-          if (!res.ok) {
-            let errorMessage = `HTTP ${res.status}`;
+            if (!passwordRes.ok) {
+              let errorMessage = `HTTP ${passwordRes.status}`;
             try {
-              const errorData = await res.json();
+                const errorData = await passwordRes.json();
               errorMessage = errorData.detail || errorData.message || errorMessage;
             } catch (e) {
-              // If JSON parsing fails, try to get text
-              try {
-                const errorText = await res.text();
-                if (errorText) {
-                  errorMessage = errorText;
-                }
-              } catch (e2) {
-                // Use default error message
+                try {
+                  const errorText = await passwordRes.text();
+                  if (errorText) errorMessage = errorText;
+                } catch (e2) {}
               }
+              throw new Error(`Password change failed: ${errorMessage}`);
             }
-            logMsg(`Password change error on ${fabric_host}: ${errorMessage}`);
-            throw new Error(errorMessage);
+            logMsg(`[${host}] Password changed successfully`);
           }
-        });
-      }
+          
+          logMsg(`[${host}] Preparation steps completed successfully`);
+          return { host, success: true };
+        } catch (error) {
+          logMsg(`[${host}] Preparation steps failed: ${error.message || error}`);
+          failedHosts.add(host);
+          return { host, success: false, error: error.message || error };
+        }
+      });
+      
+      // Wait for all hosts to complete preparation steps
+      await Promise.all(hostPromises);
       
       // Add templates to create to the templates array
       updateRunProgress(20, 'Preparing templates...');
@@ -6717,8 +6950,8 @@ async function handleRunButton() {
             });
             logMsg(`Template located on ${host}`);
 
-            // 2) create fabric
-            logMsg(`Creating fabric ${t.template_name} v${t.version} on ${host} (template_id: ${template_id})`);
+            // 2) create fabric (async)
+            logMsg(`[${host}] Initiating fabric creation for ${t.template_name} v${t.version} (template_id: ${template_id})`);
             
             res = await api('/model/fabric', {
               method: 'POST',
@@ -6729,6 +6962,7 @@ async function handleRunButton() {
                 template_name: t.template_name,
                 version: t.version,
               }),
+              timeout: 3 * 60 * 1000, // 3 minutes timeout for fabric creation request
             });
             
             if (!res.ok) {
@@ -6743,50 +6977,35 @@ async function handleRunButton() {
               } catch (e) {
                 // Not JSON, use errorText as is
               }
-              const errorMsg = `Failed to create fabric '${t.template_name}' v${t.version} on ${host}: ${errorDetail}`;
+              const errorMsg = `Failed to initiate fabric creation '${t.template_name}' v${t.version} on ${host}: ${errorDetail}`;
               showStatus(errorMsg);
               t.status = 'err';
               t.createProgress = 0;
               renderTemplates();
-              return {host, success: false, error: errorDetail || 'Create failed'};
+              return {host, success: false, error: errorDetail || 'Create initiation failed'};
             }
             
             const responseData = await res.json().catch(() => ({}));
-            logMsg(`Fabric creation request submitted on ${host} for ${t.template_name} v${t.version} (template_id: ${template_id})`);
+            logMsg(`[${host}] Fabric creation task initiated for ${t.template_name} v${t.version} (template_id: ${template_id})`);
 
-            // 3) live poll running task count until zero or timeout for creation
+            // 3) Wait for creation tasks to complete (polls every 15 seconds)
             const createStart = Date.now();
-            const timeoutMs = 15 * 60 * 1000; // 15 minutes
             t.createProgress = 5; // Start with 5% to show immediate feedback
             renderTemplates();
             
-            const progressInterval = setInterval(() => {
-              const elapsed = Date.now() - createStart;
-              const pct = Math.min(95, Math.max(5, Math.floor((elapsed / timeoutMs) * 100)));
-              if (t.createProgress !== pct) {
-                t.createProgress = pct;
+            const createWait = await waitForTasksComplete(host, 15 * 60 * 1000, `fabric creation for ${t.template_name}`);
+            
+            if (!createWait.success) {
+              const errorMsg = `Template '${t.template_name}' v${t.version} creation failed on ${host}: ${createWait.error || 'unknown error'}`;
+              showStatus(errorMsg);
+              t.status = 'err';
+              t.createProgress = 0;
                 renderTemplates();
-              }
-            }, 500); // Update every 500ms for smoother animation
-
-            while (Date.now() - createStart < timeoutMs) {
-              const sres = await api('/tasks/status', { params: { fabric_host: host } });
-              if (!sres.ok) { clearInterval(progressInterval); break; }
-              const sdata = await sres.json();
-              const cnt = sdata.running_count ?? 0;
-              if (cnt === 0) { clearInterval(progressInterval); break; }
-              await new Promise(r => setTimeout(r, 2000));
+              return {host, success: false, error: createWait.error || 'Creation tasks failed'};
             }
-            clearInterval(progressInterval);
 
-            // mark status
-            const done = await api('/tasks/status', { params: { fabric_host: host } });
-            if (done.ok) {
-              const d = await done.json();
-              if ((d.running_count ?? 0) === 0) {
                 // Check for task errors after tasks complete
                 try {
-                  // Capture timestamp and template name for filtering
                   const createStartTime = new Date(createStart).toISOString();
                   const errorsRes = await api('/tasks/errors', { 
                     params: { 
@@ -6794,7 +7013,8 @@ async function handleRunButton() {
                       limit: 20,
                       fabric_name: t.template_name,
                       since_timestamp: createStartTime
-                    } 
+                },
+                timeout: 15 * 60 * 1000
                   });
                   if (errorsRes.ok) {
                     const errorsData = await errorsRes.json();
@@ -6809,7 +7029,21 @@ async function handleRunButton() {
                     }
                   }
                 } catch (error) {
+              logMsg(`[${host}] Could not check for errors after fabric creation: ${error.message || error}`);
                   // Continue anyway - this is not critical
+                }
+                
+                // Wait for fabric to appear in the fabric list before declaring success
+                logMsg(`[${host}] Waiting for fabric '${t.template_name}' v${t.version} to appear...`);
+                const fabricWait = await waitForFabricToAppear(host, t.template_name, t.version, 2 * 60 * 1000, 3000);
+                
+                if (!fabricWait.success) {
+                  const errorMsg = `Template '${t.template_name}' v${t.version} creation tasks completed on ${host}, but fabric did not appear: ${fabricWait.error || 'unknown error'}`;
+                  showStatus(errorMsg);
+                  t.status = 'err';
+                  t.createProgress = 0;
+                  renderTemplates();
+                  return {host, success: false, error: fabricWait.error || 'Fabric did not appear after creation'};
                 }
                 
                 // showStatus already calls logMsg internally, so don't duplicate
@@ -6818,23 +7052,6 @@ async function handleRunButton() {
                 t.createProgress = 100;
                 renderTemplates();
                 return {host, success: true};
-              } else {
-                const errorMsg = `Template '${t.template_name}' v${t.version} creation timeout on ${host} - tasks still running`;
-                showStatus(errorMsg);
-                t.status = 'err';
-                t.createProgress = 0;
-                renderTemplates();
-                return {host, success: false, error: 'Timeout - tasks still running'};
-              }
-            } else {
-              const errorText = await done.text().catch(() => 'Unknown error');
-              const errorMsg = `Failed to check task status on ${host} for '${t.template_name}' v${t.version}: ${errorText}`;
-              showStatus(errorMsg);
-              t.status = 'err';
-              t.createProgress = 0;
-              renderTemplates();
-              return {host, success: false, error: 'Status check failed'};
-            }
           } catch (error) {
             const errorMsg = `Error processing template '${rowTemplate.template_name}' v${rowTemplate.version} on ${host}: ${error.message || error}`;
             showStatus(errorMsg);
@@ -7141,62 +7358,42 @@ async function handleRunButton() {
           renderTemplates();
           return {host, success: false, error: `Install failed: HTTP ${res.status}`};
         }
-        logMsg(`Workspace installation requested successfully on ${host}`);
+        logMsg(`[${host}] Workspace installation task initiated successfully`);
         
-        // Progress tracking with 15 minutes assumption
-        const timeoutMs = 15 * 60 * 1000; // 15 minutes
+        // Wait for installation tasks to complete (polls every 15 seconds)
         target.installProgress = 5; // Start with 5% to show immediate feedback
         renderTemplates();
         
-        const progressInterval = setInterval(() => {
-          const elapsed = Date.now() - installStart;
-          const installPct = Math.min(95, Math.max(5, Math.floor((elapsed / timeoutMs) * 100)));
-          if (target.installProgress !== installPct) {
-            target.installProgress = installPct;
+        // Wait for installation tasks to appear and complete (polls every 15 seconds)
+        // waitForTasksToAppear=true ensures we wait for tasks to appear before declaring success
+        const installWait = await waitForTasksComplete(host, 15 * 60 * 1000, `workspace installation for ${template_name}`, 15000, true);
+        
+        if (!installWait.success) {
+          hostProgressMap.set(host, 100); // Mark as done (failed)
+          target.status = 'err';
+          target.installProgress = 0;
             renderTemplates();
-          }
-          // Track individual host progress
-          hostProgressMap.set(host, installPct);
-          // Calculate overall progress based on all hosts
-          const totalProgress = Array.from(hostProgressMap.values()).reduce((sum, pct) => sum + pct, 0);
-          const avgProgress = totalProgress / totalHosts;
-          const overallProgress = 70 + (avgProgress / 100) * 25; // 70-95% range
-          updateRunProgress(Math.min(95, overallProgress), `Installing on ${hosts.length} host(s)... (${Math.round(avgProgress)}%)`);
-        }, 500); // Update every 500ms for smoother animation
-        
-        // poll until running tasks are zero
-        const start = Date.now();
-        while (Date.now() - start < timeoutMs) {
-          const sres = await api('/tasks/status', { params: { fabric_host: host } });
-          if (!sres.ok) { clearInterval(progressInterval); break; }
-          const sdata = await sres.json();
-          const cnt = sdata.running_count ?? 0;
-          if (cnt === 0) { clearInterval(progressInterval); break; }
-          await new Promise(r => setTimeout(r, 2000));
+          const completedCount = Array.from(hostProgressMap.values()).filter(p => p === 100).length;
+          updateRunProgress(70 + (completedCount / totalHosts) * 25, `Completed on ${completedCount}/${totalHosts} host(s)`);
+          return {host, success: false, error: installWait.error || 'Installation tasks failed'};
         }
-        clearInterval(progressInterval);
         
-        const done = await api('/tasks/status', { params: { fabric_host: host } });
-        hostProgressMap.set(host, 100); // Mark as completed
-        if (done.ok) {
-          const d = await done.json();
-          if ((d.running_count ?? 0) === 0) {
-            // Check for task errors after tasks complete
-            try {
-              // Capture timestamp and template name for filtering
+        // Check for task errors after installation tasks complete
+        try {
               const installStartTime = new Date(installStart).toISOString();
               const errorsRes = await api('/tasks/errors', { 
                 params: { 
                   fabric_host: host, 
-                  limit: 20,
+              limit: 50,
                   fabric_name: template_name,
                   since_timestamp: installStartTime
-                } 
+            },
+            timeout: 15 * 60 * 1000
               });
               if (errorsRes.ok) {
                 const errorsData = await errorsRes.json();
                 if (errorsData.errors && errorsData.errors.length > 0) {
-                  const errorMessages = errorsData.errors.map(err => `Task '${err.task_name}': ${err.error}`).join('; ');
+              const errorMessages = errorsData.errors.map(err => err.error).join('; ');
                   const errorMsg = `Workspace '${template_name}' v${version} installation completed on ${host} but with errors: ${errorMessages}`;
                   showStatus(errorMsg);
                   target.status = 'err';
@@ -7208,35 +7405,39 @@ async function handleRunButton() {
                 }
               }
             } catch (error) {
+          logMsg(`[${host}] Could not check for errors after installation: ${error.message || error}`);
               // Continue anyway - this is not critical
             }
             
-            logMsg(`Installed successfully on ${host}`);
+        hostProgressMap.set(host, 100);
             target.status = 'installed';
             target.installProgress = 100;
             renderTemplates();
+        logMsg(`[${host}] Workspace '${template_name}' v${version} installed successfully`);
             const completedCount = Array.from(hostProgressMap.values()).filter(p => p === 100).length;
             updateRunProgress(70 + (completedCount / totalHosts) * 25, `Completed on ${completedCount}/${totalHosts} host(s)`);
             return {host, success: true};
-          } else {
-            logMsg(`Still running or timeout on ${host}`);
-            target.status = 'err';
-            target.installProgress = 0;
-            renderTemplates();
-            return {host, success: false, error: 'Timeout'};
-          }
-        }
-        target.status = 'err';
-        target.installProgress = 0;
-        renderTemplates();
-        return {host, success: false, error: 'Status check failed'};
       } catch (error) {
-        logMsg(`Error installing on ${host}: ${error.message || error}`);
+        // Extract meaningful error message
+        let errorMsg = 'Unknown error';
+        if (error && typeof error === 'object') {
+          if (error.message) {
+            errorMsg = error.message;
+          } else if (error.name === 'AbortError' || error.toString().includes('abort') || error.toString().includes('signal')) {
+            errorMsg = 'Request was aborted (timeout or connection error)';
+          } else {
+            errorMsg = error.toString();
+          }
+        } else if (error) {
+          errorMsg = String(error);
+        }
+        
+        logMsg(`Error installing on ${host}: ${errorMsg}`);
         hostProgressMap.set(host, 100); // Mark as done (error)
         target.status = 'err';
         target.installProgress = 0;
         renderTemplates();
-        return {host, success: false, error: error.message || error};
+        return {host, success: false, error: errorMsg};
       }
     });
     const results = await Promise.allSettled(installPromises);
@@ -7416,6 +7617,7 @@ async function restoreConfiguration(config) {
         nhiSelect.value = String(config.nhiCredentialId);
         
         // Automatically load the credential (no password required)
+        // Note: loadSelectedNhiCredential() already updates the session, so we don't need to do it again
         try {
           await loadSelectedNhiCredential();
           
@@ -7424,23 +7626,24 @@ async function restoreConfiguration(config) {
             currentNhiId = parseInt(config.nhiCredentialId);
           }
           
-          // Ensure session is updated with NHI credential ID
-          // This is critical for saved configurations
-          try {
-            await api('/auth/session/nhi-credential', {
-              method: 'PUT',
-              params: { nhi_credential_id: currentNhiId }
-            });
-            logMsg(`Session updated with NHI credential ID during restore: ${currentNhiId}`);
-          } catch (e) {
-            logMsg(`Warning: Failed to update session with NHI credential ID during restore: ${e.message || e}`);
-          }
+          // Check immediately if hosts are populated (populateHostsFromInput is synchronous)
+          logMsg(`After loadSelectedNhiCredential: window.validatedNhiHosts = ${window.validatedNhiHosts ? JSON.stringify(window.validatedNhiHosts.map(h => h.host)) : 'null/undefined'}`);
           
-          // Wait for credential to load and hosts to be populated (reduced from 300ms)
-          await new Promise(resolve => setTimeout(resolve, 100));
+          // Wait for credential to load and hosts to be populated
+          // Retry checking for hosts up to 10 times (1 second total)
+          let retries = 0;
+          const maxRetries = 10;
+          while (retries < maxRetries && (!window.validatedNhiHosts || window.validatedNhiHosts.length === 0)) {
+            await new Promise(resolve => setTimeout(resolve, 100));
+            retries++;
+            if (retries < maxRetries && (!window.validatedNhiHosts || window.validatedNhiHosts.length === 0)) {
+              logMsg(`Retry ${retries}: window.validatedNhiHosts = ${window.validatedNhiHosts ? JSON.stringify(window.validatedNhiHosts.map(h => h.host)) : 'null/undefined'}`);
+            }
+          }
           
           // Populate hosts from NHI credential (auto-confirmed)
           if (window.validatedNhiHosts && window.validatedNhiHosts.length > 0) {
+            logMsg(`Found ${window.validatedNhiHosts.length} host(s) in window.validatedNhiHosts after ${retries} retries`);
             // Populate validated hosts from NHI credential (but don't set confirmedHosts yet)
             validatedHosts = [...window.validatedNhiHosts];
             
@@ -7459,21 +7662,17 @@ async function restoreConfiguration(config) {
               fabricHostInput.style.cursor = 'not-allowed';
             }
             
-            // Make NHI credential input readonly
-            const fabricHostFromNhiInput = el('fabricHostFromNhi');
-            if (fabricHostFromNhiInput) {
-              const nhiHostsStr = window.validatedNhiHosts.map(({host, port}) => 
-                host + (port !== undefined ? ':' + port : '')
-              ).join(' ');
-              fabricHostFromNhiInput.value = nhiHostsStr;
-              fabricHostFromNhiInput.readOnly = true;
-              fabricHostFromNhiInput.disabled = false;
-              fabricHostFromNhiInput.style.backgroundColor = '#f5f5f7';
-              fabricHostFromNhiInput.style.cursor = 'not-allowed';
+            // Ensure hostSourceManual is NOT checked so autoConfirmHosts uses window.validatedNhiHosts
+            const hostSourceManual = el('hostSourceManual');
+            if (hostSourceManual) {
+              hostSourceManual.checked = false;
             }
             
-            // Auto-confirm hosts and acquire tokens
-            if (autoConfirmHosts()) {
+            // Directly confirm hosts from window.validatedNhiHosts since we know they're from NHI
+            if (window.validatedNhiHosts && window.validatedNhiHosts.length > 0) {
+              confirmedHosts = window.validatedNhiHosts.map(({host, port}) => ({host, port}));
+              logMsg(`Confirmed ${confirmedHosts.length} host(s) from NHI credential: ${confirmedHosts.map(h => h.host).join(', ')}`);
+              
               // Render host list (but don't show hostsListRow)
               await renderFabricHostList();
               
@@ -7489,6 +7688,18 @@ async function restoreConfiguration(config) {
               }
             } else {
               await renderFabricHostList();
+              logMsg(`Warning: No hosts found in window.validatedNhiHosts after NHI credential load. window.validatedNhiHosts = ${JSON.stringify(window.validatedNhiHosts)}`);
+              // Try to confirm from validatedHosts as fallback
+              if (validatedHosts && validatedHosts.length > 0) {
+                confirmedHosts = validatedHosts.map(({host, port}) => ({host, port}));
+                logMsg(`Fallback: Confirmed ${confirmedHosts.length} host(s) from validatedHosts: ${confirmedHosts.map(h => h.host).join(', ')}`);
+                await renderFabricHostList();
+                if (await acquireTokens()) {
+                  const addRowBtn = el('btnAddRow');
+                  if (addRowBtn) addRowBtn.disabled = false;
+                  updateCreateEnabled();
+                }
+              }
             }
           } else if (config.confirmedHosts && config.confirmedHosts.length > 0) {
             // Fallback: Use confirmed hosts from configuration if NHI credential doesn't have hosts
@@ -7767,14 +7978,11 @@ async function restoreConfiguration(config) {
                 // Set template value (removed unnecessary wait)
                 if (uniqueNames.includes(finalTemplate)) {
                   
-                  // Set template value WITHOUT triggering change events that would try to load from API
-                  // We're using cache, so we'll populate versions directly from cache
-                  templateFiltered.input.value = finalTemplate;
-                  if (templateFiltered.select) {
-                    templateFiltered.select.value = finalTemplate;
-                  }
+                  // Set template value using setValue() to ensure selectedValue is updated
+                  // This ensures getValue() will work correctly when checking if rows are filled
+                  templateFiltered.setValue(finalTemplate);
                   // Update datalist to show the value
-                  if (templateFiltered.datalist) {
+                  if (templateFiltered.updateDatalist) {
                     templateFiltered.updateDatalist();
                   }
                   
@@ -8900,6 +9108,7 @@ async function handleTrackedRunButton() {
       completeRun();
       return;
     }
+    logHostBatches(hosts, 'Tracked Run');
     
     // Now acquire tokens after hosts are loaded (critical for saved configurations)
     // Since confirmedHosts is now populated, acquireTokens() should work
@@ -9037,55 +9246,150 @@ async function handleTrackedRunButton() {
     
     // If we need to create templates, run preparation steps first
     if (templatesToCreate.length > 0) {
-      // Execute preparation steps (5-20%)
-      updateRunProgress(7, 'Executing preparation steps...');
+      // Execute preparation steps - each host processes independently
+      updateRunProgress(7, 'Executing preparation steps on all hosts...');
+      logMsg('Executing preparation steps on all hosts (each host processes independently)...');
       
-      // Refresh repositories
-      updateRunProgress(9, 'Refreshing repositories...');
-      logMsg('Refreshing repositories...');
-      await executeOnAllHosts('Refresh Repositories', async (fabric_host) => {
-        const res = await api('/repo/refresh', { method: 'POST', params: { fabric_host } });
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      });
-      
-      // Uninstall workspaces (reset)
-      updateRunProgress(11, 'Uninstalling workspaces...');
-      logMsg('Uninstalling workspaces...');
-      await executeOnAllHosts('Uninstall Workspaces', async (fabric_host) => {
-        const res = await api('/runtime/reset', { method: 'POST', params: { fabric_host } });
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      });
-      
-      // Remove workspaces (batch delete)
-      updateRunProgress(13, 'Removing workspaces...');
-      logMsg('Removing workspaces...');
-      await executeOnAllHosts('Remove Workspaces', async (fabric_host) => {
-        const res = await api('/model/fabric/batch', { method: 'DELETE', params: { fabric_host } });
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      });
-      
-      // Change hostname (if provided)
       const hostnameBase = el('newHostname').value.trim();
-      if (hostnameBase) {
-        updateRunProgress(15, 'Changing hostnames...');
-        await waitForNoRunningTasks(hosts, 'Change Hostname');
-        const hostnamePromises = hosts.map(async ({host}, index) => {
+      const new_password = el('chgPass').value.trim();
+      const username = 'guest';
+      
+      // Process each host independently through all stages
+      const hostPromises = hosts.map(async ({host}, index) => {
+        try {
+          // Stage 1: Refresh repositories (async)
+          logMsg(`[${host}] Initiating repository refresh...`);
+          const refreshRes = await api('/repo/refresh', { method: 'POST', params: { fabric_host: host }, timeout: 15 * 60 * 1000 });
+          if (!refreshRes.ok) throw new Error(`Refresh initiation failed: HTTP ${refreshRes.status}`);
+          
+          // Wait for refresh tasks to complete (poll every 2 seconds)
+          const refreshWait = await waitForTasksComplete(host, 15 * 60 * 1000, 'repository refresh', 2000);
+          if (!refreshWait.success) throw new Error(`Refresh tasks failed: ${refreshWait.error || 'unknown error'}`);
+          
+          // Check for errors after refresh
           try {
+            const errorRes = await api('/tasks/errors', { 
+              params: { fabric_host: host, limit: 20 },
+              timeout: 15 * 60 * 1000
+            });
+            if (errorRes.ok) {
+              const errorData = await errorRes.json();
+              if (errorData.errors && errorData.errors.length > 0) {
+                logMsg(`[${host}] Warning: Found ${errorData.errors.length} error(s) after refresh`);
+              }
+            }
+          } catch (e) {
+            logMsg(`[${host}] Could not check for errors after refresh: ${e.message || e}`);
+          }
+          
+          // Stage 2: Uninstall workspaces (reset) (async)
+          logMsg(`[${host}] Initiating workspace uninstall...`);
+          const resetRes = await api('/runtime/reset', { method: 'POST', params: { fabric_host: host }, timeout: 15 * 60 * 1000 });
+          if (!resetRes.ok) throw new Error(`Uninstall initiation failed: HTTP ${resetRes.status}`);
+          
+          // Wait for reset tasks to complete (poll every 2 seconds)
+          const resetWait = await waitForTasksComplete(host, 15 * 60 * 1000, 'workspace uninstall', 2000);
+          if (!resetWait.success) throw new Error(`Uninstall tasks failed: ${resetWait.error || 'unknown error'}`);
+          
+          // Check for errors after reset
+          try {
+            const errorRes = await api('/tasks/errors', { 
+              params: { fabric_host: host, limit: 20 },
+              timeout: 15 * 60 * 1000
+            });
+            if (errorRes.ok) {
+              const errorData = await errorRes.json();
+              if (errorData.errors && errorData.errors.length > 0) {
+                logMsg(`[${host}] Warning: Found ${errorData.errors.length} error(s) after uninstall`);
+              }
+            }
+          } catch (e) {
+            logMsg(`[${host}] Could not check for errors after uninstall: ${e.message || e}`);
+          }
+          
+          // Stage 3: Remove workspaces (batch delete) (async)
+          logMsg(`[${host}] Initiating workspace removal...`);
+          const deleteRes = await api('/model/fabric/batch', { method: 'DELETE', params: { fabric_host: host }, timeout: 15 * 60 * 1000 });
+          if (!deleteRes.ok) throw new Error(`Remove initiation failed: HTTP ${deleteRes.status}`);
+          
+          // Wait for delete tasks to complete (poll every 2 seconds)
+          const deleteWait = await waitForTasksComplete(host, 15 * 60 * 1000, 'workspace removal', 2000);
+          if (!deleteWait.success) throw new Error(`Remove tasks failed: ${deleteWait.error || 'unknown error'}`);
+          
+          // Check for errors after delete
+          try {
+            const errorRes = await api('/tasks/errors', { 
+              params: { fabric_host: host, limit: 20 },
+              timeout: 15 * 60 * 1000
+            });
+            if (errorRes.ok) {
+              const errorData = await errorRes.json();
+              if (errorData.errors && errorData.errors.length > 0) {
+                logMsg(`[${host}] Warning: Found ${errorData.errors.length} error(s) after removal`);
+              }
+            }
+          } catch (e) {
+            logMsg(`[${host}] Could not check for errors after removal: ${e.message || e}`);
+          }
+          
+          // Stage 4: Change hostname (if provided)
+      if (hostnameBase) {
             const hostname = hostnameBase + (index + 1);
-            const res = await api('/system/hostname', {
+            logMsg(`[${host}] Changing hostname to ${hostname}...`);
+            const hostnameRes = await api('/system/hostname', {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ fabric_host: host, hostname })
+              body: JSON.stringify({ fabric_host: host, hostname }),
+              timeout: 15 * 60 * 1000
             });
-            if (!res.ok) throw new Error(`HTTP ${res.status}`);
+            if (!hostnameRes.ok) throw new Error(`Hostname change failed: HTTP ${hostnameRes.status}`);
             logMsg(`Hostname changed to ${hostname} for ${host}`);
             executionDetails.hostname_changes.push({
               host: host,
               new_hostname: hostname,
               success: true
             });
-          } catch (error) {
-            logMsg(`Change hostname failed on ${host}: ${error.message || error}`);
+          }
+          
+          // Stage 5: Change password (if provided)
+      if (new_password) {
+            logMsg(`[${host}] Changing guest user password...`);
+            const passwordRes = await api('/user/password', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ fabric_host: host, username, new_password }),
+              timeout: 15 * 60 * 1000
+          });
+            if (!passwordRes.ok) {
+              let errorMessage = `HTTP ${passwordRes.status}`;
+            try {
+                const errorData = await passwordRes.json();
+              errorMessage = errorData.detail || errorData.message || errorMessage;
+            } catch (e) {
+                try {
+                  const errorText = await passwordRes.text();
+                  if (errorText) errorMessage = errorText;
+                } catch (e2) {}
+              }
+              throw new Error(`Password change failed: ${errorMessage}`);
+            }
+            logMsg(`[${host}] Password changed successfully`);
+            executionDetails.password_changes.push({
+              host: host,
+              username: 'guest',
+              success: true,
+              error: null
+            });
+          }
+          
+          logMsg(`[${host}] Preparation steps completed successfully`);
+          return { host, success: true };
+        } catch (error) {
+          logMsg(`[${host}] Preparation steps failed: ${error.message || error}`);
+          failedHosts.add(host);
+          
+          // Track failures in execution details
+          if (hostnameBase && error.message && error.message.includes('Hostname')) {
             executionDetails.hostname_changes.push({
               host: host,
               new_hostname: hostnameBase + (index + 1),
@@ -9093,53 +9397,21 @@ async function handleTrackedRunButton() {
               error: error.message || String(error)
             });
           }
-        });
-        await Promise.all(hostnamePromises);
-      }
-      
-      // Change password (if provided)
-      const new_password = el('chgPass').value.trim();
-      if (new_password) {
-        updateRunProgress(17, 'Changing guest user password...');
-        logMsg('Changing guest user password...');
-        const passwordChangeResults = await executeOnAllHosts('Change password', async (fabric_host) => {
-          const res = await api('/user/password', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ fabric_host, username: 'guest', new_password })
-          });
-          if (!res.ok) {
-            let errorMessage = `HTTP ${res.status}`;
-            try {
-              const errorData = await res.json();
-              errorMessage = errorData.detail || errorData.message || errorMessage;
-            } catch (e) {
-              // If JSON parsing fails, try to get text
-              try {
-                const errorText = await res.text();
-                if (errorText) {
-                  errorMessage = errorText;
-                }
-              } catch (e2) {
-                // Use default error message
-              }
-            }
-            logMsg(`Password change error on ${fabric_host}: ${errorMessage}`);
-            throw new Error(errorMessage);
-          }
-        });
-        // Track password change results
-        if (passwordChangeResults) {
-          passwordChangeResults.forEach(result => {
+          if (new_password && error.message && error.message.includes('Password')) {
             executionDetails.password_changes.push({
-              host: result.host,
+              host: host,
               username: 'guest',
-              success: result.success || false,
-              error: result.error || null
-            });
+              success: false,
+              error: error.message || String(error)
           });
         }
+          
+          return { host, success: false, error: error.message || error };
       }
+      });
+      
+      // Wait for all hosts to complete preparation steps
+      await Promise.all(hostPromises);
       
       // Add templates to create to the templates array
       updateRunProgress(20, 'Preparing templates...');
@@ -9284,6 +9556,7 @@ async function handleTrackedRunButton() {
                 template_name: t.template_name,
                 version: t.version,
               }),
+              timeout: 3 * 60 * 1000, // 3 minutes timeout for fabric creation
             });
             
             if (!res.ok) {
@@ -9379,6 +9652,28 @@ async function handleTrackedRunButton() {
                     }
                   }
                 } catch (error) {}
+                
+                // Wait for fabric to appear in the fabric list before declaring success
+                logMsg(`[${host}] Waiting for fabric '${t.template_name}' v${t.version} to appear...`);
+                const fabricWait = await waitForFabricToAppear(host, t.template_name, t.version, 2 * 60 * 1000, 3000);
+                
+                if (!fabricWait.success) {
+                  const errorMsg = `Template '${t.template_name}' v${t.version} creation tasks completed on ${host}, but fabric did not appear: ${fabricWait.error || 'unknown error'}`;
+                  showStatus(errorMsg);
+                  t.status = 'err';
+                  t.createProgress = 0;
+                  renderTemplates();
+                  const creationDuration = (Date.now() - creationStart) / 1000;
+                  executionDetails.fabric_creations.push({
+                    host: host,
+                    template_name: t.template_name,
+                    version: t.version,
+                    success: false,
+                    duration_seconds: creationDuration,
+                    errors: [fabricWait.error || 'Fabric did not appear after creation']
+                  });
+                  return {host, success: false, error: fabricWait.error || 'Fabric did not appear after creation'};
+                }
                 
                 // showStatus already calls logMsg internally, so don't duplicate
                 showStatus(`Template '${t.template_name}' v${t.version} created successfully on ${host}`);
@@ -9918,6 +10213,7 @@ async function handleTrackedRunButton() {
     // Install on all hosts in parallel
     const installPromises = installTargets.map(async ({target, host}, hostIdx) => {
       const installStart = Date.now();
+      let installDuration;
       try {
         logMsg(`Sending install request to ${host} for ${template_name} v${version}`);
         
@@ -9939,7 +10235,7 @@ async function handleTrackedRunButton() {
           target.status = 'err';
           target.installProgress = 0;
           renderTemplates();
-          const installDuration = (Date.now() - installStart) / 1000;
+          installDuration = (Date.now() - installStart) / 1000;
           executionDetails.installations.push({
             host: host,
             template_name: template_name,
@@ -9950,65 +10246,60 @@ async function handleTrackedRunButton() {
           });
           return {host, success: false, error: `Install failed: HTTP ${res.status}`};
         }
-        logMsg(`Workspace installation requested successfully on ${host}`);
+        logMsg(`[${host}] Workspace installation task initiated successfully`);
         
-        const timeoutMs = 15 * 60 * 1000;
+        // Wait for installation tasks to complete (polls every 15 seconds)
         target.installProgress = 5;
         renderTemplates();
         
-        const progressInterval = setInterval(() => {
-          const elapsed = Date.now() - installStart;
-          const installPct = Math.min(95, Math.max(5, Math.floor((elapsed / timeoutMs) * 100)));
-          if (target.installProgress !== installPct) {
-            target.installProgress = installPct;
+        // Wait for installation tasks to appear and complete (polls every 15 seconds)
+        // waitForTasksToAppear=true ensures we wait for tasks to appear before declaring success
+        const installWait = await waitForTasksComplete(host, 15 * 60 * 1000, `workspace installation for ${template_name}`, 15000, true);
+        
+        if (!installWait.success) {
+          hostProgressMap.set(host, 100);
+          target.status = 'err';
+          target.installProgress = 0;
             renderTemplates();
-          }
-          hostProgressMap.set(host, installPct);
-          const totalProgress = Array.from(hostProgressMap.values()).reduce((sum, pct) => sum + pct, 0);
-          const avgProgress = totalProgress / totalHosts;
-          const overallProgress = 70 + (avgProgress / 100) * 25;
-          updateRunProgress(Math.min(95, overallProgress), `Installing on ${hosts.length} host(s)... (${Math.round(avgProgress)}%)`);
-        }, 500);
-        
-        const start = Date.now();
-        while (Date.now() - start < timeoutMs) {
-          const sres = await api('/tasks/status', { params: { fabric_host: host } });
-          if (!sres.ok) { clearInterval(progressInterval); break; }
-          const sdata = await sres.json();
-          const cnt = sdata.running_count ?? 0;
-          if (cnt === 0) { clearInterval(progressInterval); break; }
-          await new Promise(r => setTimeout(r, 2000));
+          const completedCount = Array.from(hostProgressMap.values()).filter(p => p === 100).length;
+          updateRunProgress(70 + (completedCount / totalHosts) * 25, `Completed on ${completedCount}/${totalHosts} host(s)`);
+          installDuration = (Date.now() - installStart) / 1000;
+          executionDetails.installations.push({
+            host: host,
+            template_name: template_name,
+            version: version,
+            success: false,
+            duration_seconds: installDuration,
+            errors: [installWait.error || 'Installation tasks failed']
+          });
+          return {host, success: false, error: installWait.error || 'Installation tasks failed'};
         }
-        clearInterval(progressInterval);
         
-        const done = await api('/tasks/status', { params: { fabric_host: host } });
-        hostProgressMap.set(host, 100);
-        if (done.ok) {
-          const d = await done.json();
-          if ((d.running_count ?? 0) === 0) {
+        // Check for task errors after installation tasks complete
             try {
               const installStartTime = new Date(installStart).toISOString();
               const errorsRes = await api('/tasks/errors', { 
                 params: { 
                   fabric_host: host, 
-                  limit: 20,
+              limit: 50,
                   fabric_name: template_name,
                   since_timestamp: installStartTime
-                } 
+            },
+            timeout: 15 * 60 * 1000
               });
               if (errorsRes.ok) {
                 const errorsData = await errorsRes.json();
                 if (errorsData.errors && errorsData.errors.length > 0) {
-                  const errorMessages = errorsData.errors.map(err => `Task '${err.task_name}': ${err.error}`).join('; ');
+              const errorMessages = errorsData.errors.map(err => err.error).join('; ');
                   const errorMsg = `Workspace '${template_name}' v${version} installation completed on ${host} but with errors: ${errorMessages}`;
                   showStatus(errorMsg);
-                  logMsg(errorMsg);
+              logMsg(`[${host}] ${errorMsg}`);
                   target.status = 'err';
                   target.installProgress = 0;
                   renderTemplates();
                   const completedCount = Array.from(hostProgressMap.values()).filter(p => p === 100).length;
                   updateRunProgress(70 + (completedCount / totalHosts) * 25, `Completed on ${completedCount}/${totalHosts} host(s)`);
-                  const installDuration = (Date.now() - installStart) / 1000;
+              installDuration = (Date.now() - installStart) / 1000;
                   executionDetails.installations.push({
                     host: host,
                     template_name: template_name,
@@ -10020,15 +10311,19 @@ async function handleTrackedRunButton() {
                   return {host, success: false, error: errorMessages};
                 }
               }
-            } catch (error) {}
+        } catch (error) {
+          logMsg(`[${host}] Could not check for errors after installation: ${error.message || error}`);
+          // Continue anyway - this is not critical
+        }
             
-            logMsg(`Installed successfully on ${host}`);
+        hostProgressMap.set(host, 100);
             target.status = 'installed';
             target.installProgress = 100;
             renderTemplates();
+        logMsg(`[${host}] Workspace '${template_name}' v${version} installed successfully`);
             const completedCount = Array.from(hostProgressMap.values()).filter(p => p === 100).length;
             updateRunProgress(70 + (completedCount / totalHosts) * 25, `Completed on ${completedCount}/${totalHosts} host(s)`);
-            const installDuration = (Date.now() - installStart) / 1000;
+        installDuration = (Date.now() - installStart) / 1000;
             executionDetails.installations.push({
               host: host,
               template_name: template_name,
@@ -10037,52 +10332,41 @@ async function handleTrackedRunButton() {
               duration_seconds: installDuration
             });
             return {host, success: true};
-          } else {
-            logMsg(`Still running or timeout on ${host}`);
-            target.status = 'err';
-            target.installProgress = 0;
-            renderTemplates();
-            const installDuration = (Date.now() - installStart) / 1000;
-            executionDetails.installations.push({
-              host: host,
-              template_name: template_name,
-              version: version,
-              success: false,
-              duration_seconds: installDuration,
-              errors: ['Timeout']
-            });
-            return {host, success: false, error: 'Timeout'};
-          }
-        }
-        target.status = 'err';
-        target.installProgress = 0;
-        renderTemplates();
-        const installDuration = (Date.now() - installStart) / 1000;
-        executionDetails.installations.push({
-          host: host,
-          template_name: template_name,
-          version: version,
-          success: false,
-          duration_seconds: installDuration,
-          errors: ['Status check failed']
-        });
-        return {host, success: false, error: 'Status check failed'};
       } catch (error) {
-        logMsg(`Error installing on ${host}: ${error.message || error}`);
+        // Extract meaningful error message
+        let errorMsg = 'Unknown error';
+        if (error && typeof error === 'object') {
+          if (error.message) {
+            errorMsg = error.message;
+          } else if (error.name === 'AbortError' || error.toString().includes('abort') || error.toString().includes('signal')) {
+            errorMsg = 'Request was aborted (timeout or connection error during polling)';
+          } else {
+            errorMsg = error.toString();
+          }
+        } else if (error) {
+          errorMsg = String(error);
+        }
+        
+        // Check if it's the raw browser abort message and provide better context
+        if (errorMsg.includes('signal is aborted') || errorMsg.includes('aborted without reason')) {
+          errorMsg = 'Connection was interrupted during installation polling (timeout or network error)';
+        }
+        
+        logMsg(`Error installing on ${host}: ${errorMsg}`);
         hostProgressMap.set(host, 100);
         target.status = 'err';
         target.installProgress = 0;
         renderTemplates();
-        const installDuration = (Date.now() - installStart) / 1000;
+        installDuration = (Date.now() - installStart) / 1000;
         executionDetails.installations.push({
           host: host,
           template_name: template_name,
           version: version,
           success: false,
           duration_seconds: installDuration,
-          errors: [error.message || String(error)]
+          errors: [errorMsg]
         });
-        return {host, success: false, error: error.message || error};
+        return {host, success: false, error: errorMsg};
       }
     });
 
@@ -10594,11 +10878,11 @@ async function editNhi(nhiId) {
       clientSecretInput.placeholder = 'Leave empty to keep existing, or enter new secret';
     }
     
-    // Populate fabric hosts field with hosts that have tokens
+    // Populate fabric hosts field with hosts that have tokens (preserve order from backend)
     const fabricHostsInput = el('nhiFabricHosts');
     if (fabricHostsInput && nhiData.hosts_with_tokens && Array.isArray(nhiData.hosts_with_tokens)) {
-      const hosts = nhiData.hosts_with_tokens.sort();
-      fabricHostsInput.value = hosts.join(' ');
+      // Don't sort - preserve the order from backend (which respects host_position)
+      fabricHostsInput.value = nhiData.hosts_with_tokens.join(' ');
     } else if (fabricHostsInput) {
       fabricHostsInput.value = '';
     }

@@ -157,50 +157,17 @@ def _check_rate_limit_for_endpoint(ip: str, endpoint: str, max_requests: int, wi
         return True
 
 class RateLimitMiddleware(BaseHTTPMiddleware):
-    """Middleware to enforce rate limiting on API endpoints"""
+    """Middleware to enforce rate limiting on API endpoints
+    
+    NOTE: Rate limiting is disabled. This middleware is a no-op.
+    """
     
     async def dispatch(self, request: Request, call_next):
-        # Skip rate limiting for static files and frontend routes
-        path = request.url.path
-        if path.startswith('/static/') or path == '/' or path.endswith(('.html', '.js', '.css', '.woff2', '.svg', '.ico', '.png', '.jpg', '.jpeg')):
-            return await call_next(request)
-        
-        # Get client IP
-        ip = get_client_ip(request)
-        
-        # Check per-endpoint rate limit if configured
-        endpoint_limit = Config.RATE_LIMITS.get(path)
-        if endpoint_limit:
-            # Use stricter limit for this endpoint
-            limit_requests = endpoint_limit["requests"]
-            limit_window = endpoint_limit["window"]
-            if not _check_rate_limit_for_endpoint(ip, path, limit_requests, limit_window):
-                logger.warning(f"Rate limit exceeded for IP {ip} on {request.method} {path}")
-                return JSONResponse(
-                    status_code=429,
-                    content={
-                        "detail": f"Rate limit exceeded. Maximum {limit_requests} requests per {limit_window} seconds for this endpoint."
-                    },
-                    headers={"Retry-After": str(limit_window)}
-                )
-        
-        # Check global rate limit
-        if not _check_rate_limit(ip):
-            logger.warning(f"Rate limit exceeded for IP {ip} on {request.method} {path}")
-            return JSONResponse(
-                status_code=429,
-                content={
-                    "detail": f"Rate limit exceeded. Maximum {RATE_LIMIT_REQUESTS} requests per {RATE_LIMIT_WINDOW} seconds."
-                },
-                headers={"Retry-After": str(RATE_LIMIT_WINDOW)}
-            )
-        
-        # Process request
-        response = await call_next(request)
-        return response
+        # Rate limiting disabled - pass through all requests
+        return await call_next(request)
 
-# Add rate limiting middleware
-app.add_middleware(RateLimitMiddleware)
+# Rate limiting middleware disabled
+# app.add_middleware(RateLimitMiddleware)
 
 # Add CSRF protection middleware (after rate limiting)
 app.add_middleware(CSRFProtectionMiddleware)
@@ -295,7 +262,6 @@ def get_access_token_from_request(request: Request, fabric_host: str = None, nhi
         session = get_session_from_request(request)
         if session and session.get('nhi_credential_id'):
             nhi_credential_id = session.get('nhi_credential_id')
-            logger.debug(f"Using NHI credential {nhi_credential_id} from session for {fabric_host}")
     
     if not nhi_credential_id:
         # Log session details for debugging
@@ -338,18 +304,13 @@ def get_access_token_from_request(request: Request, fabric_host: str = None, nhi
                         # Token is valid, decrypt it
                         try:
                             decrypted_token = decrypt_with_server_secret(token_encrypted)
-                            logger.debug(f"Retrieved valid token from nhi_tokens for {fabric_host}")
                             conn.close()
                             return decrypted_token
                         except Exception as e:
                             logger.error(f"Failed to decrypt token from nhi_tokens: {e}")
                             # Token exists but can't be decrypted - try to get a new one (fall through)
-                    else:
-                        logger.debug(f"Token from nhi_tokens for {fabric_host} has expired")
                 except (ValueError, TypeError) as e:
                     logger.error(f"Invalid token expiration date format: {e}")
-        else:
-            logger.debug(f"No valid token found in nhi_tokens for {fabric_host}")
         
         # Token not found or expired - try to automatically retrieve it using the selected NHI credential
         logger.info(f"Attempting to automatically retrieve token for {fabric_host} using NHI credential {nhi_credential_id}")
@@ -466,15 +427,12 @@ def get_access_token_for_host(fabric_host: str, nhi_credential_id: int) -> Optio
                             decrypted_token = decrypt_with_server_secret(token_encrypted)
                             # Calculate remaining seconds until expiration
                             remaining_seconds = int((expires_at - now).total_seconds())
-                            logger.debug(f"Found valid cached token for {fabric_host} (NHI credential {nhi_credential_id}), expires in {remaining_seconds} seconds")
                             conn.close()
                             return decrypted_token
                         except Exception as e:
                             logger.error(f"Failed to decrypt token from nhi_tokens for {fabric_host}: {e}")
                             conn.close()
                             return None
-                    else:
-                        logger.debug(f"Cached token for {fabric_host} (NHI credential {nhi_credential_id}) has expired")
                 except (ValueError, TypeError) as e:
                     logger.error(f"Invalid token expiration date format for {fabric_host}: {e}")
         
@@ -525,15 +483,12 @@ def get_system_token(fabric_host: str) -> Optional[str]:
                         try:
                             decrypted_token = decrypt_with_server_secret(token_encrypted)
                             remaining_seconds = int((expires_at - now).total_seconds())
-                            logger.debug(f"Found valid system token for {fabric_host}, expires in {remaining_seconds} seconds")
                             conn.close()
                             return decrypted_token
                         except Exception as e:
                             logger.error(f"Failed to decrypt system token for {fabric_host}: {e}")
                             conn.close()
                             return None
-                    else:
-                        logger.debug(f"System token for {fabric_host} has expired")
                 except (ValueError, TypeError) as e:
                     logger.error(f"Invalid token expiration date format for {fabric_host}: {e}")
         
@@ -593,7 +548,6 @@ def get_access_token_with_cache(fabric_host: str, client_id: str, client_secret:
                         VALUES (?, ?, ?, CURRENT_TIMESTAMP)
                     ''', (fabric_host, token_encrypted, token_expires_at))
                     conn.commit()
-                    logger.debug(f"Stored new system token for {fabric_host} (expires at {token_expires_at})")
                 except Exception as e:
                     logger.warning(f"Failed to store system token for {fabric_host}: {e}")
                 finally:
@@ -1090,12 +1044,21 @@ def init_db():
             fabric_host TEXT NOT NULL,
             token_encrypted TEXT NOT NULL,
             token_expires_at TIMESTAMP NOT NULL,
+            host_position INTEGER,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (nhi_credential_id) REFERENCES nhi_credentials(id) ON DELETE CASCADE,
             UNIQUE(nhi_credential_id, fabric_host)
         )
     ''')
+    c.execute("PRAGMA table_info(nhi_tokens)")
+    columns = [column[1] for column in c.fetchall()]
+    if 'host_position' not in columns:
+        try:
+            c.execute('ALTER TABLE nhi_tokens ADD COLUMN host_position INTEGER')
+            conn.commit()
+        except sqlite3.OperationalError as e:
+            print(f"Warning: Could not add host_position column to nhi_tokens: {e}")
     
     # Create system_tokens table for internal/system tokens (LEAD_FABRIC_HOST)
     # These are never exposed and are completely separate from NHI credentials
@@ -2177,7 +2140,6 @@ def refresh_token_for_host(session_id: str, fabric_host: str) -> bool:
                     WHERE session_id = ?
                 ''', (tokens_encrypted, session_id))
                 conn.commit()
-                logger.info(f"Token refreshed successfully for {fabric_host}")
                 return True
             except sqlite3.Error as e:
                 logger.error(f"Database error refreshing token: {e}")
@@ -2222,54 +2184,6 @@ def create_user_session(user_id: int) -> tuple:
         conn.close()
     
     return session_id, expires_at
-
-def create_session(nhi_credential_id: int, encryption_password: str, tokens_by_host: dict = None, client_id: str = None, client_secret: str = None) -> tuple:
-    """Create a new session and return (session_id, session_key, expires_at) - DEPRECATED: Use create_user_session"""
-    session_id = generate_session_id()
-    session_key = derive_session_key(encryption_password, session_id)
-    session_key_hash = hash_session_key(session_key)
-    
-    # Encrypt tokens if provided
-    tokens_to_store = {}
-    if tokens_by_host:
-        for host, token_info in tokens_by_host.items():
-            if isinstance(token_info, dict) and token_info.get('token'):
-                expires_in = calculate_expires_in(token_info.get('expires_at', '')) if token_info.get('expires_at') else 3600
-                tokens_to_store[host] = create_token_info({
-                    'access_token': token_info['token'],
-                    'expires_in': expires_in
-                })
-    
-    # Store client credentials for token refresh (encrypted with session_key)
-    if client_id and client_secret:
-        tokens_to_store['_credentials'] = {
-            'client_id': client_id,
-            'client_secret': client_secret  # Will be encrypted when stored
-        }
-    
-    tokens_encrypted = encrypt_tokens_for_session(tokens_to_store, session_key)
-    
-    # Session expires after 1 hour of inactivity
-    expires_at = datetime.now(timezone.utc) + timedelta(hours=1)
-    
-    conn = db_connect_with_retry()
-    if not conn:
-        raise RuntimeError("Failed to connect to database for session creation")
-    c = conn.cursor()
-    try:
-        c.execute('''
-            INSERT INTO sessions 
-            (session_id, nhi_credential_id, tokens_encrypted, session_key_hash, expires_at)
-            VALUES (?, ?, ?, ?, ?)
-        ''', (session_id, nhi_credential_id, tokens_encrypted, session_key_hash, expires_at.isoformat()))
-        conn.commit()
-    finally:
-        conn.close()
-    
-    # Store session key temporarily (in production, use better approach)
-    store_session_key_temp(session_id, session_key)
-    
-    return session_id, session_key, expires_at
 
 def get_session(session_id: str) -> Optional[dict]:
     """Get session data from database"""
@@ -3069,6 +2983,14 @@ def set_password(request: Request, req: UserPassReq):
         return {"status": "ok"}
     except HTTPException:
         raise
+    except RuntimeError as e:
+        # Check if it's a rate limit error
+        error_msg = str(e)
+        if "Rate limit exceeded" in error_msg or "rate limit" in error_msg.lower():
+            logger.warning(f"Rate limit error changing password for user '{req.username}' on host {req.fabric_host}: {e}")
+            raise HTTPException(429, error_msg)
+        logger.error(f"Error changing password for user '{req.username}' on host {req.fabric_host}: {e}", exc_info=True)
+        raise HTTPException(500, f"Failed to change password: {str(e)}")
     except Exception as e:
         logger.error(f"Error changing password for user '{req.username}' on host {req.fabric_host}: {e}", exc_info=True)
         raise HTTPException(500, f"Failed to change password: {str(e)}")
@@ -3080,8 +3002,10 @@ def runtime_reset(request: Request, fabric_host: str):
     token = get_access_token_from_request(request, fabric_host)
     if not token:
         raise HTTPException(401, "Missing access_token in session or Authorization header")
-    reset_fabric(fabric_host, token)
-    return {"status": "ok"}
+    success = reset_fabric(fabric_host, token)
+    if not success:
+        raise HTTPException(500, "Failed to initiate fabric reset")
+    return {"status": "ok", "message": "Fabric reset task initiated"}
 
 
 @app.delete("/model/fabric/batch")
@@ -3090,8 +3014,10 @@ def model_batch_delete(request: Request, fabric_host: str):
     token = get_access_token_from_request(request, fabric_host)
     if not token:
         raise HTTPException(401, "Missing access_token in session or Authorization header")
-    batch_delete(fabric_host, token)
-    return {"status": "ok"}
+    success = batch_delete(fabric_host, token)
+    if not success:
+        raise HTTPException(500, "Failed to initiate batch delete")
+    return {"status": "ok", "message": "Batch delete task initiated"}
 
 
 @app.post("/repo/refresh")
@@ -3104,10 +3030,10 @@ def repo_refresh(request: Request, fabric_host: str):
     # Log refresh start
     refresh_id = log_repository_refresh(fabric_host, 'started')
     
-    # Refresh repositories
+    # Refresh repositories (async - returns immediately after initiating task)
     success = refresh_repositories(fabric_host, token)
     
-    # Invalidate repository cache after refresh (but keep template cache for durability)
+    # Invalidate repository cache (but keep template cache for durability)
     conn = db_connect_with_retry()
     if conn:
         try:
@@ -3120,13 +3046,8 @@ def repo_refresh(request: Request, fabric_host: str):
         finally:
             conn.close()
     
-    # Log refresh completion
     if success:
-        # Get repository count after refresh (don't use cache since we just invalidated it)
-        repos = list_repositories(fabric_host, token)
-        repo_count = len(repos) if repos else 0
-        log_repository_refresh(fabric_host, 'completed', repositories_count=repo_count)
-        return {"status": "ok", "message": "Repository refresh initiated"}
+        return {"status": "ok", "message": "Repository refresh task initiated"}
     else:
         log_repository_refresh(fabric_host, 'failed', error_message="Refresh request failed")
         raise HTTPException(500, "Repository refresh failed")
@@ -3153,7 +3074,18 @@ def model_fabric_create(request: Request, req: CreateFabricReq):
     if not token:
         raise HTTPException(401, "Missing access_token in session or Authorization header")
     create_start = datetime.now(timezone.utc)
-    result = create_fabric(req.fabric_host, token, req.template_id, req.template_name, req.version)
+    try:
+        result = create_fabric(req.fabric_host, token, req.template_id, req.template_name, req.version)
+    except RuntimeError as e:
+        # Check if it's a rate limit error
+        error_msg = str(e)
+        if "Rate limit exceeded" in error_msg or "rate limit" in error_msg.lower():
+            logger.warning(f"Rate limit error creating fabric on host {req.fabric_host}: {e}")
+            raise HTTPException(429, error_msg)
+        # Re-raise as generic error
+        logger.error(f"Error creating fabric on host {req.fabric_host}: {e}", exc_info=True)
+        raise HTTPException(500, f"Failed to create fabric: {str(e)}")
+    
     create_end = datetime.now(timezone.utc)
     create_duration = (create_end - create_start).total_seconds()
     
@@ -3169,17 +3101,17 @@ def model_fabric_create(request: Request, req: CreateFabricReq):
             log_audit("fabric_create_error", details=f"host={req.fabric_host} template={req.template_name} version={req.version} errors={' ; '.join(errors) if errors else 'unknown'} duration_s={create_duration:.1f}", request=request)
         except Exception:
             pass
-        error_msg = "Failed to create fabric"
+        error_msg = "Failed to initiate fabric creation"
         if errors:
             error_msg += ": " + "; ".join(errors)
         else:
-            error_msg += ": creation timed out or encountered an error"
+            error_msg += ": creation request failed"
         raise HTTPException(500, error_msg)
     try:
-        log_audit("fabric_created", details=f"host={req.fabric_host} template={req.template_name} version={req.version} duration_s={create_duration:.1f}", request=request)
+        log_audit("fabric_create_initiated", details=f"host={req.fabric_host} template={req.template_name} version={req.version} duration_s={create_duration:.1f}", request=request)
     except Exception:
         pass
-    return {"status": "ok", "message": "Fabric created successfully"}
+    return {"status": "ok", "message": "Fabric creation task initiated"}
 
 
 @app.post("/runtime/fabric/install")
@@ -3209,17 +3141,17 @@ def model_fabric_install(request: Request, req: InstallFabricReq):
             log_audit("fabric_install_error", details=f"host={req.fabric_host} template={req.template_name} version={req.version} errors={' ; '.join(errors) if errors else 'unknown'} duration_s={install_duration:.1f}", request=request)
         except Exception:
             pass
-        error_msg = "Failed to install fabric"
+        error_msg = "Failed to initiate fabric installation"
         if errors:
             error_msg += ": " + "; ".join(errors)
         else:
-            error_msg += ": installation timed out or encountered an error"
+            error_msg += ": installation request failed"
         raise HTTPException(500, error_msg)
     try:
-        log_audit("fabric_installed", details=f"host={req.fabric_host} template={req.template_name} version={req.version} duration_s={install_duration:.1f}", request=request)
+        log_audit("fabric_install_initiated", details=f"host={req.fabric_host} template={req.template_name} version={req.version} duration_s={install_duration:.1f}", request=request)
     except Exception:
         pass
-    return {"status": "ok", "message": "Fabric installed successfully"}
+    return {"status": "ok", "message": "Fabric installation task initiated"}
 
 
 @app.get("/tasks/progress")
@@ -3238,9 +3170,10 @@ def tasks_status(request: Request, fabric_host: str):
     token = get_access_token_from_request(request, fabric_host)
     if not token:
         raise HTTPException(401, "Missing access_token in session or Authorization header")
-    count = get_running_task_count(fabric_host, token)
+    count, error_message = get_running_task_count(fabric_host, token)
     if count is None:
-        raise HTTPException(400, "Failed to get task status")
+        # Return 500 for server/network errors, not 400 (client error)
+        raise HTTPException(500, error_message or "Failed to get task status")
     return {"running_count": count}
 
 
@@ -3355,7 +3288,6 @@ def get_cached_repositories(fabric_host: str):
                     repos.append(repo_data)
                 except (json.JSONDecodeError, TypeError):
                     continue
-            logger.debug(f"Retrieved {len(repos)} cached repositories for {fabric_host}")
             return repos
         return None
     except Exception as e:
@@ -3568,7 +3500,6 @@ def cache_templates(templates: list):
         removed_count = 0
         templates_to_remove = existing_templates - new_templates
         if templates_to_remove:
-            logger.debug(f"Removing {len(templates_to_remove)} templates that are no longer in source")
             for key in templates_to_remove:
                 parts = key.split(':')
                 if len(parts) == 3:
@@ -3737,7 +3668,6 @@ def repo_template_single(request: Request, fabric_host: str, template_name: str,
         ver_val = (t.get("version") or "").strip()
         if name_norm == tname_norm and ver_val == ver_norm:
             template_id = t.get("id")
-            logger.debug(f"Found template_id {template_id} for {template_name} v{version} in repo {repo_name} on host {fabric_host}")
             return {"template_id": template_id}
     sample = [{"id": x.get("id"), "name": x.get("name"), "version": x.get("version")} for x in templates[:5]]
     logger.warning("Template not found in repo '%s' on host %s. Looking for name='%s' version='%s'. Sample: %s", match.get("name"), fabric_host, template_name, version, sample)
@@ -3750,7 +3680,6 @@ def repo_remotes_proxy(request: Request, fabric_host: str, nhi_credential_id: Op
     # Try cache first - no authentication required if cache is available
     cached_repos = get_cached_repositories(fabric_host)
     if cached_repos:
-        logger.debug(f"Using cached repositories for {fabric_host}")
         repos = cached_repos
     else:
         # Fallback to API if cache is empty/expired
@@ -3772,7 +3701,6 @@ def repo_templates_list(request: Request, fabric_host: str, repo_name: str):
     # Try cache first - no authentication required if cache is available
     templates = get_cached_templates_for_repo(repo_name)
     if templates:
-        logger.debug(f"Using cached templates for repository {repo_name}")
         return {"templates": templates}
     
     # Fallback to API if cache is empty/expired
@@ -3808,7 +3736,6 @@ def repo_versions(request: Request, fabric_host: str, repo_name: str, template_n
     # Try cache first - no authentication required if cache is available
     versions = get_cached_template_versions(repo_name, template_name)
     if versions:
-        logger.debug(f"Using cached versions for template {template_name} in repository {repo_name}")
         return {"versions": versions}
     
     # Fallback to API if cache is empty/expired
@@ -4909,7 +4836,6 @@ def run_configuration(config_data: dict, event_name: str, event_id: Optional[int
                                     # Decrypt using FS_SERVER_SECRET
                                     try:
                                         client_secret = decrypt_with_server_secret(client_secret_encrypted)
-                                        logger.info(f"Event '{event_name}': Successfully decrypted client_secret (length={len(client_secret)})")
                                     except Exception as e:
                                         logger.error(f"Event '{event_name}': Failed to decrypt client_secret: {e}", exc_info=True)
                                 else:
@@ -4930,7 +4856,6 @@ def run_configuration(config_data: dict, event_name: str, event_id: Optional[int
                                     # Decrypt using FS_SERVER_SECRET
                                     try:
                                         client_secret = decrypt_with_server_secret(client_secret_encrypted)
-                                        logger.info(f"Event '{event_name}': Successfully decrypted client_secret for manual run (length={len(client_secret)})")
                                     except Exception as e:
                                         logger.error(f"Event '{event_name}': Failed to decrypt client_secret for manual run: {e}", exc_info=True)
                     conn.close()
@@ -4980,7 +4905,6 @@ def run_configuration(config_data: dict, event_name: str, event_id: Optional[int
                                         hours = int(delta.total_seconds() // 3600)
                                         minutes = int((delta.total_seconds() % 3600) // 60)
                                         token_fetched = True
-                                        logger.info(f"Event '{event_name}': Reusing stored token for {host} (expires in {hours}h {minutes}m)")
                                     except Exception as e:
                                         logger.warning(f"Event '{event_name}': Failed to decrypt stored token for {host}: {e}, will fetch new token")
                         conn.close()
@@ -5019,11 +4943,8 @@ def run_configuration(config_data: dict, event_name: str, event_id: Optional[int
                                     conn.close()
                         return {"status": "error", "message": msg, "errors": errors, "event": event_name}
                     
-                    logger.info(f"Event '{event_name}': Fetching new token for host {host} with client_id={client_id[:10] if client_id else 'None'}...")
-                    logger.info(f"Event '{event_name}': client_id length={len(client_id) if client_id else 0}, client_secret length={len(client_secret) if client_secret else 0}")
                     token_data = get_access_token(client_id, client_secret, host)
                     if token_data and isinstance(token_data, dict) and token_data.get("access_token"):
-                        logger.info(f"Event '{event_name}': Successfully acquired token for host {host}")
                         host_tokens[host] = token_data.get("access_token")
                         
                         # Store the new token in nhi_tokens if we have NHI credential (encrypt with FS_SERVER_SECRET)
@@ -5045,7 +4966,6 @@ def run_configuration(config_data: dict, event_name: str, event_id: Optional[int
                                         ''', (nhi_cred_id, host, token_encrypted, token_expires_at))
                                         conn.commit()
                                         conn.close()
-                                        logger.info(f"Event '{event_name}': Stored new token for {host} (expires at {token_expires_at})")
                             except Exception as e:
                                 logger.warning(f"Event '{event_name}': Failed to store token for {host}: {e}")
                     else:
@@ -5148,7 +5068,6 @@ def run_configuration(config_data: dict, event_name: str, event_id: Optional[int
                     if name_norm == t_norm and ver_val == v_norm:
                         template_id = item.get('id')
                         template_id_cache[host][cache_key] = template_id
-                        logger.info(f"Event '{event_name}': Cached template '{template_name}' (version={version}) -> id {template_id} on host {host}")
                         return template_id
                 return None
             return template_id_cache[host].get(cache_key)
@@ -5309,8 +5228,10 @@ def run_configuration(config_data: dict, event_name: str, event_id: Optional[int
                     
                     # Check for running tasks before creating
                     try:
-                        running_count = get_running_task_count(host, token)
-                        if running_count > 0:
+                        running_count, error_msg = get_running_task_count(host, token)
+                        if error_msg:
+                            logger.warning(f"Event '{event_name}': Could not check task status on {host}: {error_msg}")
+                        elif running_count and running_count > 0:
                             check_tasks(host, token, display_progress=False)
                     except Exception as e:
                         msg = f"Error checking tasks on host {host}: {e}"
@@ -5374,8 +5295,10 @@ def run_configuration(config_data: dict, event_name: str, event_id: Optional[int
                     
                     # Wait for tasks to complete after each template
                     try:
-                        running_count = get_running_task_count(host, token)
-                        if running_count > 0:
+                        running_count, error_msg = get_running_task_count(host, token)
+                        if error_msg:
+                            logger.warning(f"Event '{event_name}': Could not check task status on {host}: {error_msg}")
+                        elif running_count and running_count > 0:
                             result = check_tasks(host, token, display_progress=False)
                             if result is not None:
                                 elapsed_time, success = result if isinstance(result, tuple) else (result, True)
@@ -5492,15 +5415,57 @@ def run_configuration(config_data: dict, event_name: str, event_id: Optional[int
                         template_id = get_cached_template_id(host, template_name, repo_name, version)
                         if template_id:
                             install_start = datetime.now(timezone.utc)
+                            
+                            # Initiate installation
                             result = install_fabric(host, token, template_name, version)
+                            
+                            if isinstance(result, tuple):
+                                init_success, init_errors = result
+                            else:
+                                init_success = result
+                                init_errors = []
+                            
+                            if not init_success:
+                                # Installation initiation failed
+                                msg = "; ".join(init_errors) if init_errors else "Installation initiation failed"
+                                logger.error(f"Event '{event_name}': Installation initiation failed on host {host}: {msg}")
+                                host_result["failed_at_stage"] = "installation"
+                                host_result["error"] = msg
+                                return host_result
+                            
+                            # Wait for installation tasks to complete
+                            task_result = check_tasks(host, token, display_progress=False)
+                            
+                            if isinstance(task_result, tuple):
+                                task_elapsed_minutes, task_success = task_result
+                            else:
+                                task_success = task_result if isinstance(task_result, bool) else True
+                                task_elapsed_minutes = 0
+                            
+                            # Check for task errors after tasks complete
+                            task_errors = []
+                            if task_success:
+                                try:
+                                    # Get errors since installation started
+                                    from datetime import timedelta
+                                    since_timestamp = install_start - timedelta(seconds=10)  # 10 seconds before to catch any edge cases
+                                    errors_list = get_recent_task_errors(
+                                        host, token, 
+                                        limit=50, 
+                                        since_timestamp=since_timestamp,
+                                        fabric_name=template_name
+                                    )
+                                    if errors_list:
+                                        task_errors = [err.get('error', str(err)) for err in errors_list if isinstance(err, dict)]
+                                        task_errors.extend([str(err) for err in errors_list if not isinstance(err, dict)])
+                                except Exception as e:
+                                    logger.warning(f"Event '{event_name}': Could not check for task errors on {host}: {e}")
+                            
                             install_end = datetime.now(timezone.utc)
                             install_duration = (install_end - install_start).total_seconds()
                             
-                            if isinstance(result, tuple):
-                                success, task_errors = result
-                            else:
-                                success = result
-                                task_errors = []
+                            # Determine final success: initiation succeeded AND tasks completed successfully AND no errors
+                            success = init_success and task_success and not task_errors
                             
                             install_detail = {
                                 "host": host,
@@ -5522,7 +5487,12 @@ def run_configuration(config_data: dict, event_name: str, event_id: Optional[int
                                 host_result["stages_completed"].append("installation")
                             else:
                                 # Use task errors directly - they already contain all necessary information
-                                msg = "; ".join(task_errors) if task_errors else "Installation failed"
+                                if task_errors:
+                                    msg = "; ".join(task_errors)
+                                elif not task_success:
+                                    msg = "Installation tasks did not complete successfully"
+                                else:
+                                    msg = "Installation failed"
                                 logger.error(f"Event '{event_name}': Installation failed on host {host}: {msg}")
                                 host_result["failed_at_stage"] = "installation"
                                 host_result["error"] = msg
@@ -5610,6 +5580,10 @@ def run_configuration(config_data: dict, event_name: str, event_id: Optional[int
             for result in pipeline_results:
                 if result["failed_at_stage"]:
                     logger.warning(f"Event '{event_name}': Host {result['host']} failed at stage '{result['failed_at_stage']}': {result['error']}")
+                    # Ensure error is added to errors list if not already there
+                    error_msg = f"Host {result['host']} failed at stage '{result['failed_at_stage']}': {result['error']}"
+                    if error_msg not in errors:
+                        errors.append(error_msg)
         
         completed_at = datetime.now(timezone.utc)
         
@@ -5621,9 +5595,10 @@ def run_configuration(config_data: dict, event_name: str, event_id: Optional[int
             else:
                 c = conn.cursor()
                 try:
-                    if errors:
+                    # Determine status: error if there are errors OR if any hosts failed
+                    if errors or failed_hosts:
                         status = 'error'
-                        message = "Auto-run completed with errors"
+                        message = f"Auto-run completed with errors ({len(failed_hosts)}/{len(pipeline_results)} host(s) failed)" if failed_hosts else "Auto-run completed with errors"
                     else:
                         status = 'success'
                         message = "Auto-run execution completed successfully"
@@ -6376,7 +6351,7 @@ async def validate_ssh_password(req: dict):
         return {"valid": False, "error": str(e)}
 
 @app.post("/ssh-profiles/execute")
-async def execute_ssh_profile(req: ExecuteSshProfileReq):
+async def execute_ssh_profile(req: ExecuteSshProfileReq, request: Request):
     """Execute SSH commands from a profile on a fabric host"""
     try:
         # Get SSH profile
@@ -6707,8 +6682,6 @@ def save_nhi(req: SaveNhiReq, request: Request):
                         continue
                     
                     logger.info(f"[{idx}/{len(hosts_to_process)}] Attempting token retrieval for host {fabric_host} with client_id: {client_id_clean[:10]}...")
-                    logger.debug(f"Client ID: {client_id_clean[:20]}... (length: {len(client_id_clean)})")
-                    logger.debug(f"Client Secret: {client_secret_clean[:3]}... (length: {len(client_secret_clean)})")
                     
                     # Verify decryption worked correctly by checking if secret looks reasonable
                     if len(client_secret_clean) < 10:
@@ -6730,9 +6703,9 @@ def save_nhi(req: SaveNhiReq, request: Request):
                             # Insert or update token for this host
                             c.execute('''
                                 INSERT OR REPLACE INTO nhi_tokens 
-                                (nhi_credential_id, fabric_host, token_encrypted, token_expires_at, updated_at)
-                                VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
-                            ''', (nhi_id, fabric_host, token_encrypted, token_expires_at))
+                                (nhi_credential_id, fabric_host, token_encrypted, token_expires_at, host_position, updated_at)
+                                VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                            ''', (nhi_id, fabric_host, token_encrypted, token_expires_at, idx))
                             tokens_stored += 1
                         else:
                             # No expiration time in response
@@ -6809,12 +6782,15 @@ def list_nhi(background_tasks: BackgroundTasks):
         for row in rows:
             nhi_id = row[0]
             
-            # Get tokens for this credential
+            # Get tokens for this credential (preserve input order via host_position)
             c.execute('''
                 SELECT fabric_host, token_expires_at
                 FROM nhi_tokens
                 WHERE nhi_credential_id = ?
-                ORDER BY fabric_host ASC
+                ORDER BY 
+                    CASE WHEN host_position IS NULL THEN 1 ELSE 0 END,
+                    host_position ASC,
+                    id ASC
             ''', (nhi_id,))
             token_rows = c.fetchall()
             
@@ -6839,7 +6815,6 @@ def list_nhi(background_tasks: BackgroundTasks):
                             else:
                                 token_status = f"{minutes}m"
                     except Exception as e:
-                        logger.debug(f"Error parsing token expiration for host {fabric_host}: {e}")
                         pass
                 
                 hosts_with_tokens.append({
@@ -6893,10 +6868,13 @@ async def get_nhi(nhi_id: int, request: Request):
         
         # Get all tokens for this credential (decrypted)
         c.execute('''
-            SELECT fabric_host, token_encrypted, token_expires_at
+            SELECT fabric_host, token_encrypted, token_expires_at, host_position
             FROM nhi_tokens
             WHERE nhi_credential_id = ?
-            ORDER BY fabric_host ASC
+            ORDER BY 
+                CASE WHEN host_position IS NULL THEN 1 ELSE 0 END,
+                host_position ASC,
+                id ASC
         ''', (nhi_id,))
         token_rows = c.fetchall()
         
@@ -7739,7 +7717,7 @@ def refresh_expiring_tokens():
         logger.error(f"Error refreshing NHI tokens: {e}", exc_info=True)
     
     if session_refreshed_count > 0 or nhi_refreshed_count > 0:
-        logger.debug(f"Token refresh completed: {session_refreshed_count} session tokens, {nhi_refreshed_count} NHI tokens refreshed")
+        pass
 
 def check_and_run_token_refresh():
     """Background thread to periodically refresh expiring tokens"""
@@ -7931,7 +7909,6 @@ def refresh_template_cache_periodically():
 
             try:
                 # Get access token using credentials from .env, checking cache first
-                logger.debug(f"Requesting access token for {fabric_host}")
                 token_data = get_access_token_with_cache(fabric_host, client_id, client_secret)
 
                 if not token_data or not token_data.get("access_token"):
@@ -7942,7 +7919,6 @@ def refresh_template_cache_periodically():
                     refresh_status = "failed"
                 else:
                     token = token_data.get("access_token")
-                    logger.debug(f"Access token obtained, fetching templates from {fabric_host}")
 
                     # Fetch all templates
                     templates = list_all_templates(fabric_host, token) or []
@@ -8006,9 +7982,6 @@ def check_and_run_events():
             current_time_short = current_time.strftime('%H:%M')
             
             # Log scheduler check periodically (every 10 checks = ~5 minutes)
-            if random.randint(1, 10) == 1:
-                logger.debug(f"Scheduler checking: date={current_date_str}, time={current_time_str} (UTC)")
-            
             # First, let's see what events exist in the database
             c.execute('''
                 SELECT id, name, event_date, event_time, auto_run
@@ -8016,10 +7989,6 @@ def check_and_run_events():
                 WHERE auto_run = 1
             ''')
             all_events = c.fetchall()
-            if all_events:
-                logger.debug(f"Found {len(all_events)} auto-run event(s) in database:")
-                for evt_id, evt_name, evt_date, evt_time, evt_auto_run in all_events:
-                    logger.debug(f"  - Event {evt_id}: {evt_name}, date={evt_date!r}, time={evt_time!r}, auto_run={evt_auto_run}")
             
             # Query for events - dates are stored as YYYY-MM-DD format
             # Times are stored as HH:MM format (e.g., "10:25" or "19:00"), not HH:MM:SS
@@ -8045,14 +8014,6 @@ def check_and_run_events():
                 logger.info(f"Found {len(events_to_run)} event(s) to run at {current_date_str} {current_time_str} (UTC)")
                 for event_id, event_name, event_date, event_time in events_to_run:
                     logger.info(f"  - Event ID {event_id}: {event_name} (date={event_date}, time={event_time}, UTC)")
-            else:
-                # Log why no events matched (for debugging) - only log every 10th check to avoid spam
-                if random.randint(1, 10) == 1:
-                    logger.debug(f"No events matched: date={current_date_str}, time={current_time_short} (UTC)")
-                    # Also show what events exist
-                    if all_events:
-                        logger.debug(f"  Available events: {[(evt_id, evt_name, evt_date, evt_time) for evt_id, evt_name, evt_date, evt_time, _ in all_events]}")
-            
             # Clean up executed events from previous days (thread-safe)
             if events_to_run:
                 with _executed_events_lock:
@@ -8072,7 +8033,6 @@ def check_and_run_events():
                 # Skip if already executed (thread-safe check)
                 with _executed_events_lock:
                     if event_key in _executed_events:
-                        logger.debug(f"Skipping event {event_id} - already executed (key: {event_key})")
                         continue
                     
                     # Mark as executed before starting (to prevent duplicate if scheduler runs again)
