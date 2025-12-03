@@ -2,11 +2,30 @@
 set -e
 
 # Ensure data and logs directories exist and are writable
-mkdir -p /app/data /app/logs
+CONTAINER_UID=$(id -u)
+CONTAINER_GID=$(id -g)
+
+# Try to create directories (will fail silently if parent isn't writable)
+mkdir -p /app/data /app/logs 2>/dev/null || true
+
 if [ ! -w /app/data ]; then
     echo "❌ ERROR: /app/data directory is not writable!"
     echo "   This usually happens when the ./data directory on the host has wrong permissions."
-    echo "   Fix with: sudo chown -R $(id -u):$(id -g) ./data"
+    echo ""
+    echo "   Container is running as UID:${CONTAINER_UID} GID:${CONTAINER_GID}"
+    echo "   Current /app/data permissions: $(ls -ld /app/data 2>/dev/null || echo 'directory does not exist')"
+    echo ""
+    echo "   Fix on the HOST (outside container):"
+    echo "   1. Stop the container: docker-compose down"
+    echo "   2. Fix ownership (recommended):"
+    echo "      sudo chown -R ${CONTAINER_UID}:${CONTAINER_GID} ./data ./logs"
+    echo "   3. Or make world-writable (less secure, for testing only):"
+    echo "      chmod -R 777 ./data ./logs"
+    echo "   4. Restart: docker-compose up -d"
+    echo ""
+    echo "   Or create directories before starting container:"
+    echo "      mkdir -p data logs certs"
+    echo "      chmod 755 data logs certs"
     exit 1
 fi
 
