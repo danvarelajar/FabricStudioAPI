@@ -142,14 +142,7 @@ All dependencies are listed in `requirements.txt` and installed automatically du
    cd FabricStudioAPI
    ```
 
-2. **Create required directories:**
-   ```bash
-   # Create data and logs directories with proper permissions
-   mkdir -p data logs certs
-   chmod 755 data logs certs
-   ```
-
-3. **Set up environment variables:**
+2. **Set up environment variables:**
    ```bash
    # Create .env file from template
    cat > .env << EOF
@@ -178,7 +171,7 @@ All dependencies are listed in `requirements.txt` and installed automatically du
    EOF
    ```
 
-4. **Start the application:**
+3. **Start the application:**
    ```bash
    # Using helper script (recommended)
    ./scripts/docker-start.sh
@@ -188,7 +181,7 @@ All dependencies are listed in `requirements.txt` and installed automatically du
    docker-compose up -d
    ```
 
-5. **Verify installation:**
+4. **Verify installation:**
    ```bash
    # Check container status
    docker-compose ps
@@ -200,7 +193,7 @@ All dependencies are listed in `requirements.txt` and installed automatically du
    # Open http://localhost:8000 in your browser
    ```
 
-6. **Create initial users:**
+5. **Create initial users:**
    ```bash
    # Edit scripts/create_users.py to customize users
    # Default: admin / FortinetAssistant1!
@@ -647,19 +640,6 @@ The database and logs are stored in the `./data` and `./logs` directories, which
    # Check if port is in use
    lsof -i :8000
    # Or change PORT in .env
-   ```
-
-5. **Database permission errors ("unable to open database file"):**
-   ```bash
-   # Ensure data directory exists and has proper permissions
-   mkdir -p data logs certs
-   chmod 755 data logs certs
-   
-   # If directory was created by Docker as root, fix ownership:
-   sudo chown -R $USER:$USER data logs
-   
-   # Restart container
-   docker-compose restart
    ```
 
 ### Changes Not Reflected

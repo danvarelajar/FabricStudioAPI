@@ -76,8 +76,8 @@ class Config:
     
     # Lead Fabric Host Configuration (for background repository refresh)
     LEAD_FABRIC_HOST = os.environ.get("LEAD_FABRIC_HOST", "").strip()
-    LEAD_CLIENT_ID = os.environ.get("CLIENT_ID", "").strip()
-    LEAD_CLIENT_SECRET = os.environ.get("CLIENT_SECRET", "").strip()
+    LEAD_CLIENT_ID = os.environ.get("LEAD_CLIENT_ID", "").strip()
+    LEAD_CLIENT_SECRET = os.environ.get("LEAD_CLIENT_SECRET", "").strip()
     
     # CORS configuration
     # Allow origins from environment variable (comma-separated list)
