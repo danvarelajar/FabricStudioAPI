@@ -1,6 +1,15 @@
 #!/bin/bash
 set -e
 
+# Ensure data and logs directories exist and are writable
+mkdir -p /app/data /app/logs
+if [ ! -w /app/data ]; then
+    echo "❌ ERROR: /app/data directory is not writable!"
+    echo "   This usually happens when the ./data directory on the host has wrong permissions."
+    echo "   Fix with: sudo chown -R $(id -u):$(id -g) ./data"
+    exit 1
+fi
+
 # Get configuration from environment variables
 HOSTNAME=${HOSTNAME:-0.0.0.0}
 PORT=${PORT:-8000}
