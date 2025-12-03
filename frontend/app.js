@@ -6760,7 +6760,7 @@ async function handleRunButton() {
           // Wait for delete tasks to complete (poll every 2 seconds)
           const deleteWait = await waitForTasksComplete(host, 15 * 60 * 1000, 'workspace removal', 2000);
           if (!deleteWait.success) throw new Error(`Remove tasks failed: ${deleteWait.error || 'unknown error'}`);
-          
+      
           // Check for errors after delete
           try {
             const errorRes = await api('/tasks/errors', { 
@@ -6804,7 +6804,7 @@ async function handleRunButton() {
                 const errorData = await passwordRes.json();
               errorMessage = errorData.detail || errorData.message || errorMessage;
             } catch (e) {
-                try {
+              try {
                   const errorText = await passwordRes.text();
                   if (errorText) errorMessage = errorText;
                 } catch (e2) {}
@@ -6820,8 +6820,8 @@ async function handleRunButton() {
           logMsg(`[${host}] Preparation steps failed: ${error.message || error}`);
           failedHosts.add(host);
           return { host, success: false, error: error.message || error };
-        }
-      });
+          }
+        });
       
       // Wait for all hosts to complete preparation steps
       await Promise.all(hostPromises);
@@ -7039,10 +7039,10 @@ async function handleRunButton() {
                 
                 if (!fabricWait.success) {
                   const errorMsg = `Template '${t.template_name}' v${t.version} creation tasks completed on ${host}, but fabric did not appear: ${fabricWait.error || 'unknown error'}`;
-                  showStatus(errorMsg);
-                  t.status = 'err';
-                  t.createProgress = 0;
-                  renderTemplates();
+                showStatus(errorMsg);
+                t.status = 'err';
+                t.createProgress = 0;
+                renderTemplates();
                   return {host, success: false, error: fabricWait.error || 'Fabric did not appear after creation'};
                 }
                 
@@ -7050,7 +7050,7 @@ async function handleRunButton() {
                 showStatus(`Template '${t.template_name}' v${t.version} created successfully on ${host}`);
                 t.status = 'created';
                 t.createProgress = 100;
-                renderTemplates();
+              renderTemplates();
                 return {host, success: true};
           } catch (error) {
             const errorMsg = `Error processing template '${rowTemplate.template_name}' v${rowTemplate.version} on ${host}: ${error.message || error}`;
@@ -7379,7 +7379,7 @@ async function handleRunButton() {
         }
         
         // Check for task errors after installation tasks complete
-        try {
+            try {
               const installStartTime = new Date(installStart).toISOString();
               const errorsRes = await api('/tasks/errors', { 
                 params: { 
@@ -7634,7 +7634,7 @@ async function restoreConfiguration(config) {
           let retries = 0;
           const maxRetries = 10;
           while (retries < maxRetries && (!window.validatedNhiHosts || window.validatedNhiHosts.length === 0)) {
-            await new Promise(resolve => setTimeout(resolve, 100));
+          await new Promise(resolve => setTimeout(resolve, 100));
             retries++;
             if (retries < maxRetries && (!window.validatedNhiHosts || window.validatedNhiHosts.length === 0)) {
               logMsg(`Retry ${retries}: window.validatedNhiHosts = ${window.validatedNhiHosts ? JSON.stringify(window.validatedNhiHosts.map(h => h.host)) : 'null/undefined'}`);
@@ -9315,7 +9315,7 @@ async function handleTrackedRunButton() {
           // Wait for delete tasks to complete (poll every 2 seconds)
           const deleteWait = await waitForTasksComplete(host, 15 * 60 * 1000, 'workspace removal', 2000);
           if (!deleteWait.success) throw new Error(`Remove tasks failed: ${deleteWait.error || 'unknown error'}`);
-          
+      
           // Check for errors after delete
           try {
             const errorRes = await api('/tasks/errors', { 
@@ -9349,8 +9349,8 @@ async function handleTrackedRunButton() {
               new_hostname: hostname,
               success: true
             });
-          }
-          
+      }
+      
           // Stage 5: Change password (if provided)
       if (new_password) {
             logMsg(`[${host}] Changing guest user password...`);
@@ -9366,7 +9366,7 @@ async function handleTrackedRunButton() {
                 const errorData = await passwordRes.json();
               errorMessage = errorData.detail || errorData.message || errorMessage;
             } catch (e) {
-                try {
+              try {
                   const errorText = await passwordRes.text();
                   if (errorText) errorMessage = errorText;
                 } catch (e2) {}

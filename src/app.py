@@ -164,8 +164,8 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
     
     async def dispatch(self, request: Request, call_next):
         # Rate limiting disabled - pass through all requests
-        return await call_next(request)
-
+            return await call_next(request)
+        
 # Rate limiting middleware disabled
 # app.add_middleware(RateLimitMiddleware)
 
@@ -4601,13 +4601,11 @@ def update_manual_run(run_id: int, req: dict):
 def execute_run(req: dict, request: Request):
     """Execute a configuration run and track it"""
     try:
-        # Extract configuration data from request
-        config_data = req.get('config_data', {})
-        if not config_data:
-            raise HTTPException(400, "config_data is required")
+        config_id = req.get('config_id')
+        if not config_id:
+            raise HTTPException(400, "config_id is required")
         
-        # Execute the configuration (event_id=None means manual run)
-        result = run_configuration(config_data, "Manual Run", event_id=None)
+        result = run_configuration(config_id=config_id, event_name="Manual Run", event_id=None)
         return result
     except Exception as e:
         logger.error(f"Error executing run: {e}", exc_info=True)
@@ -4636,10 +4634,9 @@ def execute_event(event_id: int, background_tasks: BackgroundTasks):
             raise HTTPException(404, f"Event with id {event_id} not found or auto_run is disabled")
         
         config_id, config_data_json, event_name = row
-        config_data = json.loads(config_data_json)
         
         # Execute synchronously to return detailed status
-        result = run_configuration(config_data, event_name, event_id)
+        result = run_configuration(config_id=config_id, event_name=event_name, event_id=event_id)
         if isinstance(result, dict):
             return result
         return {"status": "ok", "message": f"Event '{event_name}' executed"}
@@ -4649,8 +4646,36 @@ def execute_event(event_id: int, background_tasks: BackgroundTasks):
         raise HTTPException(500, f"Database error: {str(e)}")
     finally:
         conn.close()
-def run_configuration(config_data: dict, event_name: str, event_id: Optional[int] = None):
-    """Execute a configuration (same logic as frontend Run button)"""
+def run_configuration(config_id: int, event_name: Optional[str] = None, event_id: Optional[int] = None):
+    """Execute a configuration (same logic as frontend Run button)
+    
+    Args:
+        config_id: Configuration ID to load from database (required)
+        event_name: Name for the event/run (optional, defaults to configuration name)
+        event_id: Event ID if this is a scheduled event (optional)
+    """
+    
+    # Load configuration from database
+    conn = db_connect_with_retry()
+    if not conn:
+        return {"status": "error", "message": "Database connection failed", "errors": ["Database connection failed"], "event": event_name or "Unknown"}
+    c = conn.cursor()
+    try:
+        c.execute('SELECT name, config_data FROM configurations WHERE id = ?', (config_id,))
+        row = c.fetchone()
+        if not row:
+            return {"status": "error", "message": f"Configuration with id {config_id} not found", "errors": [f"Configuration with id {config_id} not found"], "event": event_name or "Unknown"}
+        config_name, config_data_json = row
+        config_data = json.loads(config_data_json)
+        if not event_name:
+            event_name = config_name or f"Configuration {config_id}"
+    except json.JSONDecodeError:
+        return {"status": "error", "message": "Invalid configuration data", "errors": ["Invalid configuration data"], "event": event_name or "Unknown"}
+    except Exception as e:
+        logger.error(f"Error loading configuration {config_id}: {e}", exc_info=True)
+        return {"status": "error", "message": f"Error loading configuration: {str(e)}", "errors": [str(e)], "event": event_name or "Unknown"}
+    finally:
+        conn.close()
     
     execution_record_id = None
     started_at = datetime.now(timezone.utc)
@@ -5436,14 +5461,23 @@ def run_configuration(config_data: dict, event_name: str, event_id: Optional[int
                             # Wait for installation tasks to complete
                             task_result = check_tasks(host, token, display_progress=False)
                             
-                            if isinstance(task_result, tuple):
+                            if task_result is None:
+                                # check_tasks failed (network error, etc.)
+                                msg = "Failed to check task status during installation"
+                                logger.error(f"Event '{event_name}': {msg} on host {host}")
+                                host_result["failed_at_stage"] = "installation"
+                                host_result["error"] = msg
+                                return host_result
+                            elif isinstance(task_result, tuple) and len(task_result) == 2:
                                 task_elapsed_minutes, task_success = task_result
                             else:
+                                # Unexpected return format - treat as success but log warning
+                                logger.warning(f"Event '{event_name}': Unexpected check_tasks return format on host {host}: {task_result}")
                                 task_success = task_result if isinstance(task_result, bool) else True
                                 task_elapsed_minutes = 0
                             
                             # Check for task errors after tasks complete
-                            task_errors = []
+                                task_errors = []
                             if task_success:
                                 try:
                                     # Get errors since installation started
@@ -7658,6 +7692,91 @@ def refresh_nhi_tokens():
         logger.error(f"Error in NHI token refresh task: {e}", exc_info=True)
         return 0
 
+def refresh_system_tokens():
+    """Refresh system tokens from system_tokens table for LEAD_FABRIC_HOST.
+    Creates a token if none exists, or refreshes if expiring within 5 minutes."""
+    try:
+        fabric_host = Config.LEAD_FABRIC_HOST
+        if not fabric_host:
+            return 0  # No LEAD_FABRIC_HOST configured
+        
+        client_id = Config.LEAD_CLIENT_ID
+        client_secret = Config.LEAD_CLIENT_SECRET
+        if not client_id or not client_secret:
+            return 0  # No credentials configured
+        
+        conn = db_connect_with_retry()
+        if not conn:
+            logger.error("Failed to connect to database for system token refresh")
+            return 0
+        c = conn.cursor()
+        try:
+            now = datetime.now()
+            # Check tokens expiring within 5 minutes (or already expired)
+            threshold_time = now + timedelta(minutes=5)
+            
+            # Check if token exists and is expiring soon
+            c.execute('''
+                SELECT token_expires_at
+                FROM system_tokens
+                WHERE fabric_host = ?
+            ''', (fabric_host,))
+            
+            existing_token = c.fetchone()
+            
+            # If no token exists, or token is expiring soon, get a new one
+            should_refresh = False
+            if not existing_token:
+                should_refresh = True
+                logger.info(f"No system token found for LEAD_FABRIC_HOST {fabric_host}, creating new token")
+            else:
+                token_expires_at_str = existing_token[0]
+                if token_expires_at_str:
+                    try:
+                        expires_at = datetime.fromisoformat(token_expires_at_str)
+                        if expires_at <= threshold_time:
+                            should_refresh = True
+                            logger.info(f"System token for LEAD_FABRIC_HOST {fabric_host} is expiring soon, refreshing")
+                    except (ValueError, TypeError):
+                        # Invalid expiration date, refresh
+                        should_refresh = True
+                        logger.info(f"System token for LEAD_FABRIC_HOST {fabric_host} has invalid expiration, refreshing")
+            
+            if not should_refresh:
+                return 0  # Token is still valid
+            
+            # Get new token
+            token_data = get_access_token(client_id, client_secret, fabric_host)
+            if token_data and token_data.get("access_token"):
+                expires_in = token_data.get("expires_in")
+                if expires_in:
+                    expires_at = datetime.now() + timedelta(seconds=expires_in)
+                    token_expires_at_new = expires_at.isoformat()
+                    token_encrypted = encrypt_with_server_secret(token_data.get("access_token"))
+                    
+                    # Insert or update token in system_tokens
+                    c.execute('''
+                        INSERT OR REPLACE INTO system_tokens 
+                        (fabric_host, token_encrypted, token_expires_at, updated_at)
+                        VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+                    ''', (fabric_host, token_encrypted, token_expires_at_new))
+                    conn.commit()
+                    logger.info(f"Refreshed system token for LEAD_FABRIC_HOST {fabric_host}")
+                    # Log audit event
+                    log_audit("system_token_refreshed", details=f"LEAD_FABRIC_HOST {fabric_host}")
+                    return 1
+                else:
+                    logger.warning(f"No expiration time in token response for LEAD_FABRIC_HOST {fabric_host}")
+            else:
+                logger.warning(f"Failed to get new token for LEAD_FABRIC_HOST {fabric_host}")
+            
+            return 0
+        finally:
+            conn.close()
+    except Exception as e:
+        logger.error(f"Error in system token refresh task: {e}", exc_info=True)
+        return 0
+
 # Background task to refresh expiring tokens proactively
 def refresh_expiring_tokens():
     """Background task to refresh tokens that are expiring soon"""
@@ -7716,7 +7835,14 @@ def refresh_expiring_tokens():
     except Exception as e:
         logger.error(f"Error refreshing NHI tokens: {e}", exc_info=True)
     
-    if session_refreshed_count > 0 or nhi_refreshed_count > 0:
+    # Also refresh system tokens (LEAD_FABRIC_HOST) from system_tokens table
+    system_refreshed_count = 0
+    try:
+        system_refreshed_count = refresh_system_tokens()
+    except Exception as e:
+        logger.error(f"Error refreshing system tokens: {e}", exc_info=True)
+    
+    if session_refreshed_count > 0 or nhi_refreshed_count > 0 or system_refreshed_count > 0:
         pass
 
 def check_and_run_token_refresh():
@@ -8084,9 +8210,9 @@ def execute_event_internal(event_id: int, event_name: str = None):
             config_id, config_data_json, db_event_name = row
             event_name = event_name or db_event_name
             try:
-                config_data = json.loads(config_data_json)
-            except json.JSONDecodeError as je:
-                logger.error(f"Error parsing configuration JSON for event {event_id}: {je}", exc_info=True)
+                run_configuration(config_id=config_id, event_name=event_name, event_id=event_id)
+            except Exception as run_err:
+                logger.error(f"Error in run_configuration for event {event_id}: {run_err}", exc_info=True)
                 # Update execution record with error
                 completed_at = datetime.now(timezone.utc)
                 conn = db_connect_with_retry()
@@ -8103,8 +8229,8 @@ def execute_event_internal(event_id: int, event_name: str = None):
                                 WHERE id = ?
                             ''', (
                                 'error',
-                                f"Invalid configuration JSON: {str(je)}",
-                                json.dumps([f"Invalid configuration JSON: {str(je)}"]),
+                                f"Error executing configuration: {str(run_err)}",
+                                json.dumps([f"Error executing configuration: {str(run_err)}"]),
                                 completed_at.isoformat(),
                                 exec_row[0]
                             ))
@@ -8114,13 +8240,6 @@ def execute_event_internal(event_id: int, event_name: str = None):
                     finally:
                         conn.close()
                 return
-            
-            try:
-                run_configuration(config_data, event_name, event_id)
-                pass
-            except Exception as run_err:
-                logger.error(f"Error in run_configuration for event {event_id}: {run_err}", exc_info=True)
-                # Update execution record with error if run_configuration didn't update it
                 completed_at = datetime.now(timezone.utc)
                 conn = db_connect_with_retry()
                 if conn:
