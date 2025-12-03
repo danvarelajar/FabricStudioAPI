@@ -1,6 +1,19 @@
 # FabricStudio API
 
-A FastAPI-based web application for managing FabricStudio configurations, NHI credentials, and event scheduling.
+A FastAPI-based web application for managing FabricStudio configurations, NHI credentials, SSH keys, and event scheduling with Model Context Protocol (MCP) support.
+
+## Table of Contents
+
+- [Features](#features)
+- [Requirements](#requirements)
+- [Installation](#installation)
+- [Configuration](#configuration)
+- [Usage](#usage)
+- [MCP (Model Context Protocol)](#mcp-model-context-protocol)
+- [Database](#database)
+- [Security](#security)
+- [Troubleshooting](#troubleshooting)
+- [Project Structure](#project-structure)
 
 ## Features
 
@@ -37,6 +50,15 @@ A FastAPI-based web application for managing FabricStudio configurations, NHI cr
 - **User Authentication**: Secure user authentication with encrypted password storage
 - **Password Security**: Passwords hashed using bcrypt before storage
 
+### Model Context Protocol (MCP)
+- **MCP Server**: Expose FabricStudio API functionality via MCP protocol
+  - List templates, repositories, and configurations
+  - Create and update configurations
+  - Execute configurations
+  - Manage NHI credentials, SSH keys, and SSH profiles
+  - Schedule events
+- **Remote Access**: Use `mcp-remote` to connect local MCP clients to the API
+
 ### Logs
 - **Audit Logs**: Track user actions for security auditing
 - **Server Logs**: View application logs with timestamps
@@ -45,302 +67,270 @@ A FastAPI-based web application for managing FabricStudio configurations, NHI cr
 - **Modern UI**: Clean, responsive interface with Inter font family and styled navigation menu
 - **Security**: HTTP-only cookies, encrypted data storage, and comprehensive security measures
 
-## Setup
+## Requirements
 
-### Prerequisites
+### System Requirements
 
-- Docker and Docker Compose installed
-- For Mac: **Colima** (lightweight Docker alternative) - see setup instructions below
+#### Minimum Requirements
+- **Operating System**: Linux, macOS, or Windows (with WSL2)
+- **CPU**: 1 core (2+ recommended)
+- **Memory**: 512 MB RAM (2 GB recommended)
+- **Disk Space**: 500 MB for application + data storage
 
-### Quick Start
+#### Software Requirements
 
-1. **Clone the repository:**
+1. **Docker** (version 20.10 or later)
+   - For Linux: Install via your distribution's package manager
+   - For macOS: Use Colima (recommended, see below) or Docker Desktop
+   - For Windows: Docker Desktop with WSL2 backend
+
+2. **Docker Compose** (version 2.0 or later)
+   - Usually included with Docker Desktop
+   - For Linux: May need separate installation
+
+3. **Python 3.9+** (for running scripts locally)
+   - Required for user management scripts
+   - Not required for Docker deployment
+
+4. **OpenSSL** (for generating secrets)
+   - Usually pre-installed on Linux/macOS
+   - Available via package managers
+
+#### macOS-Specific: Colima (Recommended)
+
+Colima is a lightweight Docker alternative for macOS (~200MB vs Docker Desktop's 1GB+).
+
+**Installation:**
 ```bash
-git clone <repository-url>
-cd FabricStudioAPI
-```
+# Using Homebrew
+brew install colima docker docker-compose
 
-2. **Set up environment variables:**
-```bash
-cp .env.example .env
-# Edit .env and set your configuration values (see Configuration section below)
-```
-
-3. **Start the application:**
-```bash
-./scripts/docker-start.sh
-```
-
-The application will be available at `http://localhost:8000` (or the port configured in `.env`)
-
-**Note:** If you've configured a different port or enabled HTTPS, adjust the URL accordingly:
-- HTTP: `http://localhost:PORT`
-- HTTPS: `https://localhost:PORT`
-
-### Initial Users
-
-**Users are NOT created automatically.** You must create users manually after the first deployment.
-
-**To create initial users:**
-
-1. **Edit `scripts/create_users.py`** to customize which users to create:
-   - Modify the `INITIAL_USERS` list with your desired usernames and passwords
-   - Default user: `admin` with password `FortinetAssistant1!`
-
-2. **Run the user creation script:**
-   ```bash
-   python scripts/create_users.py
-   ```
-
-   The script will create users defined in `INITIAL_USERS` if they don't already exist. It will not modify existing users.
-
-**To reset a user password:**
-```bash
-python scripts/reset_user_password.py <username>
-```
-
-**Note:** The user creation script can be run multiple times safely - it only creates users that don't exist and won't overwrite existing users.
-
-## Container Deployment
-
-This project uses Docker for deployment. On Mac, **Colima** (a lightweight Docker alternative) is recommended instead of Docker Desktop (~200MB vs 1GB+).
-
-### Prerequisites
-
-- Docker and Docker Compose installed
-- For Mac: Install Colima (see below)
-
-### Mac Setup (Colima)
-
-**Install Colima (one command):**
-```bash
+# Or use the provided setup script
 ./scripts/setup-colima.sh
 ```
 
-This installs Colima and sets it up automatically. Colima works seamlessly with Docker commands.
+**Start Colima:**
+```bash
+colima start
+```
 
-### Configuration
+Colima works seamlessly with Docker commands - no changes needed to your workflow.
 
-1. **Create environment file:**
+### Python Dependencies
+
+The following Python packages are required (automatically installed in Docker):
+
+- `fastapi>=0.104.0` - Web framework
+- `uvicorn[standard]>=0.24.0` - ASGI server
+- `pydantic>=2.0.0` - Data validation
+- `requests>=2.31.0` - HTTP client
+- `cryptography>=41.0.0` - Encryption utilities
+- `urllib3>=2.0.0` - HTTP library
+- `paramiko>=3.0.0` - SSH client
+- `pytest>=7.0.0` - Testing framework
+- `httpx>=0.24.0` - Async HTTP client
+
+All dependencies are listed in `requirements.txt` and installed automatically during Docker build.
+
+## Installation
+
+### Quick Start (Docker - Recommended)
+
+1. **Clone the repository:**
    ```bash
-   cp .env.example .env
+   git clone <repository-url>
+   cd FabricStudioAPI
    ```
 
-2. **Edit `.env` and configure:**
-
-#### Required Configuration
-- **`FS_SERVER_SECRET`**: Generate with `openssl rand -base64 32` (CRITICAL for encryption)
-
-#### Server Configuration
-- **`HOSTNAME`**: Hostname to bind to (default: `0.0.0.0`)
-- **`PORT`**: Port to listen on (default: `8000`)
-- **`HTTPS_ENABLED`**: Set to `true` to enable HTTPS (default: `false`)
-- **`SSL_CERT_PATH`**: Path to SSL certificate (default: `/app/certs/cert.pem`)
-- **`SSL_KEY_PATH`**: Path to SSL private key (default: `/app/certs/key.pem`)
-
-#### FabricStudio API Configuration
-- **`LEAD_FABRIC_HOST`**: Primary FabricStudio host
-- **`CLIENT_ID`**: OAuth Client ID
-- **`CLIENT_SECRET`**: OAuth Client Secret
-
-#### Microsoft Teams Notifications (Optional)
-Configure Teams webhook to receive notifications when reports are created:
-
-- **`TEAMS_WEBHOOK_URL`**: Microsoft Teams webhook URL for sending Adaptive Card notifications
-
-**Setup Instructions:**
-1. In Microsoft Teams, go to your channel
-2. Click the `...` menu next to the channel name
-3. Select **Connectors**
-4. Search for **"Incoming Webhook"**
-5. Click **Configure**
-6. Give it a name (e.g., "FabricStudio Reports")
-7. Click **Create**
-8. Copy the webhook URL and paste it in your `.env` file
-
-**What gets notified:**
-- Report completion (success or error)
-- Configuration name and duration
-- Number of hosts processed
-- Templates created
-- SSH command profile details (if used)
-- Workspace installation details (if enabled)
-- Any errors encountered
-
-**Note:** If not set or empty, Teams notifications will be silently disabled (no errors or warnings).
-
-**Example:**
-```bash
-TEAMS_WEBHOOK_URL=https://outlook.office.com/webhook/abc123-def456-ghi789/...
-```
-
-#### CORS Configuration (Optional)
-- **`CORS_ALLOW_ORIGINS`**: Comma-separated list of allowed origins (auto-generated if not set)
-
-See `.env.example` for all available options with descriptions.
-
-### Starting the Application
-
-**Using the helper script (recommended):**
-```bash
-./scripts/docker-start.sh
-```
-
-**To rebuild without cache:**
-```bash
-./scripts/docker-start.sh --rebuild
-```
-
-**Manual commands:**
-```bash
-docker-compose build
-docker-compose up -d
-```
-
-### Building the Container Image
-
-**Standard build:**
-```bash
-docker-compose build
-```
-
-**Rebuild from scratch (no cache):**
-```bash
-docker-compose build --no-cache
-docker-compose down
-docker-compose up -d
-```
-
-**Using the helper script:**
-```bash
-./scripts/docker-start.sh --rebuild
-```
-
-This rebuilds without cache and restarts containers automatically.
-
-### Managing the Container
-
-**Start:**
-```bash
-docker-compose up -d
-```
-
-**Stop:**
-```bash
-docker-compose down
-```
-
-**Restart (to pick up configuration changes):**
-```bash
-docker-compose restart
-# Or:
-docker-compose down
-docker-compose up -d
-```
-
-**View logs:**
-```bash
-docker-compose logs -f
-```
-
-**View logs for specific service:**
-```bash
-docker-compose logs -f fabricstudio-api
-```
-
-**Execute commands in container:**
-```bash
-docker-compose exec fabricstudio-api <command>
-```
-
-### Troubleshooting
-
-**If changes aren't reflected after rebuilding:**
-
-1. **Ensure containers are stopped and restarted:**
+2. **Set up environment variables:**
    ```bash
-   docker-compose down
-   docker-compose build --no-cache
+   # Create .env file from template
+   cat > .env << EOF
+   # CRITICAL: Generate a strong secret for encryption
+   FS_SERVER_SECRET=$(openssl rand -base64 32)
+   
+   # Server Configuration
+   HOSTNAME=0.0.0.0
+   PORT=8000
+   HTTPS_ENABLED=false
+   
+   # FabricStudio API Configuration (optional, can be set per NHI credential)
+   LEAD_FABRIC_HOST=
+   LEAD_CLIENT_ID=
+   LEAD_CLIENT_SECRET=
+   
+   # MCP Configuration (required if MCP_ENABLED=true)
+   MCP_ENABLED=true
+   MCP_API_KEY=$(openssl rand -base64 32)  # REQUIRED: Generate a strong API key
+   
+   # Microsoft Teams (optional)
+   TEAMS_WEBHOOK_URL=
+   
+   # Logging
+   LOG_LEVEL=INFO
+   EOF
+   ```
+
+3. **Start the application:**
+   ```bash
+   # Using helper script (recommended)
+   ./scripts/docker-start.sh
+   
+   # Or manually
+   docker-compose build
    docker-compose up -d
    ```
 
-2. **Clear browser cache:**
-   - Hard refresh: `Ctrl+Shift+R` (Windows/Linux) or `Cmd+Shift+R` (Mac)
-   - Or use incognito/private browsing mode
-   - The application sets no-cache headers for all frontend files to prevent caching
-
-3. **Verify container status:**
+4. **Verify installation:**
    ```bash
-   docker-compose ps  # Check container status
-   docker-compose logs -f fabricstudio-api  # Check logs for errors
+   # Check container status
+   docker-compose ps
+   
+   # Check logs
+   docker-compose logs -f fabricstudio-api
+   
+   # Access the application
+   # Open http://localhost:8000 in your browser
    ```
 
-4. **Check environment variables:**
+5. **Create initial users:**
    ```bash
-   docker-compose exec fabricstudio-api env | grep -E "HOSTNAME|PORT|HTTPS"
+   # Edit scripts/create_users.py to customize users
+   # Default: admin / FortinetAssistant1!
+   python scripts/create_users.py
    ```
 
-5. **Verify configuration:**
-   - Ensure `.env` file exists and has correct values
-   - Check that `FS_SERVER_SECRET` is set (required for encryption)
-   - Verify `HOSTNAME` and `PORT` match your access URL
+### Manual Installation (Without Docker)
 
-### Database Persistence
+**Note:** Docker is the recommended deployment method. Manual installation is for development only.
 
-The database and logs are stored in the `./data` and `./logs` directories, which are mounted as volumes. This ensures:
-- Data persists across container restarts
-- Easy backup and restore
-- Data survives container deletion
+1. **Install Python 3.9+ and dependencies:**
+   ```bash
+   # Install Python dependencies
+   pip install -r requirements.txt
+   ```
 
-**Important:** Backup the `./data` directory regularly!
+2. **Set up environment variables:**
+   ```bash
+   export FS_SERVER_SECRET=$(openssl rand -base64 32)
+   export DB_PATH=./data/fabricstudio_ui.db
+   export HOSTNAME=0.0.0.0
+   export PORT=8000
+   # MCP Configuration (required if MCP_ENABLED=true)
+   export MCP_ENABLED=true
+   export MCP_API_KEY=$(openssl rand -base64 32)  # REQUIRED: Generate a strong API key
+   ```
 
-**⚠️ CRITICAL: Preserving Data During Docker Rebuilds**
+3. **Initialize the database:**
+   ```bash
+   python src/init_empty_db.py
+   ```
 
-The database (including NHI credentials and SSH credentials) is stored in `./data/fabricstudio_ui.db` and is persisted via a Docker volume mount (`./data:/app/data`).
+4. **Start the application:**
+   ```bash
+   cd src
+   uvicorn app:app --host 0.0.0.0 --port 8000
+   ```
 
-**To preserve data when rebuilding:**
-```bash
-# ✅ SAFE - Preserves data
-docker-compose down        # Stop containers (keeps volumes)
-docker-compose build       # Rebuild image
-docker-compose up -d       # Start with existing data
-```
+### Post-Installation
 
-**⚠️ DANGEROUS - Deletes all data:**
-```bash
-# ❌ This removes volumes and deletes the database!
-docker-compose down -v     # ⚠️ DO NOT USE unless you want to delete all data
-docker-compose rm -v       # ⚠️ Also removes volumes
-```
+1. **Access the application:**
+   - Open `http://localhost:8000` (or your configured port)
+   - Log in with the credentials created in step 5 above
 
-**Always backup before rebuild:**
-```bash
-# Backup database before any rebuild
-cp data/fabricstudio_ui.db data/fabricstudio_ui.db.backup.$(date +%Y%m%d_%H%M%S)
-```
+2. **Configure NHI Credentials:**
+   - Navigate to **NHI Management > NHI Credentials**
+   - Add your FabricStudio OAuth Client ID and Secret
+   - See [Registering a FabricStudio OAuth Application](#registering-a-fabricstudio-oauth-application) below
 
-**Verify data persistence:**
-```bash
-# Check database exists and has data
-ls -lh data/fabricstudio_ui.db
-sqlite3 data/fabricstudio_ui.db "SELECT COUNT(*) FROM nhi_credentials;"
-sqlite3 data/fabricstudio_ui.db "SELECT COUNT(*) FROM ssh_keys;"
-```
+3. **Configure MCP (Optional):**
+   - If MCP is enabled, configure your MCP client to connect
+   - See [MCP Configuration](#mcp-model-context-protocol) section
 
-### Server Configuration
+## Configuration
 
-The application can be configured via environment variables in `.env`:
+### Environment Variables
 
-**Basic Configuration:**
-- `HOSTNAME`: Hostname to bind to (default: `0.0.0.0`)
-- `PORT`: Port to listen on (default: `8000`)
+Create a `.env` file in the project root with the following variables:
 
-**HTTPS Configuration:**
-- `HTTPS_ENABLED`: Set to `true` to enable HTTPS (default: `false`)
-- `SSL_CERT_PATH`: Path to SSL certificate file (default: `/app/certs/cert.pem`)
-- `SSL_KEY_PATH`: Path to SSL private key file (default: `/app/certs/key.pem`)
+#### Required Configuration
 
-**To enable HTTPS:**
+- **`FS_SERVER_SECRET`** (REQUIRED)
+  - Strong random secret for encrypting sensitive data
+  - Generate with: `openssl rand -base64 32`
+  - **CRITICAL**: Never use the default value in production
+  - Example: `FS_SERVER_SECRET=Kx9mP2vQ7wR5tY8uI3oP6aS1dF4gH7jK0lM9nB2cV5xZ8=`
+
+#### Server Configuration
+
+- **`HOSTNAME`** (default: `0.0.0.0`)
+  - Hostname/IP to bind to
+  - Use `0.0.0.0` to listen on all interfaces
+
+- **`PORT`** (default: `8000`)
+  - Port to listen on
+  - Example: `PORT=9000`
+
+- **`HTTPS_ENABLED`** (default: `false`)
+  - Enable HTTPS
+  - Requires SSL certificates (see below)
+
+- **`SSL_CERT_PATH`** (default: `/app/certs/cert.pem`)
+  - Path to SSL certificate file (inside container)
+
+- **`SSL_KEY_PATH`** (default: `/app/certs/key.pem`)
+  - Path to SSL private key file (inside container)
+
+#### FabricStudio API Configuration
+
+- **`LEAD_FABRIC_HOST`** (optional)
+  - Primary FabricStudio host for template operations
+  - Can be overridden per NHI credential
+
+- **`LEAD_CLIENT_ID`** (optional)
+  - Default OAuth Client ID for LEAD_FABRIC_HOST
+
+- **`LEAD_CLIENT_SECRET`** (optional)
+  - Default OAuth Client Secret for LEAD_FABRIC_HOST
+
+#### MCP Configuration
+
+- **`MCP_ENABLED`** (default: `true`)
+  - Enable MCP protocol endpoint at `/mcp`
+
+- **`MCP_API_KEY`** (REQUIRED if MCP_ENABLED is true)
+  - API key for MCP authentication
+  - Generate with: `openssl rand -base64 32`
+  - **CRITICAL**: Must be set via environment variable - no default for security
+  - If not set, MCP requests will be rejected with 401
+  - Example: `MCP_API_KEY=Kx9mP2vQ7wR5tY8uI3oP6aS1dF4gH7jK0lM9nB2cV5xZ8=`
+
+#### Microsoft Teams Notifications (Optional)
+
+- **`TEAMS_WEBHOOK_URL`** (optional)
+  - Microsoft Teams webhook URL for Adaptive Card notifications
+  - Setup:
+    1. In Microsoft Teams, go to your channel
+    2. Click `...` menu → **Connectors**
+    3. Search for **"Incoming Webhook"**
+    4. Configure and copy the webhook URL
+  - Example: `TEAMS_WEBHOOK_URL=https://outlook.office.com/webhook/...`
+
+#### Logging Configuration
+
+- **`LOG_LEVEL`** (default: `INFO`)
+  - Logging level: `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL`
+
+#### CORS Configuration (Optional)
+
+- **`CORS_ALLOW_ORIGINS`** (optional)
+  - Comma-separated list of allowed origins
+  - Auto-generated if not set based on HOSTNAME/PORT/HTTPS_ENABLED
+  - Example: `CORS_ALLOW_ORIGINS=http://example.com:8000,https://example.com`
+
+### HTTPS Setup
+
+To enable HTTPS:
 
 1. **Create certificates directory:**
    ```bash
@@ -360,90 +350,383 @@ The application can be configured via environment variables in `.env`:
 
 4. **Restart the container:**
    ```bash
-   docker-compose down
-   docker-compose up -d
+   docker-compose restart
    ```
 
-The certificates are automatically mounted from `./certs` to `/app/certs` in the container (read-only for security).
+Certificates are mounted read-only from `./certs` to `/app/certs` in the container.
 
-**To change the port:**
+### Registering a FabricStudio OAuth Application
+
+To use FabricStudio APIs, you need OAuth Client ID and Client Secret:
+
+1. **Register an application:**
+   - Navigate to: `https://[YOUR_FabricStudio]/oauth2/applications/register/`
+
+2. **Fill the registration form:**
+   - **Name**: Any descriptive name (e.g., "FabricStudio Assistant")
+   - **Client type**: Confidential
+   - **Authorization grant type**: Client credentials
+   - **Algorithm**: HMAC with SHA-2 256
+   - Save and copy the generated Client ID and Client Secret
+
+3. **Use in the application:**
+   - Go to **NHI Management > NHI Credentials**
+   - Add a new credential with your Client ID and Client Secret
+   - The secret is encrypted and stored securely
+   - Tokens are retrieved and refreshed automatically
+
+## Usage
+
+### Starting the Application
+
+**Using helper script (recommended):**
 ```bash
-# In .env file
-PORT=9000
+./scripts/docker-start.sh
 ```
 
-After changing port or HTTPS settings, restart the container:
+**Rebuild without cache:**
 ```bash
-docker-compose restart
-# Or:
-docker-compose down
+./scripts/docker-start.sh --rebuild
+```
+
+**Manual commands:**
+```bash
+docker-compose build
 docker-compose up -d
 ```
 
-### CORS Configuration
+### Managing the Container
 
-CORS (Cross-Origin Resource Sharing) is automatically configured based on your server settings:
+**Start:**
+```bash
+docker-compose up -d
+```
 
-**Auto-generated (default):**
-- If `CORS_ALLOW_ORIGINS` is not set, origins are auto-generated from `HOSTNAME`, `PORT`, and `HTTPS_ENABLED`
-- Includes localhost variants for development
-- Includes the configured hostname if not `0.0.0.0`
+**Stop:**
+```bash
+docker-compose down
+```
 
-**Explicit configuration:**
-- Set `CORS_ALLOW_ORIGINS` in `.env` with comma-separated origins:
-  ```bash
-  CORS_ALLOW_ORIGINS=http://example.com:8000,https://example.com,http://localhost:3000
-  ```
+**Restart:**
+```bash
+docker-compose restart
+# Or:
+docker-compose down && docker-compose up -d
+```
 
-**Note:** CSRF protection is session-based and works with any hostname, so it doesn't need CORS configuration.
+**View logs:**
+```bash
+# All services
+docker-compose logs -f
 
-### Security Notes
+# Specific service
+docker-compose logs -f fabricstudio-api
+```
 
-- The `FS_SERVER_SECRET` environment variable is **required** for encrypting sensitive data in the database
-- Never commit `.env` file to version control (use `.env.example` as a template)
-- The container runs as a non-root user for enhanced security
-- All sensitive data (passwords, tokens) are encrypted before storage
-- SSL certificates are mounted read-only (`:ro` flag) for additional security
+**Execute commands in container:**
+```bash
+docker-compose exec fabricstudio-api <command>
+```
 
-## Registering a FabricStudio OAuth Application (Client ID/Secret)
+### User Management
 
-To use FabricStudio APIs from this app, you need a Client ID and Client Secret.
+**Create users:**
+```bash
+# Edit scripts/create_users.py to customize
+python scripts/create_users.py
+```
 
-1) Using the FabricStudio web interface, register an application
-- Open your browser and go to the application creation page:
-  - `https://[YOUR_FabricStudio]/oauth2/applications/register/`
+**Reset user password:**
+```bash
+python scripts/reset_user_password.py <username>
+```
 
-2) Fill the registration form
-- Name: any descriptive name (e.g., "FabricStudio Assistant")
-- Client type: Confidential
-- Authorization grant type: Client credentials
-- Algorithm: HMAC with SHA-2 256
-- Save the application. Copy the generated Client ID and Client Secret.
+**Default user:**
+- Username: `admin`
+- Password: `FortinetAssistant1!` (change after first login)
 
-3) Where the Client ID and Client Secret are used in this app
-- NHI Management > NHI Credentials: When you save a credential, enter the Client ID and Client Secret. The secret is encrypted and stored; tokens are retrieved per host using these values.
-- Token acquisition: The app calls FabricStudio to get access tokens with the client credentials flow. Tokens are stored server-side and refreshed automatically.
-- Event schedules: When an auto-run event executes, the stored NHI credential (backed by your Client ID/Secret) is used to fetch/refresh tokens to run tasks.
+### Database Management
 
-If you rotate your Client Secret, update the corresponding NHI credential in the app so token acquisition continues to work.
+**Backup database:**
+```bash
+cp data/fabricstudio_ui.db data/fabricstudio_ui.db.backup.$(date +%Y%m%d_%H%M%S)
+```
+
+**Verify database:**
+```bash
+sqlite3 data/fabricstudio_ui.db "SELECT COUNT(*) FROM nhi_credentials;"
+sqlite3 data/fabricstudio_ui.db "SELECT COUNT(*) FROM configurations;"
+```
+
+**⚠️ Important: Preserving Data During Rebuilds**
+
+The database is stored in `./data/fabricstudio_ui.db` and persists via Docker volume mount.
+
+**✅ SAFE - Preserves data:**
+```bash
+docker-compose down        # Stop containers (keeps volumes)
+docker-compose build       # Rebuild image
+docker-compose up -d       # Start with existing data
+```
+
+**❌ DANGEROUS - Deletes all data:**
+```bash
+# ⚠️ DO NOT USE unless you want to delete all data
+docker-compose down -v     # Removes volumes and deletes database
+docker-compose rm -v       # Also removes volumes
+```
+
+## MCP (Model Context Protocol)
+
+The FabricStudio API exposes an MCP endpoint for integration with MCP clients.
+
+### MCP Endpoint
+
+- **URL**: `http://your-api-url/mcp`
+- **Method**: POST
+- **Authentication**: API key via `X-API-Key` header
+- **Protocol**: JSON-RPC 2.0
+
+### Available MCP Tools
+
+- `list_templates` - List all available templates
+- `list_repositories` - List all repositories
+- `list_templates_for_repo` - List templates in a repository
+- `create_configuration` - Create a new configuration
+- `update_configuration` - Update an existing configuration
+- `delete_configuration` - Delete a configuration
+- `list_configurations` - List all configurations
+- `execute_configuration` - Execute/run a configuration
+- `list_nhi_credentials` - List NHI credentials
+- `get_nhi_credential` - Get NHI credential details
+- `create_nhi_credential` - Create a new NHI credential
+- `update_nhi_credential` - Update an NHI credential
+- `delete_nhi_credential` - Delete an NHI credential
+- `list_ssh_keys` - List SSH keys
+- `list_ssh_command_profiles` - List SSH command profiles
+- `list_events` - List scheduled events
+- `create_event` - Schedule a new event
+- `update_event` - Update a scheduled event
+- `delete_event` - Delete a scheduled event
+
+### Using mcp-remote
+
+To connect a local MCP client to the remote FabricStudio API:
+
+1. **Configure your MCP client** (e.g., Cursor, Warp):
+   ```json
+   {
+     "mcpServers": {
+       "fabricstudio": {
+         "command": "npx",
+         "args": [
+           "mcp-remote",
+           "http://localhost:8000/mcp",
+           "--header",
+           "X-API-Key: ${FABRICSTUDIO_API_KEY}"
+         ],
+         "env": {
+           "FABRICSTUDIO_API_KEY": "your-api-key-here"
+         }
+       }
+     }
+   }
+   ```
+
+2. **Set the API key** in your environment or config file
+
+3. **Restart your MCP client**
+
+The `mcp-remote` package acts as a bridge between local stdio-based MCP clients and the remote HTTP MCP server.
 
 ## Database
 
-The application uses SQLite for data storage. The database file `fabricstudio_ui.db` is created automatically when the application starts, or you can initialize it manually using `init_empty_db.py`.
+The application uses SQLite for data storage. The database file `fabricstudio_ui.db` is created automatically when the application starts.
 
-The database contains the following tables:
-- `users`: User accounts for authentication (with encrypted passwords)
-- `sessions`: Server-side session storage for user authentication and token management
-- `configurations`: Saved FabricStudio configurations
-- `event_schedules`: Scheduled events
-- `event_executions`: Execution history for scheduled events (including SSH execution details)
-- `nhi_credentials`: NHI credential storage (with encrypted secrets)
-- `nhi_tokens`: Encrypted tokens per host per credential
-- `cached_templates`: Cached template information
-- `cached_repositories`: Cached repository information per host
-- `ssh_keys`: SSH key pairs (public keys and encrypted private keys)
-- `ssh_command_profiles`: SSH command profiles with optional SSH key association
-- `audit_logs`: Audit trail of user actions
+### Database Schema
+
+- `users` - User accounts for authentication (with encrypted passwords)
+- `sessions` - Server-side session storage for user authentication and token management
+- `configurations` - Saved FabricStudio configurations
+- `event_schedules` - Scheduled events
+- `event_executions` - Execution history for scheduled events (including SSH execution details)
+- `nhi_credentials` - NHI credential storage (with encrypted secrets)
+- `nhi_tokens` - Encrypted tokens per host per credential
+- `cached_templates` - Cached template information
+- `cached_repositories` - Cached repository information per host
+- `ssh_keys` - SSH key pairs (public keys and encrypted private keys)
+- `ssh_command_profiles` - SSH command profiles with optional SSH key association
+- `audit_logs` - Audit trail of user actions
+
+### Database Location
+
+- **Docker**: `/app/data/fabricstudio_ui.db` (mounted from `./data/fabricstudio_ui.db`)
+- **Manual**: Path specified by `DB_PATH` environment variable
+
+### Database Persistence
+
+The database and logs are stored in the `./data` and `./logs` directories, which are mounted as volumes. This ensures:
+- Data persists across container restarts
+- Easy backup and restore
+- Data survives container deletion
+
+**Important:** Backup the `./data` directory regularly!
+
+## Security
+
+### Authentication & Authorization
+
+- **User Authentication**: Secure password-based authentication with bcrypt password hashing
+- **Session-Based Token Management**: Tokens are stored server-side in encrypted sessions, never exposed to the frontend
+- **HTTP-Only Cookies**: Session cookies are HTTP-only, preventing JavaScript access
+
+### Data Encryption
+
+- **NHI Credential Security**: Client secrets are encrypted using Fernet (symmetric encryption) and never returned to the frontend
+- **SSH Key Security**: Private SSH keys are encrypted using Fernet before storage and are never returned to the frontend
+- **Token Encryption**: All tokens are encrypted before storage in the database
+- **Password-Based Key Derivation**: Passwords are used to derive encryption keys using PBKDF2 (100,000 iterations)
+- **Password Hashing**: User passwords are hashed using bcrypt before storage
+
+### Token Management
+
+- **Lazy Refresh**: Tokens are automatically refreshed when API requests detect expiration or imminent expiration (< 1 minute)
+- **Proactive Refresh**: A background task runs every 2 minutes to refresh tokens expiring within 5 minutes
+- **Session-Based Storage**: Tokens are stored server-side in encrypted sessions, identified by HTTP-only cookies
+- **Transparent Operation**: Token refresh happens automatically without user intervention
+
+### Additional Security Measures
+
+- **Container Security**: Application runs as non-root user (`fabricstudio`)
+- **Resource Limits**: CPU and memory limits configured in docker-compose.yml
+- **SSL Certificate Security**: Certificates mounted read-only (`:ro` flag)
+- **CSRF Protection**: Session-based CSRF protection middleware
+- **Audit Logging**: User actions are logged for security auditing
+- **SSH Command Execution**: SSH commands are executed securely using Paramiko, with error validation and output checking
+
+### Security Best Practices
+
+1. **Never commit `.env` file** - Use `.env.example` as a template
+2. **Generate strong `FS_SERVER_SECRET`** - Use `openssl rand -base64 32`
+3. **Change default passwords** - Update admin password after first login
+4. **Use HTTPS in production** - Enable `HTTPS_ENABLED=true` with valid certificates
+5. **Regular backups** - Backup `./data` directory regularly
+6. **Keep dependencies updated** - Regularly update Python packages and Docker images
+
+## Troubleshooting
+
+### Application Won't Start
+
+1. **Check Docker is running:**
+   ```bash
+   docker ps
+   # If not running, start Docker/Colima
+   ```
+
+2. **Check container status:**
+   ```bash
+   docker-compose ps
+   docker-compose logs -f fabricstudio-api
+   ```
+
+3. **Verify environment variables:**
+   ```bash
+   docker-compose exec fabricstudio-api env | grep FS_SERVER_SECRET
+   # Should show a value, not "CHANGE_ME_IN_PRODUCTION"
+   ```
+
+4. **Check port availability:**
+   ```bash
+   # Check if port is in use
+   lsof -i :8000
+   # Or change PORT in .env
+   ```
+
+### Changes Not Reflected
+
+1. **Rebuild without cache:**
+   ```bash
+   docker-compose down
+   docker-compose build --no-cache
+   docker-compose up -d
+   ```
+
+2. **Clear browser cache:**
+   - Hard refresh: `Ctrl+Shift+R` (Windows/Linux) or `Cmd+Shift+R` (Mac)
+   - Or use incognito/private browsing mode
+
+3. **Verify container status:**
+   ```bash
+   docker-compose ps
+   docker-compose logs -f fabricstudio-api
+   ```
+
+### Database Issues
+
+1. **Check database exists:**
+   ```bash
+   ls -lh data/fabricstudio_ui.db
+   ```
+
+2. **Verify database integrity:**
+   ```bash
+   sqlite3 data/fabricstudio_ui.db "PRAGMA integrity_check;"
+   ```
+
+3. **Restore from backup:**
+   ```bash
+   cp data/fabricstudio_ui.db.backup.YYYYMMDD_HHMMSS data/fabricstudio_ui.db
+   docker-compose restart
+   ```
+
+### Authentication Issues
+
+1. **Reset user password:**
+   ```bash
+   python scripts/reset_user_password.py <username>
+   ```
+
+2. **Create new user:**
+   ```bash
+   # Edit scripts/create_users.py
+   python scripts/create_users.py
+   ```
+
+### MCP Connection Issues
+
+1. **Verify MCP is enabled:**
+   ```bash
+   docker-compose exec fabricstudio-api env | grep MCP_ENABLED
+   # Should be "true"
+   ```
+
+2. **Check API key:**
+   ```bash
+   docker-compose exec fabricstudio-api env | grep MCP_API_KEY
+   ```
+
+3. **Test MCP endpoint:**
+   ```bash
+   curl -X POST http://localhost:8000/mcp \
+     -H "Content-Type: application/json" \
+     -H "X-API-Key: your-api-key" \
+     -d '{"jsonrpc":"2.0","method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{}},"id":1}'
+   ```
+
+### Token Refresh Issues
+
+1. **Check NHI credentials:**
+   - Verify Client ID and Secret are correct
+   - Check token expiration in NHI Management
+
+2. **Check logs:**
+   ```bash
+   docker-compose logs -f fabricstudio-api | grep -i token
+   ```
+
+3. **Manually refresh tokens:**
+   - Go to NHI Management > NHI Credentials
+   - Click "Refresh Tokens" for the credential
 
 ## Project Structure
 
@@ -451,62 +734,39 @@ The database contains the following tables:
 FabricStudioAPI/
 ├── src/
 │   ├── app.py                 # FastAPI application and API endpoints
+│   ├── mcp_router.py          # MCP protocol router
+│   ├── config.py              # Configuration constants
+│   ├── db_utils.py            # Database utilities
 │   ├── init_empty_db.py       # Database initialization script
 │   └── fabricstudio/
-│       ├── auth.py           # Authentication utilities
+│       ├── auth.py            # Authentication utilities
 │       └── fabricstudio_api.py # FabricStudio API client
 ├── scripts/
-│   ├── create_users.py       # User creation/management script
+│   ├── create_users.py        # User creation/management script
 │   ├── reset_user_password.py # Password reset utility
-│   ├── docker-start.sh       # Container startup helper script
-│   ├── docker-entrypoint.sh  # Container entrypoint script
-│   └── setup-colima.sh       # Colima setup script (Mac)
+│   ├── docker-start.sh        # Container startup helper script
+│   ├── docker-entrypoint.sh   # Container entrypoint script
+│   └── setup-colima.sh        # Colima setup script (Mac)
 ├── frontend/
-│   ├── index.html        # Main HTML file
-│   ├── app.js            # Frontend JavaScript
-│   ├── styles.css        # Stylesheet
-│   ├── configurations.html # Unified Configurations section (create, edit, list, and run configurations)
-│   ├── event-schedule.html # Event Schedule section
-│   ├── nhi-management.html # NHI Management section
+│   ├── index.html             # Main HTML file
+│   ├── app.js                 # Frontend JavaScript
+│   ├── styles.css             # Stylesheet
+│   ├── configurations.html    # Configurations section
+│   ├── event-schedule.html    # Event Schedule section
+│   ├── nhi-management.html    # NHI Management section
 │   ├── ssh-command-profiles.html # SSH Command Profiles section
-│   ├── ssh-keys.html     # SSH Keys section
-│   └── fonts/            # Custom font files (Inter)
-│       ├── inter-regular.woff2
-│       └── inter-bold.woff2
-├── data/                 # Database and persistent data (created at runtime)
-├── logs/                 # Application logs (created at runtime)
-├── Dockerfile            # Docker image definition
-├── docker-compose.yml    # Docker Compose configuration
-├── .env                  # Environment variables (not in git)
-├── .env.example          # Example environment variables file
-└── requirements.txt      # Python dependencies
+│   ├── ssh-keys.html          # SSH Keys section
+│   └── fonts/                 # Custom font files (Inter)
+├── data/                      # Database and persistent data (created at runtime)
+├── logs/                      # Application logs (created at runtime)
+├── certs/                     # SSL certificates (optional, for HTTPS)
+├── Dockerfile                 # Docker image definition
+├── docker-compose.yml         # Docker Compose configuration
+├── requirements.txt           # Python dependencies
+├── .env                       # Environment variables (not in git)
+└── README.md                  # This file
 ```
-
-## Security
-
-- **User Authentication**: Secure password-based authentication with bcrypt password hashing
-- **Session-Based Token Management**: Tokens are stored server-side in encrypted sessions, never exposed to the frontend
-- **Automatic Token Refresh**: Tokens refresh automatically before expiration (5 minutes before) to prevent interruptions
-- **NHI Credential Security**: Client secrets are encrypted using Fernet (symmetric encryption) and never returned to the frontend
-- **SSH Key Security**: Private SSH keys are encrypted using Fernet before storage and are never returned to the frontend
-- **Token Encryption**: All tokens are encrypted before storage in the database
-- **Password-Based Key Derivation**: Passwords are used to derive encryption keys using PBKDF2 (100,000 iterations)
-- **Password Hashing**: User passwords are hashed using bcrypt before storage
-- **HTTP-Only Cookies**: Session cookies are HTTP-only, preventing JavaScript access
-- **Secure Session Keys**: Session keys are derived from encryption passwords and session IDs
-- **SSH Command Execution**: SSH commands are executed securely using Paramiko, with error validation and output checking
-- **Audit Logging**: User actions are logged for security auditing
-
-### Token Management
-
-The application uses a sophisticated token management system:
-
-- **Lazy Refresh**: Tokens are automatically refreshed when API requests detect expiration or imminent expiration (< 1 minute)
-- **Proactive Refresh**: A background task runs every 2 minutes to refresh tokens expiring within 5 minutes
-- **Session-Based Storage**: Tokens are stored server-side in encrypted sessions, identified by HTTP-only cookies
-- **Transparent Operation**: Token refresh happens automatically without user intervention
 
 ## License
 
 [Add your license here]
-
