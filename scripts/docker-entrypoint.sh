@@ -27,6 +27,12 @@ else
     echo "🌐 Starting with HTTP (HTTPS disabled)"
 fi
 
+# Ensure initial users are created (runs automatically on startup)
+echo "👤 Ensuring initial users exist..."
+python /app/scripts/create_users.py || {
+    echo "⚠️  WARNING: Failed to create initial users. Continuing anyway..."
+}
+
 echo "🚀 Starting FabricStudio API on ${HOSTNAME}:${PORT}"
 echo "   Command: ${UVICORN_CMD}"
 

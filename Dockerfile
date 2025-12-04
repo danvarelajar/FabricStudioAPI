@@ -35,6 +35,7 @@ RUN python -c "import uvicorn" && which uvicorn
 # Copy application code - copy frontend separately to ensure cache invalidation on frontend changes
 COPY --chown=fabricstudio:fabricstudio frontend/ ./frontend/
 COPY --chown=fabricstudio:fabricstudio src/ ./src/
+COPY --chown=fabricstudio:fabricstudio scripts/ ./scripts/
 COPY --chown=fabricstudio:fabricstudio requirements.txt ./
 
 # Create directories for database, logs, and certificates with proper permissions

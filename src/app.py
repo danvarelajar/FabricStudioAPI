@@ -1539,14 +1539,14 @@ def init_db():
     conn.commit()
     conn.close()
     
-    # Note: Initial users are NOT created automatically.
-    # To create users manually, use the create_users.py script:
+    # Note: Initial users are created automatically on container startup via docker-entrypoint.sh
+    # The entrypoint script runs scripts/create_users.py which creates users defined in
+    # scripts/create_users.py (INITIAL_USERS list) if they don't already exist.
+    # To manually create/update users, run:
     #   python scripts/create_users.py
-    # Or run it inside a Docker container:
-    #   docker-compose exec fabricstudio-api python scripts/create_users.py
-    # 
-    # The script will create users defined in scripts/create_users.py (INITIAL_USERS list)
-    # if they don't already exist. Edit scripts/create_users.py to customize initial users.
+    # Or inside a Docker container:
+    #   docker-compose exec fabricstudio-api python /app/scripts/create_users.py
+    # Edit scripts/create_users.py to customize initial users.
 
 # Encryption/Decryption functions for NHI credentials
 def derive_key_from_password(password: str, salt: bytes = None) -> bytes:
