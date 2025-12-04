@@ -13,22 +13,35 @@ SSL_KEY_PATH=${SSL_KEY_PATH:-/app/certs/key.pem}
 echo "📁 Ensuring data and logs directories exist..."
 mkdir -p /app/data /app/logs
 
-# Check if directories are writable
-if [ ! -w /app/data ]; then
-    echo "❌ ERROR: /app/data directory is not writable!"
-    echo "   This usually happens when the ./data directory on the host has wrong permissions."
-    echo "   Container user: $(id -u):$(id -g)"
-    echo "   Current /app/data permissions: $(ls -ld /app/data)"
-    echo "   Fix with: sudo chown -R $(id -u):$(id -g) ./data"
-    echo "   Alternatively, for testing, make it world-writable: chmod -R 777 ./data"
+# Function to check and report directory permissions
+check_dir_permissions() {
+    local dir=$1
+    local host_dir_name=$2  # e.g., "data" or "logs"
+    
+    if [ ! -w "$dir" ]; then
+        echo "❌ ERROR: $dir directory is not writable!"
+        echo "   This happens when the host directory has wrong ownership."
+        echo "   Container user: $(id -u):$(id -g) (fabricstudio:fabricstudio)"
+        echo "   Current $dir permissions: $(ls -ld $dir)"
+        echo ""
+        echo "   🔧 Fix on the HOST machine (in the project directory):"
+        echo "   sudo chown -R $(id -u):$(id -g) ./$host_dir_name"
+        echo ""
+        echo "   OR (for testing only, less secure):"
+        echo "   sudo chmod -R 777 ./$host_dir_name"
+        echo ""
+        echo "   Then restart: docker-compose restart"
+        return 1
+    fi
+    return 0
+}
+
+# Check permissions for data and logs directories
+if ! check_dir_permissions /app/data "data"; then
     exit 1
 fi
 
-if [ ! -w /app/logs ]; then
-    echo "❌ ERROR: /app/logs directory is not writable!"
-    echo "   Container user: $(id -u):$(id -g)"
-    echo "   Current /app/logs permissions: $(ls -ld /app/logs)"
-    echo "   Fix with: sudo chown -R $(id -u):$(id -g) ./logs"
+if ! check_dir_permissions /app/logs "logs"; then
     exit 1
 fi
 
