@@ -3075,7 +3075,7 @@ def model_fabric_create(request: Request, req: CreateFabricReq):
         raise HTTPException(401, "Missing access_token in session or Authorization header")
     create_start = datetime.now(timezone.utc)
     try:
-        result = create_fabric(req.fabric_host, token, req.template_id, req.template_name, req.version)
+    result = create_fabric(req.fabric_host, token, req.template_id, req.template_name, req.version)
     except RuntimeError as e:
         # Check if it's a rate limit error
         error_msg = str(e)
